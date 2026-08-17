@@ -22,3 +22,4 @@ test_login.py
 test_market_data.py
 test_historical_data.py
 test_candle_model.py
+test_market_agent.py
