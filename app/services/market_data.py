@@ -1,5 +1,6 @@
 from app.angel.client import AngelOneClient
-
+from datetime import datetime
+from app.models.market import Candle
 
 class MarketDataService:
 
@@ -50,3 +51,19 @@ class MarketDataService:
 
         response = self.client.getCandleData(params)
         return response
+
+    def convert_to_candles(self, candle_data):
+        candles = []
+
+        for item in candle_data:
+            candle = Candle(
+            timestamp=datetime.fromisoformat(item[0]),
+            open=item[1],
+            high=item[2],
+            low=item[3],
+            close=item[4],
+            volume=item[5]
+            )
+            candles.append(candle)
+
+        return candles
