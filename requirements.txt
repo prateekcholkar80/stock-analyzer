@@ -1,0 +1,7 @@
+python-dotenv
+pandas
+pydantic
+smartapi-python
+pyotp
+logzero
+websocket-client
