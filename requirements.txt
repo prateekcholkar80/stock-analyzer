@@ -1,7 +1,9 @@
 python-dotenv
 pandas
+pandas-ta-classic
 pydantic
 smartapi-python
 pyotp
+TA-Lib
 logzero
 websocket-client
