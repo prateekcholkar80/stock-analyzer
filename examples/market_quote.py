@@ -1,11 +1,9 @@
 from app.angel.client import AngelOneClient
-from app.logging_config import configure_logging
+from app.runtime import run_entrypoint
 from app.services.market_data import MarketDataService
 
 
 def main():
-    configure_logging()
-
     market_service = MarketDataService(
         gateway=AngelOneClient()
     )
@@ -21,4 +19,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        run_entrypoint(
+            main,
+            logger_name="examples.market_quote",
+        )
+    )

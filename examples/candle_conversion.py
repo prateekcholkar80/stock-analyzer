@@ -1,10 +1,8 @@
-from app.logging_config import configure_logging
+from app.runtime import run_entrypoint
 from app.services.market_data import MarketDataService
 
 
 def main():
-    configure_logging()
-
     raw_data = [
         [
             "2026-08-17T00:00:00+05:30",
@@ -23,4 +21,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        run_entrypoint(
+            main,
+            logger_name="examples.candle_conversion",
+        )
+    )

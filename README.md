@@ -25,7 +25,7 @@ Implemented:
 - Offline unit and integration tests
 - Logging-enabled example entry points
 
-Automated baseline: **66 passing tests**.
+Automated baseline: **69 passing tests**.
 
 Not implemented yet:
 
@@ -181,6 +181,9 @@ Logs must not contain:
 - Vendor exception messages
 
 Sensitive values are redacted as `[REDACTED]`.
+
+Expected application failures at executable entry points exit with status 1
+without rendering chained vendor tracebacks.
 
 ## Next phase
 

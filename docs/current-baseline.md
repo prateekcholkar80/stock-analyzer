@@ -152,6 +152,9 @@ Sensitive fields and embedded values are redacted. Application logs do not
 intentionally include credentials, session tokens, raw vendor responses, or
 vendor exception messages.
 
+Executable entry points catch expected `ApplicationError` failures and return
+exit status 1 without rendering chained vendor tracebacks.
+
 ## Automated test baseline
 
 Run the complete offline suite:
@@ -163,7 +166,7 @@ Run the complete offline suite:
 Phase 1 baseline:
 
 ```text
-66 tests passing
+69 tests passing
 ```
 
 Coverage includes:
@@ -179,6 +182,7 @@ Coverage includes:
 - Lazy service creation and reuse
 - Cross-layer operation-ID continuity
 - Logger and singleton test-state restoration
+- Safe executable-entry-point failure handling
 
 The automated suite does not require network access or real Angel One
 credentials.

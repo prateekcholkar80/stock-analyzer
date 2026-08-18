@@ -1,10 +1,8 @@
 from app.agents.market_agent import MarketAgent
-from app.logging_config import configure_logging
+from app.runtime import run_entrypoint
 
 
 def main():
-    configure_logging()
-
     agent = MarketAgent()
 
     quote = agent.get_stock_price(
@@ -17,4 +15,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        run_entrypoint(
+            main,
+            logger_name="examples.market_agent",
+        )
+    )

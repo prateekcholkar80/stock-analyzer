@@ -1,10 +1,8 @@
 from app.angel.client import AngelOneClient
-from app.logging_config import configure_logging
+from app.runtime import run_entrypoint
 
 
 def main():
-    configure_logging()
-
     angel_client = AngelOneClient()
 
     response = angel_client.login()
@@ -14,4 +12,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        run_entrypoint(
+            main,
+            logger_name="examples.angel_login",
+        )
+    )
