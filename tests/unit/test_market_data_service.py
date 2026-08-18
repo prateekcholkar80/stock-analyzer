@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import unittest
 
 from app.exceptions import (
@@ -16,6 +16,7 @@ from app.services.market_data import MarketDataService
 class FakeMarketDataGateway:
     def __init__(self):
         self.initialized = False
+        self.initialization_error = None
         self.last_quote_request = None
         self.last_history_request = None
 
@@ -35,6 +36,9 @@ class FakeMarketDataGateway:
         }
 
     def initialize(self):
+        if self.initialization_error is not None:
+            raise self.initialization_error
+
         self.initialized = True
 
     def get_ltp(
@@ -112,6 +116,39 @@ class MarketDataServiceTests(unittest.TestCase):
             hasattr(captured.records[-1], "duration_ms")
         )
 
+    def test_preserves_gateway_initialization_failure(self):
+        failure = RuntimeError(
+            "api_key=vendor-secret"
+        )
+        self.gateway.initialization_error = failure
+
+        with self.assertLogs(
+            "jarvis.services.market_data",
+            level="ERROR",
+        ) as captured:
+            with self.assertRaises(RuntimeError) as context:
+                self.service.initialize()
+
+        self.assertIs(
+            context.exception,
+            failure,
+        )
+        self.assertFalse(
+            self.service.initialized
+        )
+        self.assertEqual(
+            captured.records[0].event,
+            "market.service.initialization.failed",
+        )
+        self.assertEqual(
+            captured.records[0].error_type,
+            "RuntimeError",
+        )
+        self.assertNotIn(
+            "vendor-secret",
+            captured.records[0].getMessage(),
+        )
+
     def test_rejects_request_before_initialization(self):
         with self.assertRaises(ClientNotInitializedError):
             self.service.get_quote(
@@ -120,6 +157,30 @@ class MarketDataServiceTests(unittest.TestCase):
                 symbol="RELIANCE-EQ",
                 observed_at=self.observed_at,
             )
+
+    def test_rejects_historical_request_before_initialization(self):
+        with self.assertLogs(
+            "jarvis.services.market_data",
+            level="ERROR",
+        ) as captured:
+            with self.assertRaises(ClientNotInitializedError):
+                self.service.get_historical_series(
+                    exchange="NSE",
+                    symbol_token="2885",
+                    symbol="RELIANCE-EQ",
+                    interval="ONE_DAY",
+                    from_date="2026-08-01 09:15",
+                    to_date="2026-08-17 15:30",
+                )
+
+        self.assertEqual(
+            captured.records[0].event,
+            "market.history.failed",
+        )
+        self.assertEqual(
+            captured.records[0].error_type,
+            "ClientNotInitializedError",
+        )
 
     def test_delegates_quote_request_to_gateway(self):
         self.service.initialize()
@@ -224,6 +285,31 @@ class MarketDataServiceTests(unittest.TestCase):
         self.assertEqual(quote.observed_at, self.observed_at)
         self.assertEqual(quote.source, "angel_one")
 
+    def test_quote_uses_current_utc_time_by_default(self):
+        self.service.initialize()
+        before_request = datetime.now(timezone.utc)
+
+        quote = self.service.get_quote(
+            exchange="NSE",
+            symbol_token="2885",
+            symbol="RELIANCE-EQ",
+        )
+
+        after_request = datetime.now(timezone.utc)
+
+        self.assertLessEqual(
+            before_request,
+            quote.observed_at,
+        )
+        self.assertLessEqual(
+            quote.observed_at,
+            after_request,
+        )
+        self.assertEqual(
+            quote.observed_at.utcoffset(),
+            timedelta(0),
+        )
+
     def test_rejects_unsuccessful_quote_response(self):
         self.gateway.quote_response = {
             "status": False,
@@ -248,13 +334,18 @@ class MarketDataServiceTests(unittest.TestCase):
         }
         self.service.initialize()
 
-        with self.assertRaises(DataValidationError):
+        with self.assertRaises(DataValidationError) as context:
             self.service.get_quote(
                 exchange="NSE",
                 symbol_token="2885",
                 symbol="RELIANCE-EQ",
                 observed_at=self.observed_at,
             )
+
+        self.assertIsInstance(
+            context.exception.__cause__,
+            KeyError,
+        )
 
     def test_delegates_history_request_to_gateway(self):
         self.service.initialize()
@@ -394,6 +485,34 @@ class MarketDataServiceTests(unittest.TestCase):
             self.assertEqual(series.retrieved_at, self.observed_at)
             self.assertEqual(series.source, "angel_one")
 
+    def test_historical_series_uses_current_utc_time_by_default(self):
+        self.service.initialize()
+        before_request = datetime.now(timezone.utc)
+
+        series = self.service.get_historical_series(
+            exchange="NSE",
+            symbol_token="2885",
+            symbol="RELIANCE-EQ",
+            interval="ONE_DAY",
+            from_date="2026-08-01 09:15",
+            to_date="2026-08-17 15:30",
+        )
+
+        after_request = datetime.now(timezone.utc)
+
+        self.assertLessEqual(
+            before_request,
+            series.retrieved_at,
+        )
+        self.assertLessEqual(
+            series.retrieved_at,
+            after_request,
+        )
+        self.assertEqual(
+            series.retrieved_at.utcoffset(),
+            timedelta(0),
+        )
+
     def test_rejects_unsuccessful_historical_response(self):
         self.gateway.history_response = {
             "status": False,
@@ -447,7 +566,7 @@ class MarketDataServiceTests(unittest.TestCase):
         }
         self.service.initialize()
 
-        with self.assertRaises(DataValidationError):
+        with self.assertRaises(DataValidationError) as context:
             self.service.get_historical_series(
                 exchange="NSE",
                 symbol_token="2885",
@@ -457,6 +576,11 @@ class MarketDataServiceTests(unittest.TestCase):
                 to_date="2026-08-17 15:30",
                 retrieved_at=self.observed_at,
             )
+
+        self.assertIsInstance(
+            context.exception.__cause__,
+            IndexError,
+        )
 
 if __name__ == "__main__":
     unittest.main()
