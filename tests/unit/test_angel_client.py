@@ -5,6 +5,7 @@ from app.config import Settings
 from app.exceptions import (
     AuthenticationError,
     ClientNotInitializedError,
+    MarketDataError,
 )
 
 
@@ -70,6 +71,18 @@ class RejectedSmartConnect(FakeSmartConnect):
             "status": False,
             "message": "Invalid credentials",
         }
+
+
+class FailingQuoteSmartConnect(FakeSmartConnect):
+    def ltpData(
+        self,
+        exchange,
+        symbol,
+        symbol_token,
+    ):
+        raise RuntimeError(
+            "api_key=vendor-secret"
+        )
 
 
 class AngelOneClientTests(unittest.TestCase):
@@ -144,6 +157,79 @@ class AngelOneClientTests(unittest.TestCase):
 
         with self.assertRaises(AuthenticationError):
             client.initialize()
+
+    def test_logs_authentication_lifecycle_without_secrets(self):
+        client = AngelOneClient(
+            settings=self.settings,
+            client_factory=FakeSmartConnect,
+        )
+
+        with self.assertLogs(
+            "jarvis.angel.client",
+            level="INFO",
+        ) as captured:
+            client.initialize()
+
+        events = [
+            getattr(record, "event", None)
+            for record in captured.records
+        ]
+        messages = " ".join(
+            record.getMessage()
+            for record in captured.records
+        )
+
+        self.assertIn(
+            "angel.authentication.started",
+            events,
+        )
+        self.assertIn(
+            "angel.authentication.succeeded",
+            events,
+        )
+        self.assertNotIn(
+            "test-api-key",
+            messages,
+        )
+        self.assertNotIn(
+            "test-client-code",
+            messages,
+        )
+        self.assertNotIn(
+            "1234",
+            messages,
+        )
+
+    def test_logs_quote_failure_without_vendor_message(self):
+        client = AngelOneClient(
+            settings=self.settings,
+            client_factory=FailingQuoteSmartConnect,
+        )
+        client.initialize()
+
+        with self.assertLogs(
+            "jarvis.angel.client",
+            level="ERROR",
+        ) as captured:
+            with self.assertRaises(MarketDataError):
+                client.get_ltp(
+                    exchange="NSE",
+                    symbol_token="2885",
+                    symbol="RELIANCE-EQ",
+                )
+
+        self.assertEqual(
+            captured.records[0].event,
+            "angel.quote.failed",
+        )
+        self.assertEqual(
+            captured.records[0].error_type,
+            "RuntimeError",
+        )
+        self.assertNotIn(
+            "vendor-secret",
+            captured.records[0].getMessage(),
+        )
 
 
 if __name__ == "__main__":

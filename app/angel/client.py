@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from time import perf_counter
 from typing import Any
 
 import pyotp
@@ -10,9 +11,18 @@ from app.exceptions import (
     MarketDataError,
 )
 from app.gateways.market_data import MarketResponse
+from app.logging_config import get_logger
 
 
 ClientFactory = Callable[..., Any]
+logger = get_logger(__name__)
+
+
+def _duration_ms(started_at: float) -> float:
+    return round(
+        (perf_counter() - started_at) * 1000,
+        3,
+    )
 
 
 class AngelOneClient:
@@ -37,6 +47,15 @@ class AngelOneClient:
         self.login()
 
     def login(self) -> MarketResponse:
+        started_at = perf_counter()
+
+        logger.info(
+            "Angel One authentication started",
+            extra={
+                "event": "angel.authentication.started",
+            },
+        )
+
         try:
             totp = pyotp.TOTP(
                 self.settings.angel_totp_secret.get_secret_value()
@@ -48,16 +67,42 @@ class AngelOneClient:
                 totp,
             )
         except Exception as exc:
+            logger.error(
+                "Angel One authentication request failed",
+                extra={
+                    "event": "angel.authentication.failed",
+                    "duration_ms": _duration_ms(started_at),
+                    "error_type": type(exc).__name__,
+                },
+            )
+
             raise AuthenticationError(
                 "Unable to authenticate with Angel One"
             ) from exc
 
         if not isinstance(response, dict) or not response.get("status"):
+            logger.warning(
+                "Angel One authentication was rejected",
+                extra={
+                    "event": "angel.authentication.rejected",
+                    "duration_ms": _duration_ms(started_at),
+                },
+            )
+
             raise AuthenticationError(
                 "Angel One rejected the authentication request"
             )
 
         self.session = response
+
+        logger.info(
+            "Angel One authentication succeeded",
+            extra={
+                "event": "angel.authentication.succeeded",
+                "duration_ms": _duration_ms(started_at),
+            },
+        )
+
         return response
 
     def _require_session(self) -> None:
@@ -73,17 +118,53 @@ class AngelOneClient:
         symbol: str,
     ) -> MarketResponse:
         self._require_session()
+        started_at = perf_counter()
+
+        logger.debug(
+            "Angel One quote request started",
+            extra={
+                "event": "angel.quote.started",
+                "exchange": exchange,
+                "symbol": symbol,
+                "symbol_token": symbol_token,
+            },
+        )
 
         try:
-            return self.client.ltpData(
+            response = self.client.ltpData(
                 exchange,
                 symbol,
                 symbol_token,
             )
         except Exception as exc:
+            logger.error(
+                "Angel One quote request failed",
+                extra={
+                    "event": "angel.quote.failed",
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "symbol_token": symbol_token,
+                    "duration_ms": _duration_ms(started_at),
+                    "error_type": type(exc).__name__,
+                },
+            )
+
             raise MarketDataError(
                 f"Unable to retrieve market quote for {symbol}"
             ) from exc
+
+        logger.debug(
+            "Angel One quote request succeeded",
+            extra={
+                "event": "angel.quote.succeeded",
+                "exchange": exchange,
+                "symbol": symbol,
+                "symbol_token": symbol_token,
+                "duration_ms": _duration_ms(started_at),
+            },
+        )
+
+        return response
 
     def get_historical_candles(
         self,
@@ -94,6 +175,19 @@ class AngelOneClient:
         to_date: str,
     ) -> MarketResponse:
         self._require_session()
+        started_at = perf_counter()
+
+        logger.debug(
+            "Angel One historical request started",
+            extra={
+                "event": "angel.history.started",
+                "exchange": exchange,
+                "symbol_token": symbol_token,
+                "interval": interval,
+                "from_date": from_date,
+                "to_date": to_date,
+            },
+        )
 
         params = {
             "exchange": exchange,
@@ -104,8 +198,33 @@ class AngelOneClient:
         }
 
         try:
-            return self.client.getCandleData(params)
+            response = self.client.getCandleData(params)
         except Exception as exc:
+            logger.error(
+                "Angel One historical request failed",
+                extra={
+                    "event": "angel.history.failed",
+                    "exchange": exchange,
+                    "symbol_token": symbol_token,
+                    "interval": interval,
+                    "duration_ms": _duration_ms(started_at),
+                    "error_type": type(exc).__name__,
+                },
+            )
+
             raise MarketDataError(
                 "Unable to retrieve historical market data"
             ) from exc
+
+        logger.debug(
+            "Angel One historical request succeeded",
+            extra={
+                "event": "angel.history.succeeded",
+                "exchange": exchange,
+                "symbol_token": symbol_token,
+                "interval": interval,
+                "duration_ms": _duration_ms(started_at),
+            },
+        )
+
+        return response
