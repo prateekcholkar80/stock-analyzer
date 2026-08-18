@@ -1,8 +1,11 @@
+import os
 import unittest
+from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from app.config import Settings
+from app.config import Settings, get_settings
+from app.exceptions import ConfigurationError
 
 
 class SettingsTests(unittest.TestCase):
@@ -48,6 +51,20 @@ class SettingsTests(unittest.TestCase):
         self.assertNotIn("test-totp-secret", representation)
         self.assertIn("**********", representation)
 
+    def tearDown(self):
+        get_settings.cache_clear()
+
+    def test_get_settings_wraps_validation_failure(self):
+        get_settings.cache_clear()
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ConfigurationError) as context:
+                get_settings()
+
+        self.assertIsInstance(
+            context.exception.__cause__,
+            ValidationError,
+        )
 
 if __name__ == "__main__":
     unittest.main()

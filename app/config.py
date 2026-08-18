@@ -3,7 +3,16 @@ from collections.abc import Mapping
 from functools import lru_cache
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+)
+
+from app.exceptions import ConfigurationError
 
 
 load_dotenv()
@@ -47,4 +56,9 @@ class Settings(BaseModel):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings.from_environment()
+    try:
+        return Settings.from_environment()
+    except ValidationError as exc:
+        raise ConfigurationError(
+            "Application configuration is missing or invalid"
+        ) from exc
