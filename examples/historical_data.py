@@ -1,8 +1,11 @@
 from app.angel.client import AngelOneClient
+from app.logging_config import configure_logging
 from app.services.market_data import MarketDataService
 
 
 def main():
+    configure_logging()
+
     market_service = MarketDataService(
         gateway=AngelOneClient()
     )

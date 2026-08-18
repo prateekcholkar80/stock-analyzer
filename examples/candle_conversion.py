@@ -1,7 +1,10 @@
+from app.logging_config import configure_logging
 from app.services.market_data import MarketDataService
 
 
 def main():
+    configure_logging()
+
     raw_data = [
         [
             "2026-08-17T00:00:00+05:30",

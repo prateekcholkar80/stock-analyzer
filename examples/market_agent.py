@@ -1,7 +1,10 @@
 from app.agents.market_agent import MarketAgent
+from app.logging_config import configure_logging
 
 
 def main():
+    configure_logging()
+
     agent = MarketAgent()
 
     quote = agent.get_stock_price(

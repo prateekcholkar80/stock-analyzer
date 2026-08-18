@@ -1,7 +1,9 @@
 from app.angel.client import AngelOneClient
+from app.logging_config import configure_logging
 
 
 def main():
+    configure_logging()
 
     angel_client = AngelOneClient()
 
