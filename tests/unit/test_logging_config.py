@@ -3,9 +3,11 @@ import logging
 import unittest
 
 from app.logging_config import (
+    LOGGER_NAMESPACE,
     JsonLogFormatter,
     OperationContextFilter,
     REDACTED_VALUE,
+    configure_logging,
     get_operation_id,
     operation_context,
 )
@@ -105,6 +107,84 @@ class JsonLogFormatterTests(unittest.TestCase):
         self.assertIn(
             REDACTED_VALUE,
             payload["message"],
+        )
+
+
+class LoggingConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        self.application_logger = logging.getLogger(
+            LOGGER_NAMESPACE
+        )
+        self.original_handlers = list(
+            self.application_logger.handlers
+        )
+        self.original_level = self.application_logger.level
+        self.original_propagate = (
+            self.application_logger.propagate
+        )
+
+        self.application_logger.handlers = []
+
+    def tearDown(self):
+        for handler in self.application_logger.handlers:
+            if handler not in self.original_handlers:
+                handler.close()
+
+        self.application_logger.handlers = (
+            self.original_handlers
+        )
+        self.application_logger.setLevel(
+            self.original_level
+        )
+        self.application_logger.propagate = (
+            self.original_propagate
+        )
+
+    def test_configure_logging_is_idempotent(self):
+        configure_logging("INFO")
+        configure_logging("INFO")
+
+        self.assertEqual(
+            len(self.application_logger.handlers),
+            1,
+        )
+        self.assertIsInstance(
+            self.application_logger.handlers[0].formatter,
+            JsonLogFormatter,
+        )
+        self.assertFalse(
+            self.application_logger.propagate
+        )
+
+    def test_configure_logging_updates_existing_handler_level(self):
+        configure_logging("INFO")
+        handler = self.application_logger.handlers[0]
+
+        configure_logging("DEBUG")
+
+        self.assertIs(
+            self.application_logger.handlers[0],
+            handler,
+        )
+        self.assertEqual(
+            self.application_logger.level,
+            logging.DEBUG,
+        )
+        self.assertEqual(
+            handler.level,
+            logging.DEBUG,
+        )
+
+    def test_configure_logging_rejects_invalid_level(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "Invalid logging level",
+        ):
+            configure_logging("VERBOSE")
+
+        self.assertEqual(
+            self.application_logger.handlers,
+            [],
         )
 
 
