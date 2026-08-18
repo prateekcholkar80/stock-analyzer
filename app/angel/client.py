@@ -1,27 +1,27 @@
 import pyotp
 from SmartApi import SmartConnect
 
-from app.config import settings
+from app.config import Settings, get_settings
 
 
 class AngelOneClient:
+    def __init__(self, settings: Settings | None = None):
+        self.settings = settings or get_settings()
 
-    def __init__(self):
         self.client = SmartConnect(
-            api_key=settings.ANGEL_API_KEY
+            api_key=self.settings.angel_api_key.get_secret_value()
         )
 
         self.session = None
 
     def login(self):
-
         totp = pyotp.TOTP(
-            settings.ANGEL_TOTP_SECRET
+            self.settings.angel_totp_secret.get_secret_value()
         ).now()
 
         response = self.client.generateSession(
-            settings.ANGEL_CLIENT_CODE,
-            settings.ANGEL_PIN,
+            self.settings.angel_client_code.get_secret_value(),
+            self.settings.angel_pin.get_secret_value(),
             totp,
         )
 
@@ -31,5 +31,4 @@ class AngelOneClient:
             )
 
         self.session = response
-
         return response
