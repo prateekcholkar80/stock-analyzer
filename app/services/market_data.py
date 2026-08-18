@@ -2,77 +2,68 @@ from datetime import datetime
 
 from pydantic import ValidationError
 
-from app.angel.client import AngelOneClient
 from app.exceptions import (
     ClientNotInitializedError,
     DataValidationError,
-    MarketDataError,
+)
+from app.gateways.market_data import (
+    MarketDataGateway,
+    MarketResponse,
 )
 from app.models.market import Candle
 
 
 class MarketDataService:
-    def __init__(self):
-        self.angel_client = AngelOneClient()
-        self.client = None
+    def __init__(self, gateway: MarketDataGateway):
+        self.gateway = gateway
+        self.initialized = False
 
-    def initialize(self):
-        self.angel_client.login()
-        self.client = self.angel_client.client
+    def initialize(self) -> None:
+        self.gateway.initialize()
+        self.initialized = True
 
-    def _require_client(self):
-        if self.client is None:
+    def _require_gateway(self) -> MarketDataGateway:
+        if not self.initialized:
             raise ClientNotInitializedError(
-                "Market data client is not initialized"
+                "Market data service is not initialized"
             )
 
-        return self.client
+        return self.gateway
 
     def get_ltp(
         self,
-        exchange,
-        symbol_token,
-        symbol,
-    ):
-        client = self._require_client()
+        exchange: str,
+        symbol_token: str,
+        symbol: str,
+    ) -> MarketResponse:
+        gateway = self._require_gateway()
 
-        try:
-            return client.ltpData(
-                exchange,
-                symbol,
-                symbol_token,
-            )
-        except Exception as exc:
-            raise MarketDataError(
-                f"Unable to retrieve market quote for {symbol}"
-            ) from exc
+        return gateway.get_ltp(
+            exchange=exchange,
+            symbol_token=symbol_token,
+            symbol=symbol,
+        )
 
     def get_historical_candles(
         self,
-        exchange,
-        symbol_token,
-        interval,
-        from_date,
-        to_date,
-    ):
-        client = self._require_client()
+        exchange: str,
+        symbol_token: str,
+        interval: str,
+        from_date: str,
+        to_date: str,
+    ) -> MarketResponse:
+        gateway = self._require_gateway()
 
-        params = {
-            "exchange": exchange,
-            "symboltoken": symbol_token,
-            "interval": interval,
-            "fromdate": from_date,
-            "todate": to_date,
-        }
+        return gateway.get_historical_candles(
+            exchange=exchange,
+            symbol_token=symbol_token,
+            interval=interval,
+            from_date=from_date,
+            to_date=to_date,
+        )
 
-        try:
-            return client.getCandleData(params)
-        except Exception as exc:
-            raise MarketDataError(
-                "Unable to retrieve historical market data"
-            ) from exc
-
-    def convert_to_candles(self, candle_data):
+    @staticmethod
+    def convert_to_candles(candle_data) -> list[Candle]:
         try:
             return [
                 Candle(

@@ -2,9 +2,6 @@ from app.services.market_data import MarketDataService
 
 
 def main():
-
-    market_service = MarketDataService()
-
     raw_data = [
         [
             "2026-08-17T00:00:00+05:30",
@@ -12,11 +9,11 @@ def main():
             1320.8,
             1298.1,
             1320.0,
-            13090231
+            13090231,
         ]
     ]
 
-    candles = market_service.convert_to_candles(raw_data)
+    candles = MarketDataService.convert_to_candles(raw_data)
 
     print(candles[0])
     print(type(candles[0]))

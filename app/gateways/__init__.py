@@ -1,0 +1,1 @@
+"""Interfaces for external application integrations."""
