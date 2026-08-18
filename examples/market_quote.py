@@ -8,13 +8,13 @@ def main():
     )
     market_service.initialize()
 
-    response = market_service.get_ltp(
+    quote = market_service.get_quote(
         exchange="NSE",
         symbol_token="2885",
         symbol="RELIANCE-EQ",
     )
 
-    print(response)
+    print(quote.model_dump(mode="json"))
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+from app.models.market import MarketQuote
 from app.services.market_data import MarketDataService
 
 
@@ -27,10 +28,10 @@ def get_current_price(
     exchange: str,
     symbol_token: str,
     symbol: str,
-):
+) -> MarketQuote:
     market_service = get_market_service()
 
-    return market_service.get_ltp(
+    return market_service.get_quote(
         exchange=exchange,
         symbol_token=symbol_token,
         symbol=symbol,

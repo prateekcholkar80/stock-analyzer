@@ -1,6 +1,15 @@
+from datetime import datetime, timezone
 import unittest
 
-from app.exceptions import ClientNotInitializedError
+from app.exceptions import (
+    ClientNotInitializedError,
+    DataValidationError,
+    MarketDataError,
+)
+from app.models.market import (
+    HistoricalCandleSeries,
+    MarketQuote,
+)
 from app.services.market_data import MarketDataService
 
 
@@ -9,6 +18,21 @@ class FakeMarketDataGateway:
         self.initialized = False
         self.last_quote_request = None
         self.last_history_request = None
+
+        self.quote_response = {
+            "status": True,
+            "data": {
+                "ltp": 1320.0,
+                "open": 1314.0,
+                "high": 1320.8,
+                "low": 1298.1,
+                "close": 1305.0,
+            },
+        }
+        self.history_response = {
+            "status": True,
+            "data": [],
+        }
 
     def initialize(self):
         self.initialized = True
@@ -25,12 +49,7 @@ class FakeMarketDataGateway:
             "symbol": symbol,
         }
 
-        return {
-            "status": True,
-            "data": {
-                "ltp": 1320.0,
-            },
-        }
+        return self.quote_response
 
     def get_historical_candles(
         self,
@@ -48,16 +67,21 @@ class FakeMarketDataGateway:
             "to_date": to_date,
         }
 
-        return {
-            "status": True,
-            "data": [],
-        }
+        return self.history_response
 
 
 class MarketDataServiceTests(unittest.TestCase):
     def setUp(self):
         self.gateway = FakeMarketDataGateway()
         self.service = MarketDataService(gateway=self.gateway)
+        self.observed_at = datetime(
+            2026,
+            8,
+            17,
+            10,
+            0,
+            tzinfo=timezone.utc,
+        )
 
     def test_initializes_injected_gateway(self):
         self.service.initialize()
@@ -67,22 +91,24 @@ class MarketDataServiceTests(unittest.TestCase):
 
     def test_rejects_request_before_initialization(self):
         with self.assertRaises(ClientNotInitializedError):
-            self.service.get_ltp(
+            self.service.get_quote(
                 exchange="NSE",
                 symbol_token="2885",
                 symbol="RELIANCE-EQ",
+                observed_at=self.observed_at,
             )
 
     def test_delegates_quote_request_to_gateway(self):
         self.service.initialize()
 
-        response = self.service.get_ltp(
+        quote = self.service.get_quote(
             exchange="NSE",
             symbol_token="2885",
             symbol="RELIANCE-EQ",
+            observed_at=self.observed_at,
         )
 
-        self.assertEqual(response["data"]["ltp"], 1320.0)
+        self.assertEqual(quote.price, 1320.0)
         self.assertEqual(
             self.gateway.last_quote_request,
             {
@@ -92,18 +118,71 @@ class MarketDataServiceTests(unittest.TestCase):
             },
         )
 
+    def test_returns_normalized_market_quote(self):
+        self.service.initialize()
+
+        quote = self.service.get_quote(
+            exchange="NSE",
+            symbol_token="2885",
+            symbol="RELIANCE-EQ",
+            observed_at=self.observed_at,
+        )
+
+        self.assertIsInstance(quote, MarketQuote)
+        self.assertEqual(quote.price, 1320.0)
+        self.assertEqual(quote.previous_close, 1305.0)
+        self.assertEqual(quote.exchange, "NSE")
+        self.assertEqual(quote.symbol_token, "2885")
+        self.assertEqual(quote.symbol, "RELIANCE-EQ")
+        self.assertEqual(quote.observed_at, self.observed_at)
+        self.assertEqual(quote.source, "angel_one")
+
+    def test_rejects_unsuccessful_quote_response(self):
+        self.gateway.quote_response = {
+            "status": False,
+            "message": "Quote unavailable",
+        }
+        self.service.initialize()
+
+        with self.assertRaises(MarketDataError):
+            self.service.get_quote(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                observed_at=self.observed_at,
+            )
+
+    def test_rejects_malformed_quote_data(self):
+        self.gateway.quote_response = {
+            "status": True,
+            "data": {
+                "ltp": 1320.0,
+            },
+        }
+        self.service.initialize()
+
+        with self.assertRaises(DataValidationError):
+            self.service.get_quote(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                observed_at=self.observed_at,
+            )
+
     def test_delegates_history_request_to_gateway(self):
         self.service.initialize()
 
-        response = self.service.get_historical_candles(
+        series = self.service.get_historical_series(
             exchange="NSE",
             symbol_token="2885",
+            symbol="RELIANCE-EQ",
             interval="ONE_DAY",
             from_date="2026-08-01 09:15",
             to_date="2026-08-17 15:30",
+            retrieved_at=self.observed_at,
         )
 
-        self.assertEqual(response["data"], [])
+        self.assertEqual(series.candles, [])
         self.assertEqual(
             self.gateway.last_history_request,
             {
@@ -115,6 +194,108 @@ class MarketDataServiceTests(unittest.TestCase):
             },
         )
 
+    def test_returns_normalized_historical_series(self):
+            self.gateway.history_response = {
+            "status": True,
+            "data": [
+                [
+                    "2026-08-17T00:00:00+05:30",
+                    1314.0,
+                    1320.8,
+                    1298.1,
+                    1320.0,
+                    13_090_231,
+                ]
+            ],
+        }
+            self.service.initialize()
+
+            series = self.service.get_historical_series(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                interval="ONE_DAY",
+                from_date="2026-08-01 09:15",
+                to_date="2026-08-17 15:30",
+                retrieved_at=self.observed_at,
+        )
+
+            self.assertIsInstance(
+                series,
+                HistoricalCandleSeries,
+        )
+            self.assertEqual(series.exchange, "NSE")
+            self.assertEqual(series.symbol_token, "2885")
+            self.assertEqual(series.symbol, "RELIANCE-EQ")
+            self.assertEqual(series.interval, "ONE_DAY")
+            self.assertEqual(len(series.candles), 1)
+            self.assertEqual(series.candles[0].close, 1320.0)
+            self.assertEqual(series.retrieved_at, self.observed_at)
+            self.assertEqual(series.source, "angel_one")
+
+    def test_rejects_unsuccessful_historical_response(self):
+        self.gateway.history_response = {
+            "status": False,
+            "message": "Historical data unavailable",
+        }
+        self.service.initialize()
+
+        with self.assertRaises(MarketDataError):
+            self.service.get_historical_series(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                interval="ONE_DAY",
+                from_date="2026-08-01 09:15",
+                to_date="2026-08-17 15:30",
+                retrieved_at=self.observed_at,
+            )
+
+    def test_rejects_historical_response_without_candle_list(self):
+        self.gateway.history_response = {
+            "status": True,
+            "data": {
+                "unexpected": "value",
+            },
+        }
+        self.service.initialize()
+
+        with self.assertRaises(DataValidationError):
+            self.service.get_historical_series(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                interval="ONE_DAY",
+                from_date="2026-08-01 09:15",
+                to_date="2026-08-17 15:30",
+                retrieved_at=self.observed_at,
+            )
+
+    def test_rejects_invalid_historical_candle_row(self):
+        self.gateway.history_response = {
+            "status": True,
+            "data": [
+                [
+                    "2026-08-17T00:00:00+05:30",
+                    1314.0,
+                    1320.8,
+                    1298.1,
+                    1320.0,
+                ]
+            ],
+        }
+        self.service.initialize()
+
+        with self.assertRaises(DataValidationError):
+            self.service.get_historical_series(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                interval="ONE_DAY",
+                from_date="2026-08-01 09:15",
+                to_date="2026-08-17 15:30",
+                retrieved_at=self.observed_at,
+            )
 
 if __name__ == "__main__":
     unittest.main()
