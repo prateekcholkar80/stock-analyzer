@@ -60,6 +60,28 @@ class CandleModelTests(unittest.TestCase):
                 volume=-1,
             )
 
+    def test_rejects_candle_without_timestamp_timezone(self):
+        with self.assertRaises(ValidationError):
+            Candle(
+                timestamp="2026-08-17T00:00:00",
+                open=1314.0,
+                high=1320.8,
+                low=1298.1,
+                close=1320.0,
+                volume=13_090_231,
+            )
+
+    def test_rejects_low_above_open_or_close(self):
+        with self.assertRaises(ValidationError):
+            Candle(
+                timestamp="2026-08-17T00:00:00+05:30",
+                open=1314.0,
+                high=1320.8,
+                low=1315.0,
+                close=1320.0,
+                volume=13_090_231,
+            )
+
 
 class MarketQuoteModelTests(unittest.TestCase):
     def test_builds_valid_market_quote(self):
@@ -110,6 +132,50 @@ class MarketQuoteModelTests(unittest.TestCase):
                 observed_at="2026-08-17T15:30:00",
             )
 
+    def test_rejects_negative_quote_price(self):
+        with self.assertRaises(ValidationError):
+            MarketQuote(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                price=-1.0,
+                open=1314.0,
+                high=1320.8,
+                low=1298.1,
+                previous_close=1305.0,
+                observed_at="2026-08-17T15:30:00+05:30",
+            )
+
+    def test_rejects_empty_quote_metadata(self):
+        with self.assertRaises(ValidationError):
+            MarketQuote(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="",
+                price=1320.0,
+                open=1314.0,
+                high=1320.8,
+                low=1298.1,
+                previous_close=1305.0,
+                observed_at="2026-08-17T15:30:00+05:30",
+            )
+
+    def test_quote_is_immutable(self):
+        quote = MarketQuote(
+            exchange="NSE",
+            symbol_token="2885",
+            symbol="RELIANCE-EQ",
+            price=1320.0,
+            open=1314.0,
+            high=1320.8,
+            low=1298.1,
+            previous_close=1305.0,
+            observed_at="2026-08-17T15:30:00+05:30",
+        )
+
+        with self.assertRaises(ValidationError):
+            quote.price = 1400.0
+
 
 class HistoricalCandleSeriesModelTests(unittest.TestCase):
     def test_builds_series_with_market_metadata(self):
@@ -134,6 +200,28 @@ class HistoricalCandleSeriesModelTests(unittest.TestCase):
         self.assertEqual(len(series.candles), 1)
         self.assertEqual(series.candles[0], candle)
         self.assertEqual(series.source, "angel_one")
+
+    def test_rejects_series_without_retrieval_timezone(self):
+        with self.assertRaises(ValidationError):
+            HistoricalCandleSeries(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                interval="ONE_DAY",
+                candles=[],
+                retrieved_at="2026-08-17T15:31:00",
+            )
+
+    def test_rejects_empty_historical_interval(self):
+        with self.assertRaises(ValidationError):
+            HistoricalCandleSeries(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                interval="",
+                candles=[],
+                retrieved_at="2026-08-17T15:31:00+05:30",
+            )
 
 
 if __name__ == "__main__":
