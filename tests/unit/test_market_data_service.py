@@ -89,6 +89,29 @@ class MarketDataServiceTests(unittest.TestCase):
         self.assertTrue(self.gateway.initialized)
         self.assertTrue(self.service.initialized)
 
+    def test_logs_initialization_lifecycle(self):
+        with self.assertLogs(
+            "jarvis.services.market_data",
+            level="INFO",
+        ) as captured:
+            self.service.initialize()
+
+        events = [
+            getattr(record, "event", None)
+            for record in captured.records
+        ]
+
+        self.assertEqual(
+            events,
+            [
+                "market.service.initialization.started",
+                "market.service.initialization.succeeded",
+            ],
+        )
+        self.assertTrue(
+            hasattr(captured.records[-1], "duration_ms")
+        )
+
     def test_rejects_request_before_initialization(self):
         with self.assertRaises(ClientNotInitializedError):
             self.service.get_quote(
@@ -116,6 +139,70 @@ class MarketDataServiceTests(unittest.TestCase):
                 "symbol_token": "2885",
                 "symbol": "RELIANCE-EQ",
             },
+        )
+
+    def test_logs_quote_lifecycle(self):
+        self.service.initialize()
+
+        with self.assertLogs(
+            "jarvis.services.market_data",
+            level="DEBUG",
+        ) as captured:
+            self.service.get_quote(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                observed_at=self.observed_at,
+            )
+
+        events = [
+            getattr(record, "event", None)
+            for record in captured.records
+        ]
+
+        self.assertEqual(
+            events,
+            [
+                "market.quote.started",
+                "market.quote.succeeded",
+            ],
+        )
+        self.assertTrue(
+            hasattr(captured.records[-1], "duration_ms")
+        )
+
+    def test_logs_quote_failure_without_raw_response(self):
+        self.gateway.quote_response = {
+            "status": False,
+            "message": "api_key=vendor-secret",
+        }
+        self.service.initialize()
+
+        with self.assertLogs(
+            "jarvis.services.market_data",
+            level="ERROR",
+        ) as captured:
+            with self.assertRaises(MarketDataError):
+                self.service.get_quote(
+                    exchange="NSE",
+                    symbol_token="2885",
+                    symbol="RELIANCE-EQ",
+                    observed_at=self.observed_at,
+                )
+
+        record = captured.records[0]
+
+        self.assertEqual(
+            record.event,
+            "market.quote.failed",
+        )
+        self.assertEqual(
+            record.error_type,
+            "MarketDataError",
+        )
+        self.assertNotIn(
+            "vendor-secret",
+            record.getMessage(),
         )
 
     def test_returns_normalized_market_quote(self):
@@ -192,6 +279,80 @@ class MarketDataServiceTests(unittest.TestCase):
                 "from_date": "2026-08-01 09:15",
                 "to_date": "2026-08-17 15:30",
             },
+        )
+
+    def test_logs_historical_series_lifecycle(self):
+        self.service.initialize()
+
+        with self.assertLogs(
+            "jarvis.services.market_data",
+            level="DEBUG",
+        ) as captured:
+            self.service.get_historical_series(
+                exchange="NSE",
+                symbol_token="2885",
+                symbol="RELIANCE-EQ",
+                interval="ONE_DAY",
+                from_date="2026-08-01 09:15",
+                to_date="2026-08-17 15:30",
+                retrieved_at=self.observed_at,
+            )
+
+        events = [
+            getattr(record, "event", None)
+            for record in captured.records
+        ]
+
+        self.assertEqual(
+            events,
+            [
+                "market.history.started",
+                "market.history.succeeded",
+            ],
+        )
+        self.assertEqual(
+            captured.records[-1].candle_count,
+            0,
+        )
+        self.assertTrue(
+            hasattr(captured.records[-1], "duration_ms")
+        )
+
+    def test_logs_historical_failure_without_raw_response(self):
+        self.gateway.history_response = {
+            "status": False,
+            "message": "authorization=vendor-secret",
+        }
+        self.service.initialize()
+
+        with self.assertLogs(
+            "jarvis.services.market_data",
+            level="ERROR",
+        ) as captured:
+            with self.assertRaises(MarketDataError):
+                self.service.get_historical_series(
+                    exchange="NSE",
+                    symbol_token="2885",
+                    symbol="RELIANCE-EQ",
+                    interval="ONE_DAY",
+                    from_date="2026-08-01 09:15",
+                    to_date="2026-08-17 15:30",
+                    retrieved_at=self.observed_at,
+                )
+
+        record = captured.records[0]
+
+        self.assertEqual(
+            record.event,
+            "market.history.failed",
+        )
+        self.assertEqual(
+            record.error_type,
+            "MarketDataError",
+        )
+        self.assertNotIn(
+            "vendor-secret",
+            record.getMessage(),
         )
 
     def test_returns_normalized_historical_series(self):

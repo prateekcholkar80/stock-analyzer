@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from time import perf_counter
 
 from pydantic import ValidationError
 
@@ -16,6 +17,21 @@ from app.models.market import (
     HistoricalCandleSeries,
     MarketQuote,
 )
+from app.logging_config import (
+    get_logger,
+    get_operation_id,
+    operation_context,
+)
+
+
+logger = get_logger(__name__)
+
+
+def _duration_ms(started_at: float) -> float:
+    return round(
+        (perf_counter() - started_at) * 1000,
+        3,
+    )
 
 
 class MarketDataService:
@@ -24,8 +40,38 @@ class MarketDataService:
         self.initialized = False
 
     def initialize(self) -> None:
-        self.gateway.initialize()
-        self.initialized = True
+        with operation_context(get_operation_id()):
+            started_at = perf_counter()
+
+            logger.info(
+                "Market data service initialization started",
+                extra={
+                    "event": "market.service.initialization.started",
+                },
+            )
+
+            try:
+                self.gateway.initialize()
+            except Exception as exc:
+                logger.error(
+                    "Market data service initialization failed",
+                    extra={
+                        "event": "market.service.initialization.failed",
+                        "duration_ms": _duration_ms(started_at),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise
+
+            self.initialized = True
+
+            logger.info(
+                "Market data service initialization succeeded",
+                extra={
+                    "event": "market.service.initialization.succeeded",
+                    "duration_ms": _duration_ms(started_at),
+                },
+            )
 
     def _require_gateway(self) -> MarketDataGateway:
         if not self.initialized:
@@ -42,21 +88,61 @@ class MarketDataService:
         symbol: str,
         observed_at: datetime | None = None,
     ) -> MarketQuote:
-        gateway = self._require_gateway()
+        with operation_context(get_operation_id()):
+            started_at = perf_counter()
 
-        response = gateway.get_ltp(
-            exchange=exchange,
-            symbol_token=symbol_token,
-            symbol=symbol,
-        )
+            logger.debug(
+                "Market quote processing started",
+                extra={
+                    "event": "market.quote.started",
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "symbol_token": symbol_token,
+                },
+            )
 
-        return self.convert_to_quote(
-            response=response,
-            exchange=exchange,
-            symbol_token=symbol_token,
-            symbol=symbol,
-            observed_at=observed_at,
-        )
+            try:
+                gateway = self._require_gateway()
+
+                response = gateway.get_ltp(
+                    exchange=exchange,
+                    symbol_token=symbol_token,
+                    symbol=symbol,
+                )
+
+                quote = self.convert_to_quote(
+                    response=response,
+                    exchange=exchange,
+                    symbol_token=symbol_token,
+                    symbol=symbol,
+                    observed_at=observed_at,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Market quote processing failed",
+                    extra={
+                        "event": "market.quote.failed",
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "symbol_token": symbol_token,
+                        "duration_ms": _duration_ms(started_at),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise
+
+            logger.debug(
+                "Market quote processing succeeded",
+                extra={
+                    "event": "market.quote.succeeded",
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "symbol_token": symbol_token,
+                    "duration_ms": _duration_ms(started_at),
+                },
+            )
+
+            return quote
 
     @staticmethod
     def convert_to_quote(
@@ -106,27 +192,80 @@ class MarketDataService:
             ) from exc
 
     def get_historical_series(
-        self, exchange: str, symbol_token: str, symbol: str, interval: str, from_date: str,
-        to_date: str, retrieved_at: datetime | None = None,) -> HistoricalCandleSeries:
-        gateway = self._require_gateway()
+        self,
+        exchange: str,
+        symbol_token: str,
+        symbol: str,
+        interval: str,
+        from_date: str,
+        to_date: str,
+        retrieved_at: datetime | None = None,
+    ) -> HistoricalCandleSeries:
+        with operation_context(get_operation_id()):
+            started_at = perf_counter()
 
-        response = gateway.get_historical_candles(
-            exchange=exchange,
-            symbol_token=symbol_token,
-            interval=interval,
-            from_date=from_date,
-            to_date=to_date,
-        )
+            logger.debug(
+                "Historical market-data processing started",
+                extra={
+                    "event": "market.history.started",
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "symbol_token": symbol_token,
+                    "interval": interval,
+                    "from_date": from_date,
+                    "to_date": to_date,
+                },
+            )
 
-        return self.convert_to_historical_series(
-            response=response,
-            exchange=exchange,
-            symbol_token=symbol_token,
-            symbol=symbol,
-            interval=interval,
-            retrieved_at=retrieved_at,
-        )
-    
+            try:
+                gateway = self._require_gateway()
+
+                response = gateway.get_historical_candles(
+                    exchange=exchange,
+                    symbol_token=symbol_token,
+                    interval=interval,
+                    from_date=from_date,
+                    to_date=to_date,
+                )
+
+                series = self.convert_to_historical_series(
+                    response=response,
+                    exchange=exchange,
+                    symbol_token=symbol_token,
+                    symbol=symbol,
+                    interval=interval,
+                    retrieved_at=retrieved_at,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Historical market-data processing failed",
+                    extra={
+                        "event": "market.history.failed",
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "symbol_token": symbol_token,
+                        "interval": interval,
+                        "duration_ms": _duration_ms(started_at),
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                raise
+
+            logger.debug(
+                "Historical market-data processing succeeded",
+                extra={
+                    "event": "market.history.succeeded",
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "symbol_token": symbol_token,
+                    "interval": interval,
+                    "candle_count": len(series.candles),
+                    "duration_ms": _duration_ms(started_at),
+                },
+            )
+
+            return series
+
     @classmethod
     def convert_to_historical_series(
         cls,
