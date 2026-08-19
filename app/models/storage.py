@@ -56,6 +56,7 @@ class StoredMarketSeries(StorageModel):
 
 
 class StoredBacktestRun(StorageModel):
+    storage_schema_version: int = Field(default=1, ge=1)
     run_id: str = Field(
         min_length=1,
         max_length=200,
@@ -75,7 +76,10 @@ class StoredBacktestRun(StorageModel):
 
     @model_validator(mode="after")
     def validate_fingerprints(self) -> Self:
-        if self.result_fingerprint != payload_fingerprint(self.result):
+        if (
+            self.storage_schema_version >= 2
+            and self.result_fingerprint != payload_fingerprint(self.result)
+        ):
             raise ValueError(
                 "backtest fingerprint must match its result payload"
             )
@@ -237,6 +241,7 @@ def stored_backtest_run(
 ) -> StoredBacktestRun:
     result_fingerprint = payload_fingerprint(result)
     return StoredBacktestRun(
+        storage_schema_version=2,
         run_id=run_id or f"backtest:{result_fingerprint}",
         result_fingerprint=result_fingerprint,
         market_fingerprint=payload_fingerprint(result.market_series),

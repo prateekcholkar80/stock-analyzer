@@ -24,6 +24,10 @@ class TechnicalSwingAgent:
         return self._evaluator.config.evaluator_id
 
     @property
+    def config(self) -> UnifiedSwingEvaluatorConfig:
+        return self._evaluator.config
+
+    @property
     def configuration_fingerprint(self) -> str:
         serialized = self._evaluator.config.model_dump_json()
         return sha256(serialized.encode("utf-8")).hexdigest()

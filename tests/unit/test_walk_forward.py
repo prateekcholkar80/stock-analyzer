@@ -546,6 +546,43 @@ class WalkForwardBacktestTests(unittest.TestCase):
         )
         self.assertEqual(len(result.equity_curve), 60)
         self.assertTrue(result.configuration_fingerprint)
+        strategy = result.strategy_configuration
+        self.assertIsNotNone(strategy)
+        self.assertEqual(
+            strategy.category_weights,
+            {
+                "trend": 1.25,
+                "momentum": 1.0,
+                "volatility": 0.75,
+                "volume": 1.0,
+                "price_action": 1.5,
+            },
+        )
+        self.assertEqual(
+            strategy.walk_forward_configuration_fingerprint,
+            result.configuration_fingerprint,
+        )
+        self.assertIn("slow_sma_period", strategy.technical_parameters)
+        self.assertIn(
+            "minimum_reward_to_risk",
+            strategy.trade_planning_parameters,
+        )
+        self.assertTrue(
+            all(
+                evaluation.technical_profile is not None
+                for evaluation in result.evaluations
+                if evaluation.outcome
+                is not WalkForwardEvaluationOutcome.POSITION_ALREADY_OPEN
+            )
+        )
+
+        tampered = strategy.model_dump()
+        tampered["category_weights"]["price_action"] = 9.0
+        with self.assertRaisesRegex(
+            ValidationError,
+            "fingerprint must match all parameters",
+        ):
+            type(strategy).model_validate(tampered)
 
 
 if __name__ == "__main__":

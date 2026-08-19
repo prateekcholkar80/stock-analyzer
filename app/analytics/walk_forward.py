@@ -11,6 +11,7 @@ from app.models.agentic import (
     TradePlanningDisposition,
 )
 from app.models.backtest import (
+    BacktestStrategyConfiguration,
     BacktestSegmentPerformance,
     BacktestEquityPoint,
     WalkForwardBacktestConfig,
@@ -19,6 +20,7 @@ from app.models.backtest import (
     WalkForwardEvaluationRecord,
     WalkForwardPerformance,
     WalkForwardTradeRecord,
+    build_backtest_strategy_configuration,
 )
 from app.models.execution import (
     ExecutionSimulationConfig,
@@ -53,6 +55,10 @@ class WalkForwardBacktestEngine:
             )
         self.config = WalkForwardBacktestConfig.model_validate(
             (config or WalkForwardBacktestConfig()).model_dump()
+        )
+        self.strategy_configuration = _build_strategy_configuration(
+            self.orchestrator,
+            self.config,
         )
 
     @property
@@ -278,6 +284,7 @@ class WalkForwardBacktestEngine:
             configuration_fingerprint=self.configuration_fingerprint,
             market_series=series,
             config=self.config,
+            strategy_configuration=self.strategy_configuration,
             resolved_warmup_candles=warmup,
             evaluations=evaluations,
             trades=trades,
@@ -307,6 +314,56 @@ def _validate_orchestrator(orchestrator) -> None:
         raise ValueError(
             "walk-forward orchestrator must expose its technical agent"
         )
+
+
+def _build_strategy_configuration(
+    orchestrator,
+    config: WalkForwardBacktestConfig,
+) -> BacktestStrategyConfiguration | None:
+    technical_agent = orchestrator.technical_agent
+    technical_config = getattr(technical_agent, "config", None)
+    planning_agent = getattr(orchestrator, "trade_planning_agent", None)
+    planning_config = getattr(planning_agent, "config", None)
+    if (
+        technical_config is None
+        or not callable(getattr(technical_config, "model_dump", None))
+        or planning_agent is None
+        or planning_config is None
+        or not callable(getattr(planning_config, "model_dump", None))
+    ):
+        return None
+    execution_config = HistoricalExecutionAgentConfig(
+        simulation=config.execution
+    )
+    execution_fingerprint = sha256(
+        execution_config.model_dump_json().encode("utf-8")
+    ).hexdigest()
+    category_weights = {
+        category.value: weight
+        for category, weight in technical_config.category_weights.items()
+    }
+    return build_backtest_strategy_configuration(
+        technical_agent_id=technical_agent.agent_id,
+        technical_evaluator_id=technical_agent.evaluator_id,
+        technical_configuration_fingerprint=(
+            technical_agent.configuration_fingerprint
+        ),
+        technical_parameters=technical_config.model_dump(mode="json"),
+        trade_planning_agent_id=planning_agent.agent_id,
+        trade_planner_id=planning_agent.planner_id,
+        trade_planning_configuration_fingerprint=(
+            planning_agent.configuration_fingerprint
+        ),
+        trade_planning_parameters=planning_config.model_dump(mode="json"),
+        execution_engine_id=execution_config.execution_engine_id,
+        execution_configuration_fingerprint=execution_fingerprint,
+        execution_parameters=execution_config.model_dump(mode="json"),
+        walk_forward_configuration_fingerprint=sha256(
+            config.model_dump_json().encode("utf-8")
+        ).hexdigest(),
+        walk_forward_parameters=config.model_dump(mode="json"),
+        category_weights=category_weights,
+    )
 
 
 def _prepare_market_series(
@@ -387,6 +444,10 @@ def _technical_fields(result) -> dict:
     return {
         "technical_submission_id": result.submission.submission_id,
         "technical_decision_id": result.decision.decision_id,
+        "technical_configuration_fingerprint": (
+            result.submission.configuration_fingerprint
+        ),
+        "technical_profile": result.submission.profile,
         "signal_direction": result.submission.profile.direction,
         "signal_stance": result.submission.profile.stance,
         "signal_score": result.submission.profile.score,
@@ -397,6 +458,9 @@ def _planning_fields(result) -> dict:
     return {
         "planning_submission_id": result.submission.submission_id,
         "planning_decision_id": result.decision.decision_id,
+        "planning_configuration_fingerprint": (
+            result.submission.configuration_fingerprint
+        ),
         "planning_disposition": result.submission.disposition,
         "planning_reason": result.submission.reason,
     }
@@ -406,6 +470,9 @@ def _execution_fields(result) -> dict:
     return {
         "execution_submission_id": result.submission.submission_id,
         "execution_decision_id": result.decision.decision_id,
+        "execution_configuration_fingerprint": (
+            result.submission.configuration_fingerprint
+        ),
         "execution_outcome": result.submission.execution.outcome,
     }
 

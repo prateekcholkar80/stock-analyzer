@@ -1,10 +1,17 @@
+import json
 from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
 from math import isclose, isfinite
 from typing import Self
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
 
 from app.models.agentic import (
     TradePlanningDisposition,
@@ -16,7 +23,12 @@ from app.models.execution import (
     SelectedExecutionTarget,
 )
 from app.models.market import Candle, HistoricalCandleSeries
-from app.models.signals import SignalDirection, SwingTradingStance
+from app.models.signals import (
+    SignalCategory,
+    SignalDirection,
+    SwingTradingSignalProfile,
+    SwingTradingStance,
+)
 from app.models.technical import TechnicalModel
 from app.models.trade_setup import TradeDirection
 
@@ -32,6 +44,146 @@ class WalkForwardEvaluationOutcome(StrEnum):
     TRADE_OPEN = "trade_open"
     POSITION_ALREADY_OPEN = "position_already_open"
     CAPITAL_DEPLETED = "capital_depleted"
+
+
+class BacktestStrategyConfiguration(TechnicalModel):
+    """Immutable snapshot of every setting that can affect a run."""
+
+    strategy_id: str = Field(
+        default="jarvis.swing_walk_forward.v1",
+        min_length=1,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    technical_agent_id: str = Field(min_length=1)
+    technical_evaluator_id: str = Field(min_length=1)
+    technical_configuration_fingerprint: str = Field(
+        pattern=r"^[a-f0-9]{64}$"
+    )
+    technical_parameters: dict[str, JsonValue]
+    trade_planning_agent_id: str = Field(min_length=1)
+    trade_planner_id: str = Field(min_length=1)
+    trade_planning_configuration_fingerprint: str = Field(
+        pattern=r"^[a-f0-9]{64}$"
+    )
+    trade_planning_parameters: dict[str, JsonValue]
+    execution_engine_id: str = Field(min_length=1)
+    execution_configuration_fingerprint: str = Field(
+        pattern=r"^[a-f0-9]{64}$"
+    )
+    execution_parameters: dict[str, JsonValue]
+    walk_forward_configuration_fingerprint: str = Field(
+        pattern=r"^[a-f0-9]{64}$"
+    )
+    walk_forward_parameters: dict[str, JsonValue]
+    category_weights: dict[str, float]
+    configuration_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @field_validator("category_weights", mode="before")
+    @classmethod
+    def validate_category_weights(
+        cls,
+        values: dict[str, float],
+    ) -> dict[str, float]:
+        expected = {category.value for category in SignalCategory}
+        if set(values) != expected:
+            raise ValueError(
+                "backtest strategy weights must cover every category"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not isfinite(float(value))
+            or value <= 0
+            for value in values.values()
+        ):
+            raise ValueError(
+                "backtest strategy weights must be positive and finite"
+            )
+        return {name: float(value) for name, value in values.items()}
+
+    @model_validator(mode="after")
+    def validate_configuration_fingerprint(self) -> Self:
+        if self.configuration_fingerprint != (
+            _strategy_configuration_fingerprint(self)
+        ):
+            raise ValueError(
+                "backtest strategy fingerprint must match all parameters"
+            )
+        return self
+
+    @property
+    def strategy_configuration_id(self) -> str:
+        return f"strategy:{self.configuration_fingerprint}"
+
+
+def build_backtest_strategy_configuration(
+    *,
+    technical_agent_id: str,
+    technical_evaluator_id: str,
+    technical_configuration_fingerprint: str,
+    technical_parameters: dict[str, JsonValue],
+    trade_planning_agent_id: str,
+    trade_planner_id: str,
+    trade_planning_configuration_fingerprint: str,
+    trade_planning_parameters: dict[str, JsonValue],
+    execution_engine_id: str,
+    execution_configuration_fingerprint: str,
+    execution_parameters: dict[str, JsonValue],
+    walk_forward_configuration_fingerprint: str,
+    walk_forward_parameters: dict[str, JsonValue],
+    category_weights: dict[str, float],
+    strategy_id: str = "jarvis.swing_walk_forward.v1",
+) -> BacktestStrategyConfiguration:
+    values = {
+        "strategy_id": strategy_id,
+        "technical_agent_id": technical_agent_id,
+        "technical_evaluator_id": technical_evaluator_id,
+        "technical_configuration_fingerprint": (
+            technical_configuration_fingerprint
+        ),
+        "technical_parameters": technical_parameters,
+        "trade_planning_agent_id": trade_planning_agent_id,
+        "trade_planner_id": trade_planner_id,
+        "trade_planning_configuration_fingerprint": (
+            trade_planning_configuration_fingerprint
+        ),
+        "trade_planning_parameters": trade_planning_parameters,
+        "execution_engine_id": execution_engine_id,
+        "execution_configuration_fingerprint": (
+            execution_configuration_fingerprint
+        ),
+        "execution_parameters": execution_parameters,
+        "walk_forward_configuration_fingerprint": (
+            walk_forward_configuration_fingerprint
+        ),
+        "walk_forward_parameters": walk_forward_parameters,
+        "category_weights": category_weights,
+    }
+    fingerprint = _fingerprint_mapping(values)
+    return BacktestStrategyConfiguration(
+        **values,
+        configuration_fingerprint=fingerprint,
+    )
+
+
+def _strategy_configuration_fingerprint(
+    configuration: BacktestStrategyConfiguration,
+) -> str:
+    return _fingerprint_mapping(
+        configuration.model_dump(
+            mode="json",
+            exclude={"configuration_fingerprint"},
+        )
+    )
+
+
+def _fingerprint_mapping(values: dict) -> str:
+    serialized = json.dumps(
+        values,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(serialized.encode("utf-8")).hexdigest()
 
 
 class WalkForwardBacktestConfig(TechnicalModel):
@@ -98,15 +250,28 @@ class WalkForwardEvaluationRecord(TechnicalModel):
     capital_after: float | None = None
     technical_submission_id: str | None = Field(default=None, min_length=1)
     technical_decision_id: str | None = Field(default=None, min_length=1)
+    technical_configuration_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+    technical_profile: SwingTradingSignalProfile | None = None
     signal_direction: SignalDirection | None = None
     signal_stance: SwingTradingStance | None = None
     signal_score: float | None = None
     planning_submission_id: str | None = Field(default=None, min_length=1)
     planning_decision_id: str | None = Field(default=None, min_length=1)
+    planning_configuration_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
     planning_disposition: TradePlanningDisposition | None = None
     planning_reason: TradePlanningReason | None = None
     execution_submission_id: str | None = Field(default=None, min_length=1)
     execution_decision_id: str | None = Field(default=None, min_length=1)
+    execution_configuration_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
     execution_outcome: HistoricalExecutionOutcome | None = None
     active_trade_id: str | None = Field(default=None, min_length=1)
     message: str = Field(min_length=1)
@@ -174,6 +339,36 @@ class WalkForwardEvaluationRecord(TechnicalModel):
             raise ValueError(
                 "execution record requires a trade-planning submission"
             )
+        if self.technical_profile is not None:
+            profile = self.technical_profile
+            if (
+                self.technical_submission_id is None
+                or self.technical_decision_id is None
+                or self.technical_configuration_fingerprint is None
+            ):
+                raise ValueError(
+                    "technical profile requires submission, decision, and "
+                    "configuration identifiers"
+                )
+            if profile.snapshot.evaluated_at != self.candle.timestamp:
+                raise ValueError(
+                    "technical profile must match its evaluation candle"
+                )
+            if (
+                self.signal_direction is None
+                or self.signal_stance is None
+                or self.signal_score is None
+                or profile.direction is not self.signal_direction
+                or profile.stance is not self.signal_stance
+                or not isclose(
+                    profile.score,
+                    self.signal_score,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise ValueError(
+                    "technical profile must match summarized signal fields"
+                )
         return self
 
 
@@ -577,6 +772,7 @@ class WalkForwardBacktestResult(TechnicalModel):
     configuration_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
     market_series: HistoricalCandleSeries
     config: WalkForwardBacktestConfig
+    strategy_configuration: BacktestStrategyConfiguration | None = None
     resolved_warmup_candles: int = Field(ge=0)
     evaluations: list[WalkForwardEvaluationRecord]
     trades: list[WalkForwardTradeRecord]
@@ -629,6 +825,47 @@ class WalkForwardBacktestResult(TechnicalModel):
                 raise ValueError(
                     "walk-forward evaluation candle must match history"
                 )
+            if record.technical_profile is not None:
+                snapshot = record.technical_profile.snapshot
+                if (
+                    snapshot.exchange != self.market_series.exchange
+                    or snapshot.symbol_token
+                    != self.market_series.symbol_token
+                    or snapshot.symbol != self.market_series.symbol
+                    or snapshot.interval != self.market_series.interval
+                    or snapshot.source != self.market_series.source
+                    or snapshot.source_retrieved_at
+                    != self.market_series.retrieved_at
+                ):
+                    raise ValueError(
+                        "evaluation profile must match backtest market data"
+                    )
+            if (
+                self.strategy_configuration is not None
+                and record.technical_profile is not None
+            ):
+                if record.technical_profile.category_weights != (
+                    self.strategy_configuration.category_weights
+                ):
+                    raise ValueError(
+                        "evaluation weights must match strategy snapshot"
+                    )
+                if record.technical_configuration_fingerprint != (
+                    self.strategy_configuration
+                    .technical_configuration_fingerprint
+                ):
+                    raise ValueError(
+                        "evaluation configuration must match strategy "
+                        "snapshot"
+                    )
+        if self.strategy_configuration is not None and (
+            self.strategy_configuration
+            .walk_forward_configuration_fingerprint
+            != self.configuration_fingerprint
+        ):
+            raise ValueError(
+                "strategy snapshot must match walk-forward configuration"
+            )
         if len(self.equity_curve) != len(self.market_series.candles):
             raise ValueError(
                 "walk-forward equity curve requires every market candle"
