@@ -6,7 +6,9 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
+from app.analytics.walk_forward import WalkForwardBacktestEngine
 from app.exceptions import StorageConflictError, StorageError
+from app.models.backtest import WalkForwardBacktestConfig
 from app.models.storage import (
     BacktestRunQuery,
     MarketSeriesQuery,
@@ -16,6 +18,9 @@ from app.models.storage import (
 from app.services.research_archive import ResearchArchiveService
 from app.storage.adapters.duckdb import DuckDBJarvisStorage
 from app.storage.repositories import JarvisStorageAdapter
+from app.use_cases.run_and_archive_backtest import (
+    RunAndArchiveWalkForwardBacktest,
+)
 from tests.unit.test_storage_adapters import (
     _backtest_result,
     _market_series,
@@ -94,6 +99,25 @@ class DuckDBStorageTests(unittest.TestCase):
         self.assertEqual(len(backtest_summaries), 1)
         self.assertEqual(backtest_summaries[0].symbol, "RELIANCE-EQ")
         self.assertEqual(backtest_summaries[0].candle_count, 2)
+
+    def test_run_and_archive_use_case_persists_to_duckdb(self):
+        runner = WalkForwardBacktestEngine(
+            config=WalkForwardBacktestConfig(warmup_candles=2)
+        )
+        with self.storage() as storage:
+            use_case = RunAndArchiveWalkForwardBacktest(
+                ResearchArchiveService(storage),
+                runner,
+            )
+            receipt = use_case.execute(
+                _market_series(),
+                stored_at=self.stored_at,
+            )
+
+        with self.storage() as reopened:
+            loaded = reopened.get_backtest_run(receipt.run_id)
+
+        self.assertEqual(loaded, receipt.backtest_run)
 
     def test_repeated_save_is_idempotent_and_preserves_first_timestamp(self):
         series = _market_series()

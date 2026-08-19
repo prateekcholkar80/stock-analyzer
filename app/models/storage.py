@@ -88,6 +88,48 @@ class StoredBacktestRun(StorageModel):
         return self
 
 
+class WalkForwardBacktestArchiveReceipt(StorageModel):
+    use_case_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    adapter_name: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    market_dataset_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    backtest_run: StoredBacktestRun
+
+    @model_validator(mode="after")
+    def validate_archive_chain(self) -> Self:
+        expected_dataset_id = (
+            f"market:{self.backtest_run.market_fingerprint}"
+        )
+        if self.market_dataset_id != expected_dataset_id:
+            raise ValueError(
+                "archive receipt must reference the backtest market dataset"
+            )
+        return self
+
+    @property
+    def run_id(self) -> str:
+        return self.backtest_run.run_id
+
+    @property
+    def stored_at(self) -> datetime:
+        return self.backtest_run.stored_at
+
+    @property
+    def result(self) -> WalkForwardBacktestResult:
+        return self.backtest_run.result
+
+
 class MarketSeriesSummary(StorageModel):
     dataset_id: str = Field(pattern=_IDENTIFIER_PATTERN)
     payload_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
