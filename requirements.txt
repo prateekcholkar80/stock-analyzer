@@ -1,4 +1,5 @@
 python-dotenv
+duckdb
 pandas
 pandas-ta-classic
 pydantic

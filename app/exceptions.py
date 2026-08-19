@@ -44,3 +44,11 @@ class IndicatorCalculationError(TechnicalAnalysisError):
 
 class AgentSubmissionRejectedError(TechnicalAnalysisError):
     """Raised when Jarvis rejects an agent's workflow submission."""
+
+
+class StorageError(ApplicationError):
+    """Raised when a persistence adapter cannot complete an operation."""
+
+
+class StorageConflictError(StorageError):
+    """Raised when an immutable stored identifier has conflicting data."""
