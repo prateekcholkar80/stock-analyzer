@@ -28,3 +28,19 @@ class DataValidationError(MarketDataError):
 
 class InvalidInstrumentError(MarketDataError):
     """Raised when an instrument or symbol cannot be resolved."""
+
+
+class TechnicalAnalysisError(ApplicationError):
+    """Base exception for technical-analysis failures."""
+
+
+class InsufficientDataError(TechnicalAnalysisError):
+    """Raised when an indicator does not have enough candle data."""
+
+
+class IndicatorCalculationError(TechnicalAnalysisError):
+    """Raised when an indicator provider cannot complete a calculation."""
+
+
+class AgentSubmissionRejectedError(TechnicalAnalysisError):
+    """Raised when Jarvis rejects an agent's workflow submission."""
