@@ -16,3 +16,9 @@ __pycache__/
 
 # Logs
 logs/
+
+# Downloaded external reference data
+data/cache/
+
+data/*.duckdb
+data/*.duckdb.wal

@@ -11,7 +11,7 @@ from app.agents._debate_support import (
     serialize_transcript,
     valid_evidence_ids,
 )
-from app.llm.client import LLMClient, LLMGenerationConfig
+from app.llm.gateway import StructuredLLMGateway
 from app.models.debate import BullBearArgument, DebateSide
 from app.models.signals import SwingTradingSignalProfile
 from app.models.storage import DebateRunSummary
@@ -60,12 +60,10 @@ class BullDebateAgentConfig(TechnicalModel):
         allow_inf_nan=False,
     )
 
-    generation: LLMGenerationConfig = Field(
-        default_factory=lambda: LLMGenerationConfig(
-            model="anthropic/claude-sonnet-4-5",
-            temperature=0.4,
-            max_tokens=800,
-        )
+    prompt_version: str = Field(
+        default="jarvis.bull_debate_prompt.v1",
+        min_length=1,
+        pattern=r".*\S.*",
     )
 
 
@@ -76,9 +74,13 @@ class BullDebateAgent:
 
     def __init__(
         self,
+        gateway: StructuredLLMGateway,
         config: BullDebateAgentConfig | None = None,
-        client: LLMClient | None = None,
     ) -> None:
+        if not isinstance(gateway, StructuredLLMGateway):
+            raise ValueError(
+                "bull debate agent requires a structured LLM gateway"
+            )
         if config is not None and not isinstance(
             config,
             BullDebateAgentConfig,
@@ -87,11 +89,14 @@ class BullDebateAgent:
                 "bull debate agent config must be a validated configuration"
             )
         self.config = config or BullDebateAgentConfig()
-        self._client = client or LLMClient()
+        self._gateway = gateway
 
     @property
     def configuration_fingerprint(self) -> str:
-        serialized = self.config.model_dump_json()
+        serialized = (
+            f"{self.config.model_dump_json()}:"
+            f"{self._gateway.configuration_fingerprint}"
+        )
         return sha256(serialized.encode("utf-8")).hexdigest()
 
     def generate_argument(
@@ -113,15 +118,15 @@ class BullDebateAgent:
             f"{precedent_section}\n\n"
             f"This is round {round_number}. Present the bull case."
         )
-        draft = generate_grounded(
-            client=self._client,
-            config=self.config.generation,
+        generation = generate_grounded(
+            gateway=self._gateway,
             system=_SYSTEM_PROMPT,
             context=context,
             draft_model=_ArgumentDraft,
             valid_ids=valid_evidence_ids(profile),
             citation_field="evidence_citations",
         )
+        draft = generation.value
         return BullBearArgument(
             argument_id=(
                 f"{self.agent_id}:{technical_submission_id}:"
@@ -132,6 +137,6 @@ class BullDebateAgent:
             thesis=draft.thesis,
             evidence_citations=tuple(draft.evidence_citations),
             rebuts_argument_id=draft.rebuts_argument_id,
-            model_id=self.config.generation.model,
+            model_id=generation.model,
             generated_at=datetime.now(UTC),
         )

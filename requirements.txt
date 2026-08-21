@@ -5,6 +5,7 @@ pandas-ta-classic
 pydantic
 smartapi-python
 pyotp
+requests
 TA-Lib
 logzero
 websocket-client

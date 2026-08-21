@@ -1,13 +1,14 @@
 import json
+from collections.abc import Callable
 from hashlib import sha256
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
 
 from pydantic import ConfigDict, Field
 
 from app.agents.bear_agent import BearDebateAgent
 from app.agents.bull_agent import BullDebateAgent
 from app.agents.debate_judge_agent import DebateJudgeAgent
-from app.exceptions import AgentSubmissionRejectedError, LLMResponseValidationError
+from app.exceptions import AgentSubmissionRejectedError
 from app.models.agentic import (
     AgenticSwingAnalysisResult,
     JarvisJudgeDecision,
@@ -24,14 +25,17 @@ from app.models.debate import (
 from app.models.signals import SignalDirection, SwingTradingSignalProfile
 from app.models.storage import DebateRunSummary, StoredDebateRun
 from app.models.technical import TechnicalModel
+from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.orchestration.agent_orchestrator import (
     _validate_fingerprint,
     _validate_identifier,
 )
 from app.orchestration.debate_session import DebateSession
+from app.workflow.events import WorkflowEventEmitter
 
 
 SUBMISSION_AGENT_ID = "jarvis.bull_bear_debate.v1"
+DebateStageResult = TypeVar("DebateStageResult")
 
 
 @runtime_checkable
@@ -249,11 +253,23 @@ class DebateOrchestrator:
         config: DebateOrchestratorConfig | None = None,
         archive: DebateArchive | None = None,
     ) -> None:
-        self.bull_agent = bull_agent or BullDebateAgent()
+        if bull_agent is None:
+            raise ValueError(
+                "debate orchestrator requires a configured bull agent"
+            )
+        self.bull_agent = bull_agent
         _validate_debate_side_agent("bull", self.bull_agent)
-        self.bear_agent = bear_agent or BearDebateAgent()
+        if bear_agent is None:
+            raise ValueError(
+                "debate orchestrator requires a configured bear agent"
+            )
+        self.bear_agent = bear_agent
         _validate_debate_side_agent("bear", self.bear_agent)
-        self.judge_agent = judge_agent or DebateJudgeAgent()
+        if judge_agent is None:
+            raise ValueError(
+                "debate orchestrator requires a configured judge agent"
+            )
+        self.judge_agent = judge_agent
         _validate_judge_agent(self.judge_agent)
         self.config = config or DebateOrchestratorConfig()
         self.structural_judge = structural_judge or JarvisDebateJudge(
@@ -287,6 +303,8 @@ class DebateOrchestrator:
     def run_debate(
         self,
         technical_result: AgenticSwingAnalysisResult,
+        *,
+        event_emitter: WorkflowEventEmitter | None = None,
     ) -> AgenticDebateResult:
         if not isinstance(technical_result, AgenticSwingAnalysisResult):
             raise ValueError(
@@ -300,6 +318,11 @@ class DebateOrchestrator:
                 "debate orchestrator requires a Jarvis-approved technical "
                 "submission"
             )
+        if event_emitter is not None and not isinstance(
+            event_emitter,
+            WorkflowEventEmitter,
+        ):
+            raise ValueError("debate requires a workflow event emitter")
 
         profile = technical_result.submission.profile
         technical_submission_id = technical_result.submission.submission_id
@@ -318,26 +341,36 @@ class DebateOrchestrator:
         flat_arguments: tuple[BullBearArgument, ...] = ()
 
         for round_number in range(1, self.config.max_rounds + 1):
-            try:
-                bull_argument = self.bull_agent.generate_argument(
+            bull_argument = _run_debate_stage(
+                event_emitter,
+                WorkflowStage.BULL_DEBATING,
+                round_number,
+                profile.snapshot.exchange,
+                profile.snapshot.symbol,
+                lambda: self.bull_agent.generate_argument(
                     profile=profile,
                     transcript_so_far=flat_arguments,
                     round_number=round_number,
                     technical_submission_id=technical_submission_id,
                     precedent=precedent,
-                )
-                flat_arguments = (*flat_arguments, bull_argument)
-                bear_argument = self.bear_agent.generate_argument(
+                ),
+            )
+            flat_arguments = (*flat_arguments, bull_argument)
+            bear_argument = _run_debate_stage(
+                event_emitter,
+                WorkflowStage.BEAR_DEBATING,
+                round_number,
+                profile.snapshot.exchange,
+                profile.snapshot.symbol,
+                lambda: self.bear_agent.generate_argument(
                     profile=profile,
                     transcript_so_far=flat_arguments,
                     round_number=round_number,
                     technical_submission_id=technical_submission_id,
                     precedent=precedent,
-                )
-                flat_arguments = (*flat_arguments, bear_argument)
-            except LLMResponseValidationError:
-                session.mark_agent_failure()
-                break
+                ),
+            )
+            flat_arguments = (*flat_arguments, bear_argument)
 
             debate_round = DebateRound(
                 round_number=round_number,
@@ -355,17 +388,18 @@ class DebateOrchestrator:
         else:
             session.mark_max_rounds_reached()
 
-        if not session.rounds:
-            raise AgentSubmissionRejectedError(
-                "debate orchestrator could not complete a single round "
-                "before an agent failure"
-            )
-
         transcript = session.to_transcript()
-        verdict = self.judge_agent.render_verdict(
-            profile=profile,
-            transcript=transcript,
-            technical_submission_id=technical_submission_id,
+        verdict = _run_debate_stage(
+            event_emitter,
+            WorkflowStage.JUDGE_REVIEWING,
+            None,
+            profile.snapshot.exchange,
+            profile.snapshot.symbol,
+            lambda: self.judge_agent.render_verdict(
+                profile=profile,
+                transcript=transcript,
+                technical_submission_id=technical_submission_id,
+            ),
         )
         verdict = _normalize_verdict(
             verdict,
@@ -412,6 +446,45 @@ class DebateOrchestrator:
                 f"Jarvis rejected debate submission: {reasons}"
             )
         return result.submission.verdict
+
+
+def _run_debate_stage(
+    emitter: WorkflowEventEmitter | None,
+    stage: WorkflowStage,
+    round_number: int | None,
+    exchange: str,
+    symbol: str,
+    operation: Callable[[], DebateStageResult],
+) -> DebateStageResult:
+    if emitter is not None:
+        emitter.emit(
+            stage,
+            WorkflowEventState.STARTED,
+            exchange=exchange,
+            symbol=symbol,
+            round_number=round_number,
+        )
+    try:
+        result = operation()
+    except Exception:
+        if emitter is not None:
+            emitter.emit(
+                stage,
+                WorkflowEventState.FAILED,
+                exchange=exchange,
+                symbol=symbol,
+                round_number=round_number,
+            )
+        raise
+    if emitter is not None:
+        emitter.emit(
+            stage,
+            WorkflowEventState.COMPLETED,
+            exchange=exchange,
+            symbol=symbol,
+            round_number=round_number,
+        )
+    return result
 
 
 def profile_fingerprint(profile: SwingTradingSignalProfile) -> str:

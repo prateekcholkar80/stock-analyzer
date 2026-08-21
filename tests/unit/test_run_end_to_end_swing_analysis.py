@@ -10,6 +10,9 @@ from app.agents.bull_agent import BullDebateAgent
 from app.agents.debate_judge_agent import DebateJudgeAgent
 from app.agents.technical_swing_agent import TechnicalSwingAgent
 from app.exceptions import AgentSubmissionRejectedError
+from app.llm.gateway import StructuredGeneration
+from app.llm.config import LLMRole
+from app.models.llm import LLMPreflightResult, LLMRolePreflight
 from app.models.agentic import (
     AgenticSwingAnalysisResult,
     JarvisJudgeDecision,
@@ -17,6 +20,7 @@ from app.models.agentic import (
 )
 from app.models.market import Candle, HistoricalCandleSeries
 from app.models.storage import MarketSeriesQuery, DebateRunQuery
+from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.orchestration.agent_orchestrator import AgentOrchestrator
 from app.orchestration.debate_orchestrator import (
     DebateOrchestrator,
@@ -31,6 +35,7 @@ from app.use_cases.pull_rolling_market_series import (
 from app.use_cases.run_end_to_end_swing_analysis import (
     RunEndToEndSwingAnalysis,
 )
+from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
 
 
 class StubRejectingAgentOrchestrator:
@@ -55,13 +60,22 @@ class StubRejectingAgentOrchestrator:
 IST = ZoneInfo("Asia/Kolkata")
 
 
-class FakeLLMClient:
+class FakeLLMGateway:
     def __init__(self, draft_payloads):
         self.draft_payloads = list(draft_payloads)
 
-    def complete_structured(self, *, config, system, messages, response_model):
+    @property
+    def configuration_fingerprint(self):
+        return "d" * 64
+
+    def generate(self, *, system, messages, response_model):
         payload = self.draft_payloads.pop(0)
-        return response_model(**payload)
+        return StructuredGeneration[response_model](
+            value=response_model(**payload),
+            provider="fake-provider",
+            model="fake-model",
+            attempt_count=1,
+        )
 
 
 def _synthetic_candles(count=60):
@@ -90,6 +104,25 @@ def _synthetic_series(exchange, symbol_token, symbol, interval, count=60):
         interval=interval,
         candles=_synthetic_candles(count),
         retrieved_at=datetime.now(UTC),
+    )
+
+
+def _successful_llm_preflight():
+    return LLMPreflightResult(
+        configuration_fingerprint="a" * 64,
+        roles=tuple(
+            LLMRolePreflight(
+                role=role,
+                provider="fake-provider",
+                model="fake-model",
+                credential_required=True,
+                credential_ready=True,
+                structured_gateway_ready=True,
+            )
+            for role in LLMRole
+        ),
+        checked_at=datetime.now(UTC),
+        ready=True,
     )
 
 
@@ -132,7 +165,7 @@ class FakeGateway:
 def _build_use_case(archive, *, judge_winner="bullish", judge_confidence=80.0):
     evidence_ids = _reference_evidence_ids()
     bull_agent = BullDebateAgent(
-        client=FakeLLMClient(
+        FakeLLMGateway(
             [
                 {
                     "thesis": "Trend alignment supports a bullish setup.",
@@ -143,7 +176,7 @@ def _build_use_case(archive, *, judge_winner="bullish", judge_confidence=80.0):
         )
     )
     bear_agent = BearDebateAgent(
-        client=FakeLLMClient(
+        FakeLLMGateway(
             [
                 {
                     "thesis": "Momentum shows overextension risk.",
@@ -154,7 +187,7 @@ def _build_use_case(archive, *, judge_winner="bullish", judge_confidence=80.0):
         )
     )
     judge_agent = DebateJudgeAgent(
-        client=FakeLLMClient(
+        FakeLLMGateway(
             [
                 {
                     "winner": judge_winner,
@@ -188,10 +221,28 @@ def _build_use_case(archive, *, judge_winner="bullish", judge_confidence=80.0):
         rolling_fetch,
         agent_orchestrator=AgentOrchestrator(),
         debate_orchestrator=debate_orchestrator,
+        llm_preflight=_successful_llm_preflight(),
     )
 
 
 class RunEndToEndSwingAnalysisTests(unittest.TestCase):
+    def test_requires_explicit_full_debate_orchestrator(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "configured full-debate orchestrator",
+        ):
+            RunEndToEndSwingAnalysis(object())
+
+    def test_requires_successful_llm_preflight_result(self):
+        archive = ResearchArchiveService(InMemoryJarvisStorage())
+        use_case = _build_use_case(archive)
+
+        with self.assertRaisesRegex(ValueError, "successful LLM preflight"):
+            RunEndToEndSwingAnalysis(
+                use_case.rolling_fetch,
+                debate_orchestrator=use_case.debate_orchestrator,
+            )
+
     def test_happy_path_chains_fetch_technical_and_debate(self):
         archive = ResearchArchiveService(InMemoryJarvisStorage())
         use_case = _build_use_case(archive)
@@ -215,6 +266,66 @@ class RunEndToEndSwingAnalysisTests(unittest.TestCase):
         self.assertEqual(
             verdict.bear_case_summary,
             "Bear leaned on momentum overextension.",
+        )
+
+    def test_emits_actual_market_technical_and_debate_stages(self):
+        archive = ResearchArchiveService(InMemoryJarvisStorage())
+        use_case = _build_use_case(archive)
+        sink = InMemoryWorkflowEventSink()
+        emitter = WorkflowEventEmitter("workflow-operation", sink)
+
+        use_case.execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+            event_emitter=emitter,
+        )
+
+        self.assertEqual(
+            [(event.stage, event.state) for event in sink.events],
+            [
+                (
+                    WorkflowStage.MARKET_DATA_LOADING,
+                    WorkflowEventState.STARTED,
+                ),
+                (
+                    WorkflowStage.MARKET_DATA_LOADING,
+                    WorkflowEventState.COMPLETED,
+                ),
+                (
+                    WorkflowStage.TECHNICAL_ANALYSIS,
+                    WorkflowEventState.STARTED,
+                ),
+                (
+                    WorkflowStage.TECHNICAL_ANALYSIS,
+                    WorkflowEventState.COMPLETED,
+                ),
+                (
+                    WorkflowStage.BULL_DEBATING,
+                    WorkflowEventState.STARTED,
+                ),
+                (
+                    WorkflowStage.BULL_DEBATING,
+                    WorkflowEventState.COMPLETED,
+                ),
+                (
+                    WorkflowStage.BEAR_DEBATING,
+                    WorkflowEventState.STARTED,
+                ),
+                (
+                    WorkflowStage.BEAR_DEBATING,
+                    WorkflowEventState.COMPLETED,
+                ),
+                (
+                    WorkflowStage.JUDGE_REVIEWING,
+                    WorkflowEventState.STARTED,
+                ),
+                (
+                    WorkflowStage.JUDGE_REVIEWING,
+                    WorkflowEventState.COMPLETED,
+                ),
+            ],
         )
 
     def test_rejected_technical_submission_raises_and_skips_debate(self):

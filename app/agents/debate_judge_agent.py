@@ -10,7 +10,7 @@ from app.agents._debate_support import (
     serialize_transcript,
     valid_evidence_ids,
 )
-from app.llm.client import LLMClient, LLMGenerationConfig
+from app.llm.gateway import StructuredLLMGateway
 from app.models.debate import DebateTranscript, DebateVerdict
 from app.models.signals import SignalDirection, SwingTradingSignalProfile
 from app.models.technical import TechnicalModel
@@ -59,12 +59,10 @@ class DebateJudgeAgentConfig(TechnicalModel):
         allow_inf_nan=False,
     )
 
-    generation: LLMGenerationConfig = Field(
-        default_factory=lambda: LLMGenerationConfig(
-            model="anthropic/claude-sonnet-4-5",
-            temperature=0.0,
-            max_tokens=600,
-        )
+    prompt_version: str = Field(
+        default="jarvis.debate_judge_prompt.v1",
+        min_length=1,
+        pattern=r".*\S.*",
     )
 
 
@@ -75,9 +73,13 @@ class DebateJudgeAgent:
 
     def __init__(
         self,
+        gateway: StructuredLLMGateway,
         config: DebateJudgeAgentConfig | None = None,
-        client: LLMClient | None = None,
     ) -> None:
+        if not isinstance(gateway, StructuredLLMGateway):
+            raise ValueError(
+                "debate judge agent requires a structured LLM gateway"
+            )
         if config is not None and not isinstance(
             config,
             DebateJudgeAgentConfig,
@@ -87,11 +89,14 @@ class DebateJudgeAgent:
                 "configuration"
             )
         self.config = config or DebateJudgeAgentConfig()
-        self._client = client or LLMClient()
+        self._gateway = gateway
 
     @property
     def configuration_fingerprint(self) -> str:
-        serialized = self.config.model_dump_json()
+        serialized = (
+            f"{self.config.model_dump_json()}:"
+            f"{self._gateway.configuration_fingerprint}"
+        )
         return sha256(serialized.encode("utf-8")).hexdigest()
 
     def render_verdict(
@@ -116,18 +121,18 @@ class DebateJudgeAgent:
             f"{serialize_transcript(flat_arguments)}\n\n"
             "Render your verdict."
         )
-        draft = generate_grounded(
-            client=self._client,
-            config=self.config.generation,
+        generation = generate_grounded(
+            gateway=self._gateway,
             system=_SYSTEM_PROMPT,
             context=context,
             draft_model=_VerdictDraft,
             valid_ids=valid_evidence_ids(profile),
             citation_field="decisive_evidence_ids",
         )
+        draft = generation.value
         return DebateVerdict(
             verdict_id=f"{self.agent_id}:{technical_submission_id}:verdict",
-            judge_model_id=self.config.generation.model,
+            judge_model_id=generation.model,
             winner=draft.winner,
             confidence_percentage=draft.confidence_percentage,
             decisive_evidence_ids=tuple(draft.decisive_evidence_ids),

@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+
+
 class ApplicationError(Exception):
     """Base exception for expected application failures."""
 
@@ -46,8 +49,115 @@ class AgentSubmissionRejectedError(TechnicalAnalysisError):
     """Raised when Jarvis rejects an agent's workflow submission."""
 
 
+class IntentRecognitionError(ApplicationError):
+    """Raised when a user request cannot be mapped to a supported intent."""
+
+
+class InstrumentResolutionError(ApplicationError):
+    """Base failure for provider-neutral instrument resolution."""
+
+
+class InstrumentNotFoundError(InstrumentResolutionError):
+    """Raised when no instrument matches the requested identity."""
+
+
+class AmbiguousInstrumentError(InstrumentResolutionError):
+    """Raised when a request matches more than one instrument."""
+
+
+class InstrumentMasterDownloadError(InstrumentResolutionError):
+    """Raised when the external instrument catalog cannot be downloaded."""
+
+
+class InstrumentMasterDataError(InstrumentResolutionError):
+    """Raised when instrument-master data violates the expected contract."""
+
+
+def _validated_optional_failure_identifier(
+    field_name: str,
+    value: str | None,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"LLM failure {field_name} must be a string")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"LLM failure {field_name} must not be blank")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class LLMFailureContext:
+    """Sanitized metadata safe to expose at application boundaries."""
+
+    role: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    operation_id: str | None = None
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in ("role", "provider", "model", "operation_id"):
+            object.__setattr__(
+                self,
+                field_name,
+                _validated_optional_failure_identifier(
+                    field_name,
+                    getattr(self, field_name),
+                ),
+            )
+        if not isinstance(self.retryable, bool):
+            raise TypeError("LLM failure retryable must be a boolean")
+
+
 class LLMError(ExternalServiceError):
-    """Raised when an LLM provider call cannot complete."""
+    """Base exception for safe, classified LLM workflow failures."""
+
+    default_retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        role: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        operation_id: str | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.context = LLMFailureContext(
+            role=role,
+            provider=provider,
+            model=model,
+            operation_id=operation_id,
+            retryable=(
+                self.default_retryable
+                if retryable is None
+                else retryable
+            ),
+        )
+
+
+class LLMConfigurationError(LLMError):
+    """Raised when mandatory LLM configuration is missing or invalid."""
+
+
+class LLMAuthenticationError(LLMError):
+    """Raised when an LLM provider rejects configured credentials."""
+
+
+class LLMProviderUnavailableError(LLMError):
+    """Raised when an LLM provider cannot currently be reached."""
+
+    default_retryable = True
+
+
+class LLMRateLimitError(LLMError):
+    """Raised when an LLM provider throttles a request."""
+
+    default_retryable = True
 
 
 class LLMResponseValidationError(LLMError):

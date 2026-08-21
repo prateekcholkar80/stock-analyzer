@@ -19,12 +19,14 @@ from app.models.debate import (
     DebateVerdict,
 )
 from app.models.signals import SignalDirection
+from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.orchestration.debate_orchestrator import (
     SUBMISSION_AGENT_ID,
     DebateOrchestrator,
     DebateOrchestratorConfig,
     JarvisDebateJudge,
 )
+from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
 
 
 class StubSideAgent:
@@ -316,7 +318,7 @@ class DebateOrchestratorTests(unittest.TestCase):
         self.assertEqual(verdict.confidence_percentage, 80.0)
         self.assertNotIn("Forced indecisive", verdict.rationale)
 
-    def test_agent_failure_after_one_round_terminates_debate(self):
+    def test_agent_failure_after_one_round_aborts_mandatory_debate(self):
         varying = lambda round_number: (
             self.evidence_ids[(round_number - 1) % len(self.evidence_ids)],
         )
@@ -337,19 +339,13 @@ class DebateOrchestratorTests(unittest.TestCase):
             config=DebateOrchestratorConfig(max_rounds=5),
         )
 
-        result = orchestrator.run_debate(self.technical_result)
+        with self.assertRaisesRegex(
+            LLMResponseValidationError,
+            "stub bull failure",
+        ):
+            orchestrator.run_debate(self.technical_result)
 
-        verdict = result.submission.verdict
-        self.assertEqual(verdict.winner, SignalDirection.NEUTRAL)
-        self.assertEqual(verdict.confidence_percentage, 0.0)
-        self.assertIn("Forced indecisive", verdict.rationale)
-        self.assertEqual(
-            result.submission.transcript.termination_reason,
-            DebateTerminationReason.AGENT_FAILURE,
-        )
-        self.assertEqual(result.submission.transcript.round_count, 1)
-
-    def test_agent_failure_before_any_round_raises(self):
+    def test_agent_failure_before_any_round_aborts_mandatory_debate(self):
         varying = lambda round_number: (
             self.evidence_ids[(round_number - 1) % len(self.evidence_ids)],
         )
@@ -365,12 +361,33 @@ class DebateOrchestratorTests(unittest.TestCase):
             judge_agent=judge_agent,
             config=DebateOrchestratorConfig(max_rounds=5),
         )
+        sink = InMemoryWorkflowEventSink()
 
         with self.assertRaisesRegex(
-            AgentSubmissionRejectedError,
-            "could not complete a single round",
+            LLMResponseValidationError,
+            "stub bull failure",
         ):
-            orchestrator.run_debate(self.technical_result)
+            orchestrator.run_debate(
+                self.technical_result,
+                event_emitter=WorkflowEventEmitter(
+                    "debate-operation",
+                    sink,
+                ),
+            )
+
+        self.assertEqual(
+            [(event.stage, event.state) for event in sink.events],
+            [
+                (
+                    WorkflowStage.BULL_DEBATING,
+                    WorkflowEventState.STARTED,
+                ),
+                (
+                    WorkflowStage.BULL_DEBATING,
+                    WorkflowEventState.FAILED,
+                ),
+            ],
+        )
 
     def test_rejects_unapproved_technical_result(self):
         varying = lambda round_number: (
@@ -420,6 +437,10 @@ class DebateOrchestratorTests(unittest.TestCase):
     def test_contract_validation_rejects_invalid_bull_agent(self):
         with self.assertRaisesRegex(ValueError, "generate_argument"):
             DebateOrchestrator(bull_agent=InvalidAgent())
+
+    def test_requires_explicitly_configured_debate_panel(self):
+        with self.assertRaisesRegex(ValueError, "configured bull agent"):
+            DebateOrchestrator()
 
     def test_contract_validation_rejects_invalid_judge_agent(self):
         varying = lambda round_number: (

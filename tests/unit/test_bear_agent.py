@@ -7,18 +7,29 @@ from tests.unit._debate_fixtures import (
 
 from app.agents.bear_agent import BearDebateAgent
 from app.exceptions import LLMResponseValidationError
+from app.llm.gateway import StructuredGeneration
 from app.models.debate import DebateSide
 
 
-class FakeClient:
-    def __init__(self, draft_payloads):
+class FakeGateway:
+    def __init__(self, draft_payloads, model="fake-bear-model"):
         self.draft_payloads = list(draft_payloads)
         self.calls = []
+        self.model = model
 
-    def complete_structured(self, *, config, system, messages, response_model):
+    @property
+    def configuration_fingerprint(self):
+        return "b" * 64
+
+    def generate(self, *, system, messages, response_model):
         self.calls.append({"system": system, "messages": messages})
         payload = self.draft_payloads.pop(0)
-        return response_model(**payload)
+        return StructuredGeneration[response_model](
+            value=response_model(**payload),
+            provider="fake-provider",
+            model=self.model,
+            attempt_count=1,
+        )
 
 
 class BearDebateAgentTests(unittest.TestCase):
@@ -31,10 +42,14 @@ class BearDebateAgentTests(unittest.TestCase):
 
     def test_config_rejects_non_instance(self):
         with self.assertRaisesRegex(ValueError, "validated configuration"):
-            BearDebateAgent(config=object())
+            BearDebateAgent(FakeGateway([]), config=object())
+
+    def test_rejects_non_gateway_dependency(self):
+        with self.assertRaisesRegex(ValueError, "structured LLM gateway"):
+            BearDebateAgent(object())
 
     def test_prompt_includes_all_evidence_ids(self):
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "thesis": "Momentum is overextended.",
@@ -43,7 +58,7 @@ class BearDebateAgentTests(unittest.TestCase):
                 }
             ]
         )
-        agent = BearDebateAgent(client=client)
+        agent = BearDebateAgent(gateway)
 
         argument = agent.generate_argument(
             profile=self.profile,
@@ -53,12 +68,13 @@ class BearDebateAgentTests(unittest.TestCase):
         )
 
         self.assertEqual(argument.side, DebateSide.BEAR)
-        prompt_text = client.calls[0]["messages"][0]["content"]
+        self.assertEqual(argument.model_id, "fake-bear-model")
+        prompt_text = gateway.calls[0]["messages"][0]["content"]
         for evidence_id in self.evidence_ids:
             self.assertIn(evidence_id, prompt_text)
 
     def test_precedent_included_in_prompt_when_provided(self):
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "thesis": "Momentum is overextended.",
@@ -67,7 +83,7 @@ class BearDebateAgentTests(unittest.TestCase):
                 }
             ]
         )
-        agent = BearDebateAgent(client=client)
+        agent = BearDebateAgent(gateway)
         precedent = (build_precedent_summary(),)
 
         agent.generate_argument(
@@ -78,12 +94,12 @@ class BearDebateAgentTests(unittest.TestCase):
             precedent=precedent,
         )
 
-        prompt_text = client.calls[0]["messages"][0]["content"]
+        prompt_text = gateway.calls[0]["messages"][0]["content"]
         self.assertIn("Precedent", prompt_text)
         self.assertIn("RELIANCE-EQ", prompt_text)
 
     def test_precedent_section_absent_when_not_provided(self):
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "thesis": "Momentum is overextended.",
@@ -92,7 +108,7 @@ class BearDebateAgentTests(unittest.TestCase):
                 }
             ]
         )
-        agent = BearDebateAgent(client=client)
+        agent = BearDebateAgent(gateway)
 
         agent.generate_argument(
             profile=self.profile,
@@ -101,11 +117,11 @@ class BearDebateAgentTests(unittest.TestCase):
             technical_submission_id="sub-1",
         )
 
-        prompt_text = client.calls[0]["messages"][0]["content"]
+        prompt_text = gateway.calls[0]["messages"][0]["content"]
         self.assertNotIn("Precedent", prompt_text)
 
     def test_prompt_has_role_context_system_prompt_and_feedback_sections(self):
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "thesis": "Bad citation.",
@@ -119,7 +135,7 @@ class BearDebateAgentTests(unittest.TestCase):
                 },
             ]
         )
-        agent = BearDebateAgent(client=client)
+        agent = BearDebateAgent(gateway)
 
         agent.generate_argument(
             profile=self.profile,
@@ -128,25 +144,25 @@ class BearDebateAgentTests(unittest.TestCase):
             technical_submission_id="sub-1",
         )
 
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(gateway.calls), 2)
 
-        first_system = client.calls[0]["system"]
+        first_system = gateway.calls[0]["system"]
         self.assertIn("# Role", first_system)
         self.assertIn("# System Prompt", first_system)
 
-        first_user = client.calls[0]["messages"][0]["content"]
+        first_user = gateway.calls[0]["messages"][0]["content"]
         self.assertIn("# Context", first_user)
         self.assertIn("# Feedback", first_user)
         self.assertIn("None yet", first_user)
 
-        second_user = client.calls[1]["messages"][0]["content"]
+        second_user = gateway.calls[1]["messages"][0]["content"]
         self.assertIn("# Context", second_user)
         self.assertIn("# Feedback", second_user)
         self.assertNotIn("None yet", second_user)
         self.assertIn("nonexistent.signal", second_user)
 
     def test_retries_once_on_hallucinated_citation(self):
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "thesis": "Bad citation.",
@@ -160,7 +176,7 @@ class BearDebateAgentTests(unittest.TestCase):
                 },
             ]
         )
-        agent = BearDebateAgent(client=client)
+        agent = BearDebateAgent(gateway)
 
         argument = agent.generate_argument(
             profile=self.profile,
@@ -170,10 +186,10 @@ class BearDebateAgentTests(unittest.TestCase):
         )
 
         self.assertEqual(argument.thesis, "Fixed citation.")
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(gateway.calls), 2)
 
     def test_raises_after_two_hallucinated_attempts(self):
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "thesis": "Bad citation.",
@@ -187,7 +203,7 @@ class BearDebateAgentTests(unittest.TestCase):
                 },
             ]
         )
-        agent = BearDebateAgent(client=client)
+        agent = BearDebateAgent(gateway)
 
         with self.assertRaises(LLMResponseValidationError):
             agent.generate_argument(

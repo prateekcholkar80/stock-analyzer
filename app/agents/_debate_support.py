@@ -1,10 +1,15 @@
+from typing import TypeVar
+
 from pydantic import BaseModel
 
 from app.exceptions import LLMResponseValidationError
-from app.llm.client import LLMClient, LLMGenerationConfig
+from app.llm.gateway import StructuredGeneration, StructuredLLMGateway
 from app.models.debate import BullBearArgument
 from app.models.signals import SwingTradingSignalProfile
 from app.models.storage import DebateRunSummary
+
+
+DraftModelT = TypeVar("DraftModelT", bound=BaseModel)
 
 
 def valid_evidence_ids(profile: SwingTradingSignalProfile) -> frozenset[str]:
@@ -97,39 +102,37 @@ def serialize_precedent(
 
 def generate_grounded(
     *,
-    client: LLMClient,
-    config: LLMGenerationConfig,
+    gateway: StructuredLLMGateway,
     system: str,
     context: str,
-    draft_model: type[BaseModel],
+    draft_model: type[DraftModelT],
     valid_ids: frozenset[str],
     citation_field: str,
-) -> BaseModel:
+) -> StructuredGeneration[DraftModelT]:
     """Call the LLM and require every citation to be a real evidence id.
 
     Retries once, with the Feedback section of the user message rebuilt
     to name the exact valid ids, if the first draft hallucinates a
     citation; raises if the retry still cites something nonexistent.
     """
-    draft = client.complete_structured(
-        config=config,
+    generation = gateway.generate(
         system=system,
         messages=[
             {"role": "user", "content": build_user_message(context=context)}
         ],
         response_model=draft_model,
     )
+    draft = generation.value
     invalid = _invalid_citations(draft, citation_field, valid_ids)
     if not invalid:
-        return draft
+        return generation
 
     feedback = (
         f"Your previous attempt cited evidence id(s) that do not exist: "
         f"{invalid}. Only cite ids from this exact list: "
         f"{sorted(valid_ids)}."
     )
-    draft = client.complete_structured(
-        config=config,
+    generation = gateway.generate(
         system=system,
         messages=[
             {
@@ -142,12 +145,15 @@ def generate_grounded(
         ],
         response_model=draft_model,
     )
+    draft = generation.value
     invalid = _invalid_citations(draft, citation_field, valid_ids)
     if invalid:
         raise LLMResponseValidationError(
-            f"LLM cited nonexistent evidence ids after retry: {invalid}"
+            "LLM cited nonexistent evidence ids after grounding retry",
+            provider=generation.provider,
+            model=generation.model,
         )
-    return draft
+    return generation
 
 
 def _invalid_citations(

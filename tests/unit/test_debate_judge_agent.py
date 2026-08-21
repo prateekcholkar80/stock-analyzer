@@ -5,6 +5,7 @@ from tests.unit._debate_fixtures import build_approved_technical_result
 
 from app.agents.debate_judge_agent import DebateJudgeAgent
 from app.exceptions import LLMResponseValidationError
+from app.llm.gateway import StructuredGeneration
 from app.models.debate import (
     BullBearArgument,
     DebateRound,
@@ -14,15 +15,25 @@ from app.models.debate import (
 )
 
 
-class FakeClient:
-    def __init__(self, draft_payloads):
+class FakeGateway:
+    def __init__(self, draft_payloads, model="fake-judge-model"):
         self.draft_payloads = list(draft_payloads)
         self.calls = []
+        self.model = model
 
-    def complete_structured(self, *, config, system, messages, response_model):
+    @property
+    def configuration_fingerprint(self):
+        return "c" * 64
+
+    def generate(self, *, system, messages, response_model):
         self.calls.append({"system": system, "messages": messages})
         payload = self.draft_payloads.pop(0)
-        return response_model(**payload)
+        return StructuredGeneration[response_model](
+            value=response_model(**payload),
+            provider="fake-provider",
+            model=self.model,
+            attempt_count=1,
+        )
 
 
 class DebateJudgeAgentTests(unittest.TestCase):
@@ -66,10 +77,14 @@ class DebateJudgeAgentTests(unittest.TestCase):
 
     def test_config_rejects_non_instance(self):
         with self.assertRaisesRegex(ValueError, "validated"):
-            DebateJudgeAgent(config=object())
+            DebateJudgeAgent(FakeGateway([]), config=object())
+
+    def test_rejects_non_gateway_dependency(self):
+        with self.assertRaisesRegex(ValueError, "structured LLM gateway"):
+            DebateJudgeAgent(object())
 
     def test_prompt_includes_evidence_and_transcript(self):
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "winner": "bullish",
@@ -81,7 +96,7 @@ class DebateJudgeAgentTests(unittest.TestCase):
                 }
             ]
         )
-        agent = DebateJudgeAgent(client=client)
+        agent = DebateJudgeAgent(gateway)
 
         verdict = agent.render_verdict(
             profile=self.profile,
@@ -96,7 +111,8 @@ class DebateJudgeAgentTests(unittest.TestCase):
         self.assertEqual(
             verdict.bear_case_summary, "Bear leaned on momentum evidence."
         )
-        prompt_text = client.calls[0]["messages"][0]["content"]
+        self.assertEqual(verdict.judge_model_id, "fake-judge-model")
+        prompt_text = gateway.calls[0]["messages"][0]["content"]
         self.assertIn("Bullish thesis.", prompt_text)
         self.assertIn("Bearish thesis.", prompt_text)
         for evidence_id in self.evidence_ids:
@@ -107,7 +123,7 @@ class DebateJudgeAgentTests(unittest.TestCase):
         # solely in this debate's own evidence and transcript. Bull/Bear
         # get precedent (see test_bull_agent.py/test_bear_agent.py); the
         # judge structurally cannot accept it.
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "winner": "bullish",
@@ -119,7 +135,7 @@ class DebateJudgeAgentTests(unittest.TestCase):
                 }
             ]
         )
-        agent = DebateJudgeAgent(client=client)
+        agent = DebateJudgeAgent(gateway)
 
         with self.assertRaises(TypeError):
             agent.render_verdict(
@@ -130,7 +146,7 @@ class DebateJudgeAgentTests(unittest.TestCase):
             )
 
     def test_prompt_has_role_context_system_prompt_and_feedback_sections(self):
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "winner": "bearish",
@@ -150,7 +166,7 @@ class DebateJudgeAgentTests(unittest.TestCase):
                 },
             ]
         )
-        agent = DebateJudgeAgent(client=client)
+        agent = DebateJudgeAgent(gateway)
 
         agent.render_verdict(
             profile=self.profile,
@@ -158,25 +174,25 @@ class DebateJudgeAgentTests(unittest.TestCase):
             technical_submission_id="sub-1",
         )
 
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(gateway.calls), 2)
 
-        first_system = client.calls[0]["system"]
+        first_system = gateway.calls[0]["system"]
         self.assertIn("# Role", first_system)
         self.assertIn("# System Prompt", first_system)
 
-        first_user = client.calls[0]["messages"][0]["content"]
+        first_user = gateway.calls[0]["messages"][0]["content"]
         self.assertIn("# Context", first_user)
         self.assertIn("# Feedback", first_user)
         self.assertIn("None yet", first_user)
 
-        second_user = client.calls[1]["messages"][0]["content"]
+        second_user = gateway.calls[1]["messages"][0]["content"]
         self.assertIn("# Context", second_user)
         self.assertIn("# Feedback", second_user)
         self.assertNotIn("None yet", second_user)
         self.assertIn("nonexistent.signal", second_user)
 
     def test_retries_once_on_hallucinated_decisive_evidence(self):
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "winner": "bearish",
@@ -196,7 +212,7 @@ class DebateJudgeAgentTests(unittest.TestCase):
                 },
             ]
         )
-        agent = DebateJudgeAgent(client=client)
+        agent = DebateJudgeAgent(gateway)
 
         verdict = agent.render_verdict(
             profile=self.profile,
@@ -205,10 +221,10 @@ class DebateJudgeAgentTests(unittest.TestCase):
         )
 
         self.assertEqual(verdict.rationale, "Fixed rationale.")
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(gateway.calls), 2)
 
     def test_raises_after_two_hallucinated_attempts(self):
-        client = FakeClient(
+        gateway = FakeGateway(
             [
                 {
                     "winner": "bearish",
@@ -228,7 +244,7 @@ class DebateJudgeAgentTests(unittest.TestCase):
                 },
             ]
         )
-        agent = DebateJudgeAgent(client=client)
+        agent = DebateJudgeAgent(gateway)
 
         with self.assertRaises(LLMResponseValidationError):
             agent.render_verdict(
