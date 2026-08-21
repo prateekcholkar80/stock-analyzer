@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from math import isfinite
 
 import numpy as np
 import talib
@@ -18,6 +19,73 @@ from app.models.technical import (
 
 
 IndicatorCalculator = Callable[..., np.ndarray]
+
+# (component name, TA-Lib function name, requires a penetration argument)
+# Mechanical calculation metadata only; direction/reliability semantics
+# for each pattern live in app.analytics.candlestick_signals.
+CANDLESTICK_PATTERN_NAMES: tuple[tuple[str, str, bool], ...] = (
+    ("two_crows", "CDL2CROWS", False),
+    ("three_black_crows", "CDL3BLACKCROWS", False),
+    ("three_inside", "CDL3INSIDE", False),
+    ("three_line_strike", "CDL3LINESTRIKE", False),
+    ("three_outside", "CDL3OUTSIDE", False),
+    ("three_stars_in_south", "CDL3STARSINSOUTH", False),
+    ("three_white_soldiers", "CDL3WHITESOLDIERS", False),
+    ("abandoned_baby", "CDLABANDONEDBABY", True),
+    ("advance_block", "CDLADVANCEBLOCK", False),
+    ("belt_hold", "CDLBELTHOLD", False),
+    ("breakaway", "CDLBREAKAWAY", False),
+    ("closing_marubozu", "CDLCLOSINGMARUBOZU", False),
+    ("concealing_baby_swallow", "CDLCONCEALBABYSWALL", False),
+    ("counterattack", "CDLCOUNTERATTACK", False),
+    ("dark_cloud_cover", "CDLDARKCLOUDCOVER", True),
+    ("doji", "CDLDOJI", False),
+    ("doji_star", "CDLDOJISTAR", False),
+    ("dragonfly_doji", "CDLDRAGONFLYDOJI", False),
+    ("engulfing", "CDLENGULFING", False),
+    ("evening_doji_star", "CDLEVENINGDOJISTAR", True),
+    ("evening_star", "CDLEVENINGSTAR", True),
+    ("gap_side_by_side_white", "CDLGAPSIDESIDEWHITE", False),
+    ("gravestone_doji", "CDLGRAVESTONEDOJI", False),
+    ("hammer", "CDLHAMMER", False),
+    ("hanging_man", "CDLHANGINGMAN", False),
+    ("harami", "CDLHARAMI", False),
+    ("harami_cross", "CDLHARAMICROSS", False),
+    ("high_wave", "CDLHIGHWAVE", False),
+    ("hikkake", "CDLHIKKAKE", False),
+    ("hikkake_modified", "CDLHIKKAKEMOD", False),
+    ("homing_pigeon", "CDLHOMINGPIGEON", False),
+    ("identical_three_crows", "CDLIDENTICAL3CROWS", False),
+    ("in_neck", "CDLINNECK", False),
+    ("inverted_hammer", "CDLINVERTEDHAMMER", False),
+    ("kicking", "CDLKICKING", False),
+    ("kicking_by_length", "CDLKICKINGBYLENGTH", False),
+    ("ladder_bottom", "CDLLADDERBOTTOM", False),
+    ("long_legged_doji", "CDLLONGLEGGEDDOJI", False),
+    ("long_line", "CDLLONGLINE", False),
+    ("marubozu", "CDLMARUBOZU", False),
+    ("matching_low", "CDLMATCHINGLOW", False),
+    ("mat_hold", "CDLMATHOLD", True),
+    ("morning_doji_star", "CDLMORNINGDOJISTAR", True),
+    ("morning_star", "CDLMORNINGSTAR", True),
+    ("on_neck", "CDLONNECK", False),
+    ("piercing", "CDLPIERCING", False),
+    ("rickshaw_man", "CDLRICKSHAWMAN", False),
+    ("rise_fall_three_methods", "CDLRISEFALL3METHODS", False),
+    ("separating_lines", "CDLSEPARATINGLINES", False),
+    ("shooting_star", "CDLSHOOTINGSTAR", False),
+    ("short_line", "CDLSHORTLINE", False),
+    ("spinning_top", "CDLSPINNINGTOP", False),
+    ("stalled_pattern", "CDLSTALLEDPATTERN", False),
+    ("stick_sandwich", "CDLSTICKSANDWICH", False),
+    ("takuri", "CDLTAKURI", False),
+    ("tasuki_gap", "CDLTASUKIGAP", False),
+    ("thrusting", "CDLTHRUSTING", False),
+    ("tristar", "CDLTRISTAR", False),
+    ("unique_three_river", "CDLUNIQUE3RIVER", False),
+    ("upside_gap_two_crows", "CDLUPSIDEGAP2CROWS", False),
+    ("gap_three_methods", "CDLXSIDEGAP3METHODS", False),
+)
 
 
 def calculate_sma(
@@ -720,6 +788,128 @@ def calculate_obv(
         parameters={},
         points=points,
     )
+
+
+def calculate_candlestick_patterns(
+    series: HistoricalCandleSeries,
+    *,
+    penetration: float = 0.3,
+) -> IndicatorBundle:
+    """Calculate every supported TA-Lib candlestick pattern from OHLC data.
+
+    TA-Lib pattern functions use a short internal lookback (at most a
+    handful of candles for shape context plus a body-size reference
+    window); 15 candles is a conservative floor that keeps every
+    supported pattern fully evaluable. Unlike moving-average or
+    momentum indicators, TA-Lib fills unevaluable leading bars with 0
+    rather than NaN, so every component spans the full candle prefix.
+    """
+    minimum_candles = 15
+    candle_count = len(series.candles)
+    if candle_count < minimum_candles:
+        raise InsufficientDataError(
+            "candlestick patterns require at least "
+            f"{minimum_candles} candles; received {candle_count}"
+        )
+
+    normalized_penetration = _validate_penetration(penetration)
+
+    opens = np.asarray(
+        [candle.open for candle in series.candles],
+        dtype=np.float64,
+    )
+    highs = np.asarray(
+        [candle.high for candle in series.candles],
+        dtype=np.float64,
+    )
+    lows = np.asarray(
+        [candle.low for candle in series.candles],
+        dtype=np.float64,
+    )
+    closes = np.asarray(
+        [candle.close for candle in series.candles],
+        dtype=np.float64,
+    )
+
+    components: list[IndicatorComponent] = []
+    for name, talib_name, needs_penetration in CANDLESTICK_PATTERN_NAMES:
+        calculator = getattr(talib, talib_name)
+        try:
+            if needs_penetration:
+                raw_calculated = calculator(
+                    opens,
+                    highs,
+                    lows,
+                    closes,
+                    penetration=normalized_penetration,
+                )
+            else:
+                raw_calculated = calculator(opens, highs, lows, closes)
+            calculated = np.asarray(raw_calculated, dtype=np.float64)
+        except Exception as error:
+            raise IndicatorCalculationError(
+                f"TA-Lib could not calculate candlestick pattern {name}"
+            ) from error
+
+        if calculated.ndim != 1 or calculated.size != candle_count:
+            raise IndicatorCalculationError(
+                "TA-Lib returned an invalid candlestick pattern "
+                f"{name} result shape"
+            )
+
+        if not np.all(np.isfinite(calculated)):
+            raise IndicatorCalculationError(
+                "TA-Lib returned non-finite candlestick pattern "
+                f"{name} values"
+            )
+
+        components.append(
+            IndicatorComponent(
+                name=name,
+                points=[
+                    IndicatorPoint(
+                        timestamp=candle.timestamp,
+                        value=float(value),
+                    )
+                    for candle, value in zip(series.candles, calculated)
+                ],
+            )
+        )
+
+    return IndicatorBundle(
+        exchange=series.exchange,
+        symbol_token=series.symbol_token,
+        symbol=series.symbol,
+        interval=series.interval,
+        indicator="CDL_PATTERNS",
+        input_fields=(
+            PriceField.OPEN,
+            PriceField.HIGH,
+            PriceField.LOW,
+            PriceField.CLOSE,
+        ),
+        parameters={"penetration": normalized_penetration},
+        components=components,
+    )
+
+
+def _validate_penetration(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "candlestick pattern penetration must be a number"
+        )
+
+    normalized = float(value)
+    if not isfinite(normalized):
+        raise ValueError(
+            "candlestick pattern penetration must be finite"
+        )
+    if not 0 < normalized < 1:
+        raise ValueError(
+            "candlestick pattern penetration must be between 0 and 1"
+        )
+
+    return normalized
 
 
 def _calculate_moving_average(

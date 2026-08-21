@@ -11,16 +11,20 @@ from app.exceptions import StorageConflictError, StorageError
 from app.models.storage import (
     BacktestRunQuery,
     BacktestRunSummary,
+    DebateRunQuery,
+    DebateRunSummary,
     MarketSeriesQuery,
     MarketSeriesSummary,
     StoredBacktestRun,
+    StoredDebateRun,
     StoredMarketSeries,
     backtest_run_summary,
+    debate_run_summary,
     market_series_summary,
 )
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 class DuckDBJarvisStorage:
@@ -322,6 +326,166 @@ class DuckDBJarvisStorage:
             ),
         )
 
+    def save_debate_run(
+        self,
+        stored: StoredDebateRun,
+    ) -> StoredDebateRun:
+        value = StoredDebateRun.model_validate(stored)
+        summary = debate_run_summary(value)
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                existing = self._connection.execute(
+                    "SELECT result_fingerprint, payload_json "
+                    "FROM jarvis_debate_runs WHERE run_id = ?",
+                    [value.run_id],
+                ).fetchone()
+                if existing is not None:
+                    if existing[0] != value.result_fingerprint:
+                        raise StorageConflictError(
+                            "debate run identifier already contains "
+                            "different data"
+                        )
+                    persisted = StoredDebateRun.model_validate_json(
+                        existing[1]
+                    )
+                else:
+                    self._connection.execute(
+                        "INSERT INTO jarvis_debate_runs ("
+                        "run_id, result_fingerprint, "
+                        "technical_fingerprint, stored_at, exchange, "
+                        "symbol_token, interval, winner, summary_json, "
+                        "payload_json"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            value.run_id,
+                            value.result_fingerprint,
+                            value.technical_fingerprint,
+                            value.stored_at,
+                            value.exchange,
+                            value.symbol_token,
+                            value.interval,
+                            _enum_value(
+                                value.result.submission.verdict.winner
+                            ),
+                            summary.model_dump_json(),
+                            value.model_dump_json(),
+                        ],
+                    )
+                    for token in value.signature:
+                        self._connection.execute(
+                            "INSERT INTO jarvis_debate_signal_signature "
+                            "(run_id, token) VALUES (?, ?)",
+                            [value.run_id, token],
+                        )
+                    persisted = value
+                self._connection.execute("COMMIT")
+                return StoredDebateRun.model_validate_json(
+                    persisted.model_dump_json()
+                )
+            except StorageConflictError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to persist DuckDB debate run"
+                ) from exc
+
+    def get_debate_run(
+        self,
+        run_id: str,
+    ) -> StoredDebateRun | None:
+        return self._get_payload(
+            table="jarvis_debate_runs",
+            id_column="run_id",
+            identifier=run_id,
+            payload_type=StoredDebateRun,
+        )
+
+    def list_debate_runs(
+        self,
+        query: DebateRunQuery | None = None,
+    ) -> tuple[DebateRunSummary, ...]:
+        filters = query or DebateRunQuery()
+        clauses, parameters = _common_filter_clauses(filters)
+        _append_filter(clauses, parameters, "exchange", filters.exchange)
+        _append_filter(
+            clauses,
+            parameters,
+            "symbol_token",
+            filters.symbol_token,
+        )
+        _append_filter(clauses, parameters, "interval", filters.interval)
+        _append_filter(
+            clauses,
+            parameters,
+            "winner",
+            _enum_value(filters.winner),
+        )
+        return self._list_summaries(
+            table="jarvis_debate_runs",
+            id_column="run_id",
+            clauses=clauses,
+            parameters=parameters,
+            limit=filters.limit,
+            offset=filters.offset,
+            summary_type=DebateRunSummary,
+        )
+
+    def delete_debate_run(self, run_id: str) -> bool:
+        return self._delete(
+            table="jarvis_debate_runs",
+            id_column="run_id",
+            identifier=run_id,
+            child_relations=(
+                ("jarvis_debate_signal_signature", "run_id"),
+            ),
+        )
+
+    def find_similar_debate_runs(
+        self,
+        signature: tuple[str, ...],
+        *,
+        exclude_run_id: str | None = None,
+        limit: int = 5,
+    ) -> tuple[DebateRunSummary, ...]:
+        if not signature:
+            return ()
+        placeholders = ", ".join("?" for _ in signature)
+        parameters: list[object] = list(signature)
+        exclude_clause = ""
+        if exclude_run_id is not None:
+            exclude_clause = " AND s.run_id != ?"
+            parameters.append(exclude_run_id)
+        sql = (
+            "SELECT r.summary_json, COUNT(*) AS overlap "
+            "FROM jarvis_debate_signal_signature AS s "
+            "JOIN jarvis_debate_runs AS r ON r.run_id = s.run_id "
+            f"WHERE s.token IN ({placeholders}){exclude_clause} "
+            "GROUP BY r.run_id, r.summary_json, r.stored_at "
+            "ORDER BY overlap DESC, r.stored_at DESC "
+            "LIMIT ?"
+        )
+        parameters.append(limit)
+        with self._lock:
+            self._ensure_open()
+            try:
+                rows = self._connection.execute(sql, parameters).fetchall()
+                return tuple(
+                    DebateRunSummary.model_validate_json(row[0])
+                    for row in rows
+                )
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to find similar DuckDB debate runs"
+                ) from exc
+
     def _initialize_schema(self) -> None:
         with self._lock:
             transaction_started = False
@@ -349,13 +513,14 @@ class DuckDBJarvisStorage:
                     raise StorageError(
                         "Invalid DuckDB storage schema version"
                     ) from exc
-                if current_version not in (None, 1, _SCHEMA_VERSION):
+                if current_version not in (None, 1, 2, _SCHEMA_VERSION):
                     raise StorageError(
                         "Unsupported DuckDB storage schema version: "
                         f"{row[0]}"
                     )
                 self._create_tables()
                 self._create_normalized_tables()
+                self._create_debate_tables()
                 if current_version == 1:
                     self._backfill_normalized_schema()
                 if row is None:
@@ -426,6 +591,48 @@ class DuckDBJarvisStorage:
                 interval,
                 stored_at
             )
+            """
+        )
+
+    def _create_debate_tables(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_debate_runs (
+                run_id VARCHAR PRIMARY KEY,
+                result_fingerprint VARCHAR NOT NULL,
+                technical_fingerprint VARCHAR NOT NULL,
+                stored_at TIMESTAMPTZ NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol_token VARCHAR NOT NULL,
+                interval VARCHAR NOT NULL,
+                winner VARCHAR NOT NULL,
+                summary_json VARCHAR NOT NULL,
+                payload_json VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_debate_runs_lookup
+            ON jarvis_debate_runs (
+                symbol_token,
+                interval,
+                stored_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_debate_signal_signature (
+                run_id VARCHAR NOT NULL,
+                token VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_debate_signal_signature_token
+            ON jarvis_debate_signal_signature (token)
             """
         )
 

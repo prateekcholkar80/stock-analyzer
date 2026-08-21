@@ -21,10 +21,12 @@ from app.models.market import Candle, HistoricalCandleSeries
 from app.models.signals import SignalDirection
 from app.models.storage import (
     BacktestRunQuery,
+    DebateRunQuery,
     MarketSeriesQuery,
     backtest_run_summary,
     market_series_summary,
     stored_backtest_run,
+    stored_debate_run,
     stored_market_series,
 )
 from app.services.research_archive import ResearchArchiveService
@@ -33,6 +35,8 @@ from app.storage.repositories import JarvisStorageAdapter
 from app.use_cases.run_and_archive_backtest import (
     RunAndArchiveWalkForwardBacktest,
 )
+from tests.unit._debate_fixtures import build_market_series
+from tests.unit.test_debate_storage import _build_debate_result
 from tests.unit.test_storage_adapters import (
     _backtest_result,
     _market_series,
@@ -111,7 +115,7 @@ class DuckDBStorageTests(unittest.TestCase):
         with self.storage() as storage:
             self.assertIsInstance(storage, JarvisStorageAdapter)
             self.assertEqual(storage.adapter_name, "duckdb")
-            self.assertEqual(storage.schema_version, 2)
+            self.assertEqual(storage.schema_version, 3)
             self.assertEqual(storage.database, str(self.database))
 
         connection = duckdb.connect(str(self.database), read_only=True)
@@ -127,7 +131,7 @@ class DuckDBStorageTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(version, ("2",))
+        self.assertEqual(version, ("3",))
         self.assertTrue(
             {
                 "jarvis_instruments",
@@ -145,6 +149,8 @@ class DuckDBStorageTests(unittest.TestCase):
                 "jarvis_backtest_equity_points",
                 "jarvis_backtest_performance",
                 "jarvis_backtest_performance_segments",
+                "jarvis_debate_runs",
+                "jarvis_debate_signal_signature",
             }.issubset(tables)
         )
 
@@ -243,9 +249,9 @@ class DuckDBStorageTests(unittest.TestCase):
             counts,
             {
                 "jarvis_backtest_evaluations": 9,
-                "jarvis_backtest_evaluation_categories": 35,
-                "jarvis_backtest_signal_evidence": 35,
-                "jarvis_backtest_signal_contributions": 35,
+                "jarvis_backtest_evaluation_categories": 42,
+                "jarvis_backtest_signal_evidence": 42,
+                "jarvis_backtest_signal_contributions": 42,
                 "jarvis_backtest_trades": 4,
                 "jarvis_backtest_equity_points": 11,
                 "jarvis_backtest_performance": 1,
@@ -295,6 +301,7 @@ class DuckDBStorageTests(unittest.TestCase):
         self.assertEqual(
             weights,
             [
+                ("candlestick", 1.0),
                 ("momentum", 1.0),
                 ("price_action", 1.5),
                 ("trend", 1.25),
@@ -631,11 +638,105 @@ class DuckDBStorageTests(unittest.TestCase):
             ).fetchone()[0]
             loaded = migrated.get_backtest_run("legacy-run")
 
-        self.assertEqual(version, "2")
+        self.assertEqual(version, "3")
         self.assertEqual(candle_count, 2)
         self.assertEqual(equity_count, 2)
         self.assertEqual(loaded.run_id, "legacy-run")
         self.assertEqual(loaded.storage_schema_version, 1)
+
+    def test_debate_run_persists_and_survives_close_and_reopen(self):
+        result, profile = _build_debate_result()
+        stored = stored_debate_run(
+            result,
+            profile,
+            stored_at=datetime(2026, 1, 1, tzinfo=IST),
+        )
+        with self.storage() as storage:
+            saved = storage.save_debate_run(stored)
+            self.assertEqual(saved.run_id, stored.run_id)
+
+        with self.storage() as reopened:
+            fetched = reopened.get_debate_run(stored.run_id)
+            self.assertEqual(fetched, saved)
+            summaries = reopened.list_debate_runs()
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(summaries[0].run_id, stored.run_id)
+
+    def test_debate_run_conflict_and_delete(self):
+        result, profile = _build_debate_result()
+        stored = stored_debate_run(
+            result,
+            profile,
+            stored_at=datetime(2026, 1, 1, tzinfo=IST),
+        )
+        other_result, other_profile = _build_debate_result(
+            build_market_series(count=90)
+        )
+        conflicting = stored_debate_run(
+            other_result,
+            other_profile,
+            stored_at=datetime(2026, 1, 1, tzinfo=IST),
+            run_id=stored.run_id,
+        )
+        with self.storage() as storage:
+            storage.save_debate_run(stored)
+            with self.assertRaises(StorageConflictError):
+                storage.save_debate_run(conflicting)
+            self.assertTrue(storage.delete_debate_run(stored.run_id))
+            self.assertFalse(storage.delete_debate_run(stored.run_id))
+            self.assertIsNone(storage.get_debate_run(stored.run_id))
+
+    def test_find_similar_debate_runs_via_sql_overlap(self):
+        result, profile = _build_debate_result()
+        high = stored_debate_run(
+            result,
+            profile,
+            stored_at=datetime(2026, 1, 1, tzinfo=IST),
+            run_id="debate-high",
+        ).model_copy(
+            update={"signature": ("trend:bullish", "momentum:bullish")}
+        )
+        low = high.model_copy(
+            update={"run_id": "debate-low", "signature": ("trend:bullish",)}
+        )
+        none_matching = high.model_copy(
+            update={
+                "run_id": "debate-none",
+                "signature": ("volume:bearish",),
+            }
+        )
+        with self.storage() as storage:
+            for stored in (high, low, none_matching):
+                storage.save_debate_run(stored)
+
+            results = storage.find_similar_debate_runs(
+                ("trend:bullish", "momentum:bullish"),
+            )
+
+        self.assertEqual(
+            [summary.run_id for summary in results],
+            ["debate-high", "debate-low"],
+        )
+
+    def test_debate_run_query_filters_by_winner(self):
+        result, profile = _build_debate_result()
+        stored = stored_debate_run(
+            result,
+            profile,
+            stored_at=datetime(2026, 1, 1, tzinfo=IST),
+        )
+        with self.storage() as storage:
+            storage.save_debate_run(stored)
+
+            matches = storage.list_debate_runs(
+                DebateRunQuery(winner=SignalDirection.BULLISH)
+            )
+            no_matches = storage.list_debate_runs(
+                DebateRunQuery(winner=SignalDirection.BEARISH)
+            )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(no_matches, ())
 
     def test_closed_adapter_rejects_operations_and_close_is_idempotent(self):
         storage = self.storage()

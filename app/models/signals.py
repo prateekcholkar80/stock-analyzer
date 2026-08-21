@@ -28,6 +28,7 @@ class SignalCategory(StrEnum):
     VOLATILITY = "volatility"
     VOLUME = "volume"
     PRICE_ACTION = "price_action"
+    CANDLESTICK = "candlestick"
 
 
 class SignalStrength(StrEnum):

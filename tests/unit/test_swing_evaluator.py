@@ -65,6 +65,7 @@ class UnifiedSwingEvaluatorTests(unittest.TestCase):
                 SignalCategory.VOLATILITY: 0.75,
                 SignalCategory.VOLUME: 1.0,
                 SignalCategory.PRICE_ACTION: 1.5,
+                SignalCategory.CANDLESTICK: 1.0,
             },
         )
 
@@ -77,7 +78,7 @@ class UnifiedSwingEvaluatorTests(unittest.TestCase):
             profile.snapshot.evaluated_at,
             series.candles[-1].timestamp,
         )
-        self.assertEqual(len(profile.snapshot.evidence), 11)
+        self.assertEqual(len(profile.snapshot.evidence), 12)
         self.assertEqual(profile.coverage_percentage, 100)
         self.assertEqual(
             {item.category for item in profile.snapshot.evidence},
@@ -94,6 +95,7 @@ class UnifiedSwingEvaluatorTests(unittest.TestCase):
                 "volatility_signals.bollinger_price_and_bandwidth",
                 "volatility_signals.atr_regime_and_risk_distance",
                 "volume_signals.obv_price_confirmation",
+                "candlestick_signals.candlestick_pattern",
                 "price_action_signals.fair_value_gap_context",
                 "price_action_signals.support_resistance_lifecycle",
                 "price_action_signals.market_structure",

@@ -46,6 +46,14 @@ class AgentSubmissionRejectedError(TechnicalAnalysisError):
     """Raised when Jarvis rejects an agent's workflow submission."""
 
 
+class LLMError(ExternalServiceError):
+    """Raised when an LLM provider call cannot complete."""
+
+
+class LLMResponseValidationError(LLMError):
+    """Raised when an LLM response cannot be parsed into the expected schema."""
+
+
 class StorageError(ApplicationError):
     """Raised when a persistence adapter cannot complete an operation."""
 

@@ -11,9 +11,12 @@ from typing import Protocol, runtime_checkable
 from app.models.storage import (
     BacktestRunQuery,
     BacktestRunSummary,
+    DebateRunQuery,
+    DebateRunSummary,
     MarketSeriesQuery,
     MarketSeriesSummary,
     StoredBacktestRun,
+    StoredDebateRun,
     StoredMarketSeries,
 )
 
@@ -79,9 +82,54 @@ class BacktestRunRepository(Protocol):
 
 
 @runtime_checkable
+class DebateRunRepository(Protocol):
+    """Persistence port for immutable Bull/Bear debate results."""
+
+    def save_debate_run(
+        self,
+        stored: StoredDebateRun,
+    ) -> StoredDebateRun:
+        """Store a debate run or return an identical existing run."""
+        ...
+
+    def get_debate_run(
+        self,
+        run_id: str,
+    ) -> StoredDebateRun | None:
+        """Return a stored debate run, or None when it does not exist."""
+        ...
+
+    def list_debate_runs(
+        self,
+        query: DebateRunQuery | None = None,
+    ) -> tuple[DebateRunSummary, ...]:
+        """Return newest-first metadata without loading full transcripts."""
+        ...
+
+    def delete_debate_run(self, run_id: str) -> bool:
+        """Delete a debate run and report whether it existed."""
+        ...
+
+    def find_similar_debate_runs(
+        self,
+        signature: tuple[str, ...],
+        *,
+        exclude_run_id: str | None = None,
+        limit: int = 5,
+    ) -> tuple[DebateRunSummary, ...]:
+        """Return stored runs ranked by shared-signature-token overlap.
+
+        Ties break newest-stored-first. Runs sharing zero tokens with
+        ``signature`` are never returned, even if ``limit`` isn't reached.
+        """
+        ...
+
+
+@runtime_checkable
 class JarvisStorageAdapter(
     MarketSeriesRepository,
     BacktestRunRepository,
+    DebateRunRepository,
     Protocol,
 ):
     """Complete storage port implemented by each database adapter."""

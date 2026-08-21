@@ -83,7 +83,7 @@ class AgentOrchestratorTests(unittest.TestCase):
             submission.evaluated_at,
             series.candles[-1].timestamp,
         )
-        self.assertEqual(submission.evidence_count, 11)
+        self.assertEqual(submission.evidence_count, 12)
         self.assertEqual(
             {item.source for item in submission.profile.snapshot.evidence},
             UNIFIED_SWING_EVIDENCE_SOURCES,
@@ -145,7 +145,7 @@ class AgentOrchestratorTests(unittest.TestCase):
             profile.snapshot.evaluated_at,
             series.candles[-1].timestamp,
         )
-        self.assertEqual(len(profile.snapshot.evidence), 11)
+        self.assertEqual(len(profile.snapshot.evidence), 12)
 
     def test_judge_rejects_submission_for_another_assignment(self):
         series = self.market()

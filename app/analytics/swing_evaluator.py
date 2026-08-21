@@ -3,6 +3,9 @@ from typing import Self
 
 from pydantic import ConfigDict, Field, model_validator
 
+from app.analytics.candlestick_signals import (
+    generate_candlestick_pattern_signal,
+)
 from app.analytics.fair_value_gaps import detect_fair_value_gaps
 from app.analytics.historical_analysis import (
     analyze_swing_profiles_over_history,
@@ -11,6 +14,7 @@ from app.analytics.indicators import (
     calculate_adx,
     calculate_atr,
     calculate_bollinger_bands,
+    calculate_candlestick_patterns,
     calculate_ema,
     calculate_macd,
     calculate_obv,
@@ -113,12 +117,18 @@ class UnifiedSwingEvaluatorConfig(TechnicalModel):
         ge=0,
     )
     fvg_max_age_candles: int | None = Field(default=None, ge=1)
+    candlestick_pattern_penetration: float = Field(
+        default=0.3,
+        gt=0,
+        lt=1,
+    )
 
     trend_weight: float = Field(default=1.25, gt=0)
     momentum_weight: float = Field(default=1.0, gt=0)
     volatility_weight: float = Field(default=0.75, gt=0)
     volume_weight: float = Field(default=1.0, gt=0)
     price_action_weight: float = Field(default=1.5, gt=0)
+    candlestick_weight: float = Field(default=1.0, gt=0)
     minimum_coverage_percentage: float = Field(default=60.0, ge=0, le=100)
     directional_threshold: float = Field(default=20.0, gt=0, le=100)
     strong_threshold: float = Field(default=60.0, gt=0, le=100)
@@ -168,6 +178,7 @@ class UnifiedSwingEvaluatorConfig(TechnicalModel):
                 - 2
             ),
             self.pivot_left_strength + self.pivot_right_strength + 1,
+            15,  # calculate_candlestick_patterns floor
             3,
         )
 
@@ -179,6 +190,7 @@ class UnifiedSwingEvaluatorConfig(TechnicalModel):
             SignalCategory.VOLATILITY: self.volatility_weight,
             SignalCategory.VOLUME: self.volume_weight,
             SignalCategory.PRICE_ACTION: self.price_action_weight,
+            SignalCategory.CANDLESTICK: self.candlestick_weight,
         }
 
 
@@ -249,6 +261,10 @@ class UnifiedSwingEvaluator:
             config.stochastic_slow_d_period,
         )
         obv = calculate_obv(market_series, PriceField.CLOSE)
+        candlestick_patterns = calculate_candlestick_patterns(
+            market_series,
+            penetration=config.candlestick_pattern_penetration,
+        )
 
         pivots = detect_swing_pivots(
             market_series,
@@ -309,6 +325,10 @@ class UnifiedSwingEvaluator:
             generate_obv_confirmation_signal(
                 obv,
                 market_series,
+                as_of=evaluated_at,
+            ),
+            generate_candlestick_pattern_signal(
+                candlestick_patterns,
                 as_of=evaluated_at,
             ),
             generate_fair_value_gap_signal(

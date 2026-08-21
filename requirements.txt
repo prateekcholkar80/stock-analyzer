@@ -8,3 +8,4 @@ pyotp
 TA-Lib
 logzero
 websocket-client
+litellm

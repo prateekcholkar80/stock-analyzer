@@ -556,6 +556,7 @@ class WalkForwardBacktestTests(unittest.TestCase):
                 "volatility": 0.75,
                 "volume": 1.0,
                 "price_action": 1.5,
+                "candlestick": 1.0,
             },
         )
         self.assertEqual(

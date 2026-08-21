@@ -10,8 +10,15 @@ from pydantic import (
     model_validator,
 )
 
+from app.models.agentic import AgenticSwingAnalysisResult
 from app.models.backtest import WalkForwardBacktestResult
+from app.models.debate import AgenticDebateResult, DebateTerminationReason
 from app.models.market import HistoricalCandleSeries
+from app.models.signals import (
+    SignalDirection,
+    SignalStrength,
+    SwingTradingSignalProfile,
+)
 
 
 _IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
@@ -21,6 +28,26 @@ _FINGERPRINT_PATTERN = r"^[a-f0-9]{64}$"
 def payload_fingerprint(payload: BaseModel) -> str:
     """Return a stable SHA-256 digest for a validated domain aggregate."""
     return sha256(payload.model_dump_json().encode("utf-8")).hexdigest()
+
+
+def debate_signal_signature(
+    profile: SwingTradingSignalProfile,
+) -> tuple[str, ...]:
+    """Deterministic 'symptom' signature used to recall similar debates.
+
+    One "{category}:{direction}" token per evidence item at strength
+    MODERATE or STRONG, sorted and de-duplicated -- weak/neutral evidence
+    is excluded since it isn't a strong enough symptom to match on. No
+    ML/embeddings: two debates are "similar" purely by how many of these
+    tokens they share.
+    """
+    tokens = {
+        f"{item.category.value}:{item.direction.value}"
+        for item in profile.snapshot.evidence
+        if item.strength is not SignalStrength.WEAK
+        and item.direction is not SignalDirection.NEUTRAL
+    }
+    return tuple(sorted(tokens))
 
 
 class StorageModel(BaseModel):
@@ -92,6 +119,46 @@ class StoredBacktestRun(StorageModel):
         return self
 
 
+class StoredDebateRun(StorageModel):
+    storage_schema_version: int = Field(default=1, ge=1)
+    run_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    result_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+    technical_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+    stored_at: datetime
+    exchange: str = Field(min_length=1)
+    symbol_token: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+    interval: str = Field(min_length=1)
+    signature: tuple[str, ...]
+    result: AgenticDebateResult
+
+    @field_validator("stored_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("storage timestamps must include timezone")
+        return value
+
+    @model_validator(mode="after")
+    def validate_fingerprints(self) -> Self:
+        if self.result_fingerprint != payload_fingerprint(self.result):
+            raise ValueError(
+                "debate fingerprint must match its result payload"
+            )
+        if self.technical_fingerprint != (
+            self.result.submission.input_fingerprint
+        ):
+            raise ValueError(
+                "debate technical fingerprint must match its submission's "
+                "input fingerprint"
+            )
+        return self
+
+
 class WalkForwardBacktestArchiveReceipt(StorageModel):
     use_case_id: str = Field(
         min_length=1,
@@ -149,6 +216,51 @@ class MarketSeriesSummary(StorageModel):
     last_candle_at: datetime | None = None
 
 
+class RollingFetchReceipt(StorageModel):
+    """Result of one rolling hourly market-data pull."""
+
+    use_case_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    adapter_name: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    stored: StoredMarketSeries
+    new_candle_count: int = Field(ge=0)
+    chunk_request_count: int = Field(ge=0)
+    resumed_from: datetime | None = None
+
+    @property
+    def dataset_id(self) -> str:
+        return self.stored.dataset_id
+
+
+class EndToEndSwingAnalysisResult(StorageModel):
+    """Full trail of one pull -> evaluate -> debate run."""
+
+    use_case_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    market_dataset_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    fetch: RollingFetchReceipt
+    technical_result: AgenticSwingAnalysisResult
+    debate_result: AgenticDebateResult
+
+    @property
+    def dataset_id(self) -> str:
+        return self.stored.dataset_id
+
+
 class BacktestRunSummary(StorageModel):
     run_id: str = Field(pattern=_IDENTIFIER_PATTERN)
     result_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
@@ -165,6 +277,22 @@ class BacktestRunSummary(StorageModel):
     entered_trades: int = Field(ge=0)
     final_equity: float
     total_return_percentage: float
+
+
+class DebateRunSummary(StorageModel):
+    run_id: str = Field(pattern=_IDENTIFIER_PATTERN)
+    result_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+    technical_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+    stored_at: datetime
+    exchange: str = Field(min_length=1)
+    symbol_token: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+    interval: str = Field(min_length=1)
+    winner: SignalDirection
+    confidence_percentage: float = Field(ge=0, le=100)
+    termination_reason: DebateTerminationReason
+    round_count: int = Field(ge=1)
+    signature: tuple[str, ...]
 
 
 class StorageQuery(StorageModel):
@@ -218,6 +346,13 @@ class BacktestRunQuery(StorageQuery):
     interval: str | None = Field(default=None, min_length=1)
 
 
+class DebateRunQuery(StorageQuery):
+    exchange: str | None = Field(default=None, min_length=1)
+    symbol_token: str | None = Field(default=None, min_length=1)
+    interval: str | None = Field(default=None, min_length=1)
+    winner: SignalDirection | None = None
+
+
 def stored_market_series(
     series: HistoricalCandleSeries,
     *,
@@ -246,6 +381,34 @@ def stored_backtest_run(
         result_fingerprint=result_fingerprint,
         market_fingerprint=payload_fingerprint(result.market_series),
         stored_at=stored_at,
+        result=result,
+    )
+
+
+def stored_debate_run(
+    result: AgenticDebateResult,
+    profile: SwingTradingSignalProfile,
+    *,
+    stored_at: datetime,
+    run_id: str | None = None,
+) -> StoredDebateRun:
+    if payload_fingerprint(profile) != result.submission.input_fingerprint:
+        raise ValueError(
+            "debate archive profile must match the profile the debate "
+            "actually consumed"
+        )
+    result_fingerprint = payload_fingerprint(result)
+    snapshot = profile.snapshot
+    return StoredDebateRun(
+        run_id=run_id or f"debate:{result_fingerprint}",
+        result_fingerprint=result_fingerprint,
+        technical_fingerprint=result.submission.input_fingerprint,
+        stored_at=stored_at,
+        exchange=snapshot.exchange,
+        symbol_token=snapshot.symbol_token,
+        symbol=snapshot.symbol,
+        interval=snapshot.interval,
+        signature=debate_signal_signature(profile),
         result=result,
     )
 
@@ -293,4 +456,26 @@ def backtest_run_summary(
         total_return_percentage=(
             result.performance.total_return_percentage
         ),
+    )
+
+
+def debate_run_summary(stored: StoredDebateRun) -> DebateRunSummary:
+    result = stored.result
+    verdict = result.submission.verdict
+    return DebateRunSummary(
+        run_id=stored.run_id,
+        result_fingerprint=stored.result_fingerprint,
+        technical_fingerprint=stored.technical_fingerprint,
+        stored_at=stored.stored_at,
+        exchange=stored.exchange,
+        symbol_token=stored.symbol_token,
+        symbol=stored.symbol,
+        interval=stored.interval,
+        winner=verdict.winner,
+        confidence_percentage=verdict.confidence_percentage,
+        termination_reason=(
+            result.submission.transcript.termination_reason
+        ),
+        round_count=result.submission.transcript.round_count,
+        signature=stored.signature,
     )

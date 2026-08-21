@@ -1,15 +1,22 @@
 from datetime import UTC, datetime
 
 from app.models.backtest import WalkForwardBacktestResult
+from app.models.debate import AgenticDebateResult
 from app.models.market import HistoricalCandleSeries
+from app.models.signals import SwingTradingSignalProfile
 from app.models.storage import (
     BacktestRunQuery,
     BacktestRunSummary,
+    DebateRunQuery,
+    DebateRunSummary,
     MarketSeriesQuery,
     MarketSeriesSummary,
     StoredBacktestRun,
+    StoredDebateRun,
     StoredMarketSeries,
+    debate_signal_signature,
     stored_backtest_run,
+    stored_debate_run,
     stored_market_series,
 )
 from app.storage.repositories import JarvisStorageAdapter
@@ -93,3 +100,48 @@ class ResearchArchiveService:
 
     def delete_backtest_run(self, run_id: str) -> bool:
         return self._storage.delete_backtest_run(run_id)
+
+    def archive_debate_run(
+        self,
+        result: AgenticDebateResult,
+        profile: SwingTradingSignalProfile,
+        *,
+        run_id: str | None = None,
+        stored_at: datetime | None = None,
+    ) -> StoredDebateRun:
+        stored = stored_debate_run(
+            result,
+            profile,
+            run_id=run_id,
+            stored_at=stored_at or datetime.now(UTC),
+        )
+        return self._storage.save_debate_run(stored)
+
+    def get_debate_run(
+        self,
+        run_id: str,
+    ) -> StoredDebateRun | None:
+        return self._storage.get_debate_run(run_id)
+
+    def list_debate_runs(
+        self,
+        query: DebateRunQuery | None = None,
+    ) -> tuple[DebateRunSummary, ...]:
+        return self._storage.list_debate_runs(query)
+
+    def delete_debate_run(self, run_id: str) -> bool:
+        return self._storage.delete_debate_run(run_id)
+
+    def find_similar_debate_runs(
+        self,
+        profile: SwingTradingSignalProfile,
+        *,
+        exclude_run_id: str | None = None,
+        limit: int = 5,
+    ) -> tuple[DebateRunSummary, ...]:
+        signature = debate_signal_signature(profile)
+        return self._storage.find_similar_debate_runs(
+            signature,
+            exclude_run_id=exclude_run_id,
+            limit=limit,
+        )

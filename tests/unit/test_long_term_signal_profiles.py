@@ -141,7 +141,18 @@ class LongTermTechnicalProfileTests(unittest.TestCase):
             self.snapshot(evidence)
         )
 
-        self.assertAlmostEqual(profile.coverage_percentage, 75.0)
+        total_weight = sum(DEFAULT_LONG_TERM_CATEGORY_WEIGHTS.values())
+        covered_weight = (
+            DEFAULT_LONG_TERM_CATEGORY_WEIGHTS[SignalCategory.TREND]
+            + DEFAULT_LONG_TERM_CATEGORY_WEIGHTS[SignalCategory.VOLUME]
+            + DEFAULT_LONG_TERM_CATEGORY_WEIGHTS[
+                SignalCategory.PRICE_ACTION
+            ]
+        )
+        self.assertAlmostEqual(
+            profile.coverage_percentage,
+            covered_weight / total_weight * 100,
+        )
         self.assertNotEqual(
             profile.stance,
             LongTermTechnicalStance.INSUFFICIENT_EVIDENCE,

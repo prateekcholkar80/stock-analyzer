@@ -5,12 +5,16 @@ from app.exceptions import StorageConflictError
 from app.models.storage import (
     BacktestRunQuery,
     BacktestRunSummary,
+    DebateRunQuery,
+    DebateRunSummary,
     MarketSeriesQuery,
     MarketSeriesSummary,
     StorageModel,
     StoredBacktestRun,
+    StoredDebateRun,
     StoredMarketSeries,
     backtest_run_summary,
+    debate_run_summary,
     market_series_summary,
 )
 
@@ -40,6 +44,7 @@ class InMemoryJarvisStorage:
     def __init__(self) -> None:
         self._market_series: dict[str, StoredMarketSeries] = {}
         self._backtest_runs: dict[str, StoredBacktestRun] = {}
+        self._debate_runs: dict[str, StoredDebateRun] = {}
         self._lock = RLock()
 
     def save_market_series(
@@ -178,3 +183,94 @@ class InMemoryJarvisStorage:
     def delete_backtest_run(self, run_id: str) -> bool:
         with self._lock:
             return self._backtest_runs.pop(run_id, None) is not None
+
+    def save_debate_run(
+        self,
+        stored: StoredDebateRun,
+    ) -> StoredDebateRun:
+        value = StoredDebateRun.model_validate(stored)
+        with self._lock:
+            existing = self._debate_runs.get(value.run_id)
+            if existing is not None:
+                if existing.result_fingerprint != value.result_fingerprint:
+                    raise StorageConflictError(
+                        "debate run identifier already contains "
+                        "different data"
+                    )
+                return _copy(existing)
+            self._debate_runs[value.run_id] = _copy(value)
+            return _copy(value)
+
+    def get_debate_run(
+        self,
+        run_id: str,
+    ) -> StoredDebateRun | None:
+        with self._lock:
+            stored = self._debate_runs.get(run_id)
+            return _copy(stored) if stored is not None else None
+
+    def list_debate_runs(
+        self,
+        query: DebateRunQuery | None = None,
+    ) -> tuple[DebateRunSummary, ...]:
+        filters = query or DebateRunQuery()
+        with self._lock:
+            values = [
+                value
+                for value in self._debate_runs.values()
+                if _matches_stored_range(value.stored_at, filters)
+                and (
+                    filters.exchange is None
+                    or value.exchange == filters.exchange
+                )
+                and (
+                    filters.symbol_token is None
+                    or value.symbol_token == filters.symbol_token
+                )
+                and (
+                    filters.interval is None
+                    or value.interval == filters.interval
+                )
+                and (
+                    filters.winner is None
+                    or value.result.submission.verdict.winner
+                    == filters.winner
+                )
+            ]
+        values.sort(
+            key=lambda value: (value.stored_at, value.run_id),
+            reverse=True,
+        )
+        selected = values[
+            filters.offset:filters.offset + filters.limit
+        ]
+        return tuple(debate_run_summary(value) for value in selected)
+
+    def delete_debate_run(self, run_id: str) -> bool:
+        with self._lock:
+            return self._debate_runs.pop(run_id, None) is not None
+
+    def find_similar_debate_runs(
+        self,
+        signature: tuple[str, ...],
+        *,
+        exclude_run_id: str | None = None,
+        limit: int = 5,
+    ) -> tuple[DebateRunSummary, ...]:
+        signature_set = set(signature)
+        with self._lock:
+            candidates = [
+                value
+                for value in self._debate_runs.values()
+                if value.run_id != exclude_run_id
+            ]
+        scored = [
+            (len(signature_set & set(value.signature)), value)
+            for value in candidates
+        ]
+        scored = [
+            (overlap, value) for overlap, value in scored if overlap > 0
+        ]
+        scored.sort(key=lambda item: (item[0], item[1].stored_at), reverse=True)
+        selected = scored[:limit]
+        return tuple(debate_run_summary(value) for _, value in selected)

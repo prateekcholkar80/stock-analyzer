@@ -128,7 +128,7 @@ class HistoricalSwingAnalysisTests(unittest.TestCase):
         self.assertEqual(result.success_rate_percentage, 100)
         self.assertEqual(result.points[0].available_candle_count, 3)
         self.assertEqual(result.points[0].close, 103)
-        self.assertEqual(len(result.points[0].evidence_ids), 5)
+        self.assertEqual(len(result.points[0].evidence_ids), 6)
         self.assertEqual(
             set(result.points[0].category_scores),
             {category.value for category in SignalCategory},

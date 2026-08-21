@@ -46,6 +46,7 @@ UNIFIED_SWING_EVIDENCE_SOURCES = frozenset(
         "volatility_signals.bollinger_price_and_bandwidth",
         "volatility_signals.atr_regime_and_risk_distance",
         "volume_signals.obv_price_confirmation",
+        "candlestick_signals.candlestick_pattern",
         "price_action_signals.fair_value_gap_context",
         "price_action_signals.support_resistance_lifecycle",
         "price_action_signals.market_structure",

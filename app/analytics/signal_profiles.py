@@ -23,6 +23,7 @@ DEFAULT_SWING_CATEGORY_WEIGHTS = {
     SignalCategory.VOLATILITY: 0.75,
     SignalCategory.VOLUME: 1.0,
     SignalCategory.PRICE_ACTION: 1.5,
+    SignalCategory.CANDLESTICK: 1.0,
 }
 
 DEFAULT_LONG_TERM_CATEGORY_WEIGHTS = {
@@ -31,6 +32,7 @@ DEFAULT_LONG_TERM_CATEGORY_WEIGHTS = {
     SignalCategory.VOLATILITY: 0.75,
     SignalCategory.VOLUME: 1.25,
     SignalCategory.PRICE_ACTION: 1.5,
+    SignalCategory.CANDLESTICK: 0.4,
 }
 
 DEFAULT_LONG_TERM_SOURCE_RELEVANCE = {
@@ -39,6 +41,7 @@ DEFAULT_LONG_TERM_SOURCE_RELEVANCE = {
     "momentum_signals.stochastic_zone_crossover": 0.5,
     "price_action_signals.fair_value_gap_context": 0.35,
     "volatility_signals.bollinger_price_and_bandwidth": 0.6,
+    "candlestick_signals.candlestick_pattern": 0.3,
 }
 
 STRENGTH_VALUES = {

@@ -158,13 +158,21 @@ class SwingTradingSignalProfileTests(unittest.TestCase):
                 SignalCategory.PRICE_ACTION,
                 SignalDirection.NEUTRAL,
             ),
+            self.evidence(
+                "candlestick",
+                SignalCategory.CANDLESTICK,
+                SignalDirection.NEUTRAL,
+            ),
         ]
 
         profile = build_swing_trading_signal_profile(
             self.snapshot(evidence)
         )
 
-        expected_coverage = (1.25 + 1.0 + 1.5) / 5.5 * 100
+        total_weight = sum(DEFAULT_SWING_CATEGORY_WEIGHTS.values())
+        expected_coverage = (
+            (1.25 + 1.0 + 1.5 + 1.0) / total_weight * 100
+        )
         self.assertAlmostEqual(
             profile.coverage_percentage,
             expected_coverage,
@@ -175,23 +183,31 @@ class SwingTradingSignalProfileTests(unittest.TestCase):
         )
 
     def test_strong_threshold_boundary_is_inclusive(self):
+        # A 3:2 weight ratio on the directional half of the categories
+        # puts exactly 60% of covered weight behind the bullish side,
+        # regardless of how many categories SignalCategory defines.
         categories = list(SignalCategory)
+        midpoint = len(categories) // 2
         evidence = [
             self.evidence(
                 category.value,
                 category,
                 (
                     SignalDirection.BULLISH
-                    if index < 3
+                    if index < midpoint
                     else SignalDirection.NEUTRAL
                 ),
             )
             for index, category in enumerate(categories)
         ]
+        weights = {
+            category: (3.0 if index < midpoint else 2.0)
+            for index, category in enumerate(categories)
+        }
 
         profile = build_swing_trading_signal_profile(
             self.snapshot(evidence),
-            category_weights={category: 1.0 for category in categories},
+            category_weights=weights,
         )
 
         self.assertAlmostEqual(profile.score, 60.0)
@@ -201,14 +217,17 @@ class SwingTradingSignalProfileTests(unittest.TestCase):
         )
 
     def test_directional_threshold_boundaries_are_inclusive(self):
+        # Same 3:2 weighting scheme puts 60% of covered weight behind
+        # the bullish half, which nets to a score of +/-20.
         categories = list(SignalCategory)
+        midpoint = len(categories) // 2
         bullish = [
             self.evidence(
                 category.value,
                 category,
                 (
                     SignalDirection.BULLISH
-                    if index < 3
+                    if index < midpoint
                     else SignalDirection.BEARISH
                 ),
             )
@@ -226,18 +245,18 @@ class SwingTradingSignalProfileTests(unittest.TestCase):
             )
             for item in bullish
         ]
-        equal_weights = {
-            category: 1.0
-            for category in categories
+        weights = {
+            category: (3.0 if index < midpoint else 2.0)
+            for index, category in enumerate(categories)
         }
 
         bullish_profile = build_swing_trading_signal_profile(
             self.snapshot(bullish),
-            category_weights=equal_weights,
+            category_weights=weights,
         )
         bearish_profile = build_swing_trading_signal_profile(
             self.snapshot(bearish),
-            category_weights=equal_weights,
+            category_weights=weights,
         )
 
         self.assertAlmostEqual(bullish_profile.score, 20.0)
