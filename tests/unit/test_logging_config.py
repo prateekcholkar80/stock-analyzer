@@ -109,6 +109,17 @@ class JsonLogFormatterTests(unittest.TestCase):
             payload["message"],
         )
 
+    def test_redacts_provider_specific_api_key_names(self):
+        payload = self.format_record(
+            "Provider failed OPENAI_API_KEY=provider-secret",
+            ANTHROPIC_API_KEY="another-provider-secret",
+        )
+
+        rendered = json.dumps(payload)
+        self.assertNotIn("provider-secret", rendered)
+        self.assertNotIn("another-provider-secret", rendered)
+        self.assertIn(REDACTED_VALUE, rendered)
+
 
 class LoggingConfigurationTests(unittest.TestCase):
     def setUp(self):

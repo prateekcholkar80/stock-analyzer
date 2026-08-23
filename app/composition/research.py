@@ -1,9 +1,10 @@
 from threading import RLock
 
+from app.audit.prompt_audit import PromptAuditSink
 from app.commands.swing_analysis import JarvisSwingAnalysisCommandHandler
 from app.composition.debate import (
     PreflightBuilder,
-    compose_end_to_end_swing_analysis,
+    compose_end_to_end_multi_timeframe_swing_analysis,
 )
 from app.facades.swing_research import JarvisSwingResearchFacade
 from app.gateways.instruments import InstrumentResolver
@@ -27,8 +28,11 @@ from app.use_cases.pull_rolling_market_series import PullRollingMarketSeries
 from app.use_cases.resolve_swing_analysis_request import (
     ResolveSwingAnalysisRequest,
 )
-from app.use_cases.run_end_to_end_swing_analysis import (
-    RunEndToEndSwingAnalysis,
+from app.use_cases.run_end_to_end_multi_timeframe_swing_analysis import (
+    RunEndToEndMultiTimeframeSwingAnalysis,
+)
+from app.use_cases.ask_jarvis_judge_follow_up import (
+    AskJarvisJudgeFollowUp,
 )
 from app.workflow.events import WorkflowEventSink
 
@@ -46,6 +50,7 @@ class _LazySwingAnalysisExecutorFactory:
         orchestrator_config: DebateOrchestratorConfig | None,
         gateway_builder: GatewayBuilder | None,
         preflight_builder: PreflightBuilder,
+        prompt_audit_sink: PromptAuditSink | None,
     ) -> None:
         self._rolling_fetch = rolling_fetch
         self._settings = settings
@@ -54,22 +59,48 @@ class _LazySwingAnalysisExecutorFactory:
         self._orchestrator_config = orchestrator_config
         self._gateway_builder = gateway_builder
         self._preflight_builder = preflight_builder
-        self._executor: RunEndToEndSwingAnalysis | None = None
+        self._prompt_audit_sink = prompt_audit_sink
+        self._executor: RunEndToEndMultiTimeframeSwingAnalysis | None = None
         self._lock = RLock()
 
-    def __call__(self) -> RunEndToEndSwingAnalysis:
+    def __call__(self) -> RunEndToEndMultiTimeframeSwingAnalysis:
         with self._lock:
             if self._executor is None:
-                self._executor = compose_end_to_end_swing_analysis(
-                    self._rolling_fetch,
-                    settings=self._settings,
-                    archive=self._archive,
-                    agent_orchestrator=self._agent_orchestrator,
-                    orchestrator_config=self._orchestrator_config,
-                    gateway_builder=self._gateway_builder,
-                    preflight_builder=self._preflight_builder,
+                self._executor = (
+                    compose_end_to_end_multi_timeframe_swing_analysis(
+                        self._rolling_fetch,
+                        settings=self._settings,
+                        archive=self._archive,
+                        agent_orchestrator=self._agent_orchestrator,
+                        orchestrator_config=self._orchestrator_config,
+                        gateway_builder=self._gateway_builder,
+                        preflight_builder=self._preflight_builder,
+                        prompt_audit_sink=self._prompt_audit_sink,
+                    )
                 )
             return self._executor
+
+
+class _LazyJarvisJudgeFollowUp:
+    """Reuse the exact debate panel created for the initial analysis."""
+
+    def __init__(self, executor_factory: _LazySwingAnalysisExecutorFactory):
+        self._executor_factory = executor_factory
+
+    def execute(
+        self,
+        question,
+        *,
+        technical_review,
+        debate_result,
+    ):
+        executor = self._executor_factory()
+        relay = AskJarvisJudgeFollowUp(executor.debate_orchestrator)
+        return relay.execute(
+            question,
+            technical_review=technical_review,
+            debate_result=debate_result,
+        )
 
 
 def compose_jarvis_swing_research(
@@ -85,6 +116,7 @@ def compose_jarvis_swing_research(
     gateway_builder: GatewayBuilder | None = None,
     preflight_builder: PreflightBuilder = LLMPreflightValidator,
     event_sink: WorkflowEventSink | None = None,
+    prompt_audit_sink: PromptAuditSink | None = None,
 ) -> JarvisSwingResearchFacade:
     """Compose natural-language-to-debate research without eager LLM I/O."""
     if instrument_resolver is not None and instrument_config is not None:
@@ -116,10 +148,14 @@ def compose_jarvis_swing_research(
         orchestrator_config=orchestrator_config,
         gateway_builder=gateway_builder,
         preflight_builder=preflight_builder,
+        prompt_audit_sink=prompt_audit_sink,
     )
     command_handler = JarvisSwingAnalysisCommandHandler(executor_factory)
     return JarvisSwingResearchFacade(
         request_resolver,
         command_handler,
         event_sink,
+        judge_follow_up_executor=(
+            _LazyJarvisJudgeFollowUp(executor_factory)
+        ),
     )

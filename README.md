@@ -1,83 +1,180 @@
 # Jarvis AI Investment Research Assistant
 
-Jarvis is an agentic financial-intelligence platform designed to produce
-explainable, evidence-grounded investment research.
+Jarvis is an agentic financial-intelligence platform for explainable,
+evidence-grounded equity research. It combines validated market data,
+deterministic technical analysis, look-ahead-safe backtesting, database-neutral
+storage, a provider-neutral Bull/Bear/Judge LLM debate, and a wake-activated
+conversation layer.
 
-The long-term platform combines market data, quantitative analysis,
-retrieval-augmented generation, specialized AI agents, and voice interaction.
-It is an investment research assistant—not a stock-price prediction script.
+Jarvis is an investment-research assistant, not a price-prediction script. A
+result is released only when its evidence and execution lineage satisfy the
+domain contracts. If the mandatory LLM debate cannot run, Jarvis returns a
+safe failure instead of silently substituting a deterministic recommendation.
 
-## Project status
+## Current status
 
-Phase 1 implementation is complete. Documentation and final acceptance checks
-are in progress.
+The market-data, Phase 2 technical-analysis/backtesting, storage, full debate,
+natural-language routing, and conversation-foundation layers are implemented.
+
+Automated baseline: **1,295 passing tests** (unit and integration), executed
+offline without live credentials.
 
 Implemented:
 
-- Validated environment configuration with protected secrets
-- Angel One SmartAPI integration through an injectable gateway
-- Typed market quotes and historical candle series
-- Market-data normalization and validation
-- Application-specific exception hierarchy
-- Lazy market-service construction
-- Structured JSON logging with secret redaction
-- Cross-layer operation/correlation IDs
-- Offline unit and integration tests
-- Logging-enabled example entry points
+- Angel One SmartAPI behind an injectable market-data gateway
+- Validated quotes, OHLCV candles, historical series, and IST-aware workflow
+  events
+- Resumable, chunked historical pulls and local daily/weekly aggregation
+- Parallel daily and weekly technical agents with a Judge-controlled evidence
+  release gate
+- TA-Lib indicators plus deterministic price-action analysis
+- SMA, EMA, RSI, MACD, Bollinger Bands, ATR, ADX, Stochastic, and OBV
+- Swing pivots, HH/HL/LH/LL structure, BOS, CHOCH, fair value gaps, and
+  support/resistance lifecycle evidence
+- Unified weighted swing evaluation and structurally validated trade planning
+- Directional swing backtesting with next-eligible-open execution and
+  configurable 1:2 through 1:3 reward/risk targets
+- Walk-forward replay, transaction costs, equity/drawdown curves, performance
+  metrics, and point-in-time evidence capture
+- Database-neutral repository protocols with in-memory and DuckDB adapters
+- Immutable, fingerprinted storage plus normalized dashboard-oriented tables
+- Provider-neutral structured LLM gateway and role-based model configuration
+- Mandatory Bull/Bear/Judge debate with citation and chain-of-custody checks
+- Bull/Bear prompts grounded in separately qualified `daily:` and `weekly:`
+  evidence, including explicit timeframe agreement or conflict
+- Conservative natural-language swing-intent recognition
+- Cached Angel instrument-master resolution by company name or symbol
+- Text and voice-transcript activation using the same configurable wake phrase
+- Retained approved analysis context for grounded follow-up questions routed
+  back to the same Judge abstraction
+- Typed conversation and workflow events suitable for a future dynamic UI
+- Opt-in, redacted JSONL review trail for Jarvis and LLM agent exchanges
+- Structured JSON logging, correlation IDs, and secret-safe failures
 
-Automated baseline: **69 passing tests**.
+Intentionally not implemented yet:
 
-Not implemented yet:
+- Microphone capture, speech-to-text, text-to-speech, or always-listening audio
+- HTTP/WebSocket API and the 3D Jarvis dashboard
+- Financial-statement and earnings-call document ingestion/RAG
+- Fundamental-analysis agent and document-grounded financial conclusions
+- News discovery, sentiment, and macro-analysis agents
+- Portfolio construction or live order placement
 
-- Technical-indicator engine
-- Historical signal analysis
-- Backtesting
-- Portfolio and risk analysis
-- RAG and document processing
-- News discovery and sentiment
-- Multi-agent orchestration
-- API, dashboard, and voice interface
+News and document processing remain parked while the market-analysis and
+interaction foundations are completed.
 
-News discovery and document processing are intentionally parked while
-quantitative market analysis is developed.
-
-## Current architecture
+## End-to-end flow
 
 ```text
-MarketAgent
-    |
-    v
-market_tools
-    |
-    v
-MarketDataService
-    |
-    v
-MarketDataGateway protocol
-    |
-    v
-AngelOneClient
-    |
-    v
-Angel One SmartAPI
+Typed input -----------------------------+
+                                         |
+Voice -> speech-to-text transcript ------+-> Wake detector
+                                                |
+                                                v
+                                      Conversation session
+                                     dormant -> listening
+                                                |
+                                                v
+                                  Pattern swing-intent interpreter
+                                                |
+                                                v
+                                   Angel instrument-master resolver
+                                                |
+                                                v
+                              Resolved SwingAnalysisCommand + operation ID
+                                                |
+                                                v
+                               Resumable historical market-data pull
+                                                |
+                                                v
+                      Hourly -> daily + weekly candle aggregation
+                                      |              |
+                                      v              v
+                              Daily agent      Weekly agent
+                                      \              /
+                                       v            v
+                                  Judge evidence release gate
+                                                |
+                                                v
+                       Bull <-> Bear (both timeframes) -> same Judge verdict
+                                                |
+                                                v
+                         Long-only deterministic 1:2 trade policy
+                                                |
+                                                v
+                 CEO briefing + retained Judge follow-up context
 ```
 
-The market service converts external dictionaries into validated domain models:
+The Bull, Bear, and Judge depend only on `StructuredLLMGateway`; they do not
+know which model provider is active. The composition layer selects and
+preflights the configured gateways.
 
-- `MarketQuote`
-- `Candle`
-- `HistoricalCandleSeries`
+## Wake activation
 
-Structured logs emitted by the service and gateway share an operation ID,
-allowing one request to be traced across layers.
+Both text and voice transcripts use the same anchored, case-insensitive wake
+detector. The default phrase is `Hey Jarvis`.
+
+```python
+turn = session.handle_text(
+    "Hey Jarvis, how is Reliance looking for a swing trade?"
+)
+
+turn = session.handle_voice_transcript(
+    "Hey Jarvis, analyze TCS for a swing trade"
+)
+```
+
+A wake-only message moves the session from dormant to listening and returns:
+
+```text
+Hello <configured name>. How can I help you today?
+```
+
+While listening, the next typed message or voice transcript can contain the
+request without repeating the wake phrase. Text without the wake phrase is
+ignored while dormant. A combined wake phrase and command executes immediately.
+
+After a completed multi-timeframe analysis, Jarvis retains only the approved
+technical-review and debate chain. A later activated question such as
+`Hey Jarvis, where is weekly support?` is routed to the same configured Judge
+through a provider-neutral abstraction. The Judge may cite only the retained
+daily/weekly evidence. A new company-analysis request runs the complete workflow
+again and replaces the retained context.
+
+The voice method receives an already-transcribed string. Audio capture and
+speech adapters are deliberately outside the current domain layer.
+
+## Conversation and workflow states
+
+Conversation states exposed to UI clients:
+
+```text
+dormant -> greeting -> listening -> processing -> responding -> dormant
+                                      |
+                                      +-> failed -> dormant
+                                      +-> listening (clarification required)
+```
+
+Research workflow events separately expose:
+
+```text
+request received -> instrument resolved -> market data loading
+-> technical analysis -> Bull debating -> Bear debating
+-> Judge reviewing -> completed/failed
+```
+
+Events are typed, ordered per session/operation, timestamped in IST, and contain
+fixed secret-safe messages. Event-sink failures are logged but do not terminate
+the research operation.
 
 ## Requirements
 
 - Python 3.11 or newer
-- Angel One SmartAPI credentials for live examples
-- Network access only for live Angel One operations
+- Angel One credentials for live authentication and market-data operations
+- An LLM model/provider credential for the mandatory full debate
+- Network access for live Angel One and remote LLM operations
 
-The automated test suite runs entirely offline.
+The automated suite uses injected fakes and runs offline.
 
 ## Setup
 
@@ -94,115 +191,164 @@ Install dependencies:
 python -m pip install -r requirements.txt
 ```
 
-For reproducible pinned versions:
+For pinned versions:
 
 ```bash
 python -m pip install -r requirements-lock.txt
 ```
 
-Create the local environment file:
+Create local configuration:
 
 ```bash
 cp .env.example .env
 ```
 
-Configure these values in `.env`:
+Core settings:
 
 ```dotenv
 ANGEL_API_KEY="your_api_key"
 ANGEL_CLIENT_CODE="your_client_code"
 ANGEL_PIN="your_pin"
 ANGEL_TOTP_SECRET="your_totp_secret"
+
+JARVIS_USER_NAME="Prateek"
+JARVIS_WAKE_PHRASE="Hey Jarvis"
+
+JARVIS_LLM_MODEL="provider/model"
+JARVIS_PERSONA_LLM_MODEL=""
+JARVIS_JUDGE_LLM_MAX_TOKENS="1500"
+JARVIS_PERSONA_LLM_MAX_TOKENS="5000"
 ```
 
-Never commit `.env`. It is excluded through `.gitignore`.
+`JARVIS_BULL_LLM_MODEL`, `JARVIS_BEAR_LLM_MODEL`,
+`JARVIS_JUDGE_LLM_MODEL`, and `JARVIS_PERSONA_LLM_MODEL` optionally override
+the shared model. A blank persona override inherits the Judge override and then
+the shared model. Provider credentials remain provider-specific environment
+variables and are never stored in Jarvis domain settings.
 
-## Run the automated tests
+The Angel instrument-master URL, cache path, TTL, payload limit, timeout, and
+exchange list are configurable. `.env.example` documents the common overrides;
+the validated configuration model defines all defaults.
 
-Run the complete offline suite:
+Never commit `.env`, downloaded instrument-master data, logs, provider
+credentials, or generated DuckDB files.
+
+## Running tests
+
+Full offline suite:
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Run only unit tests:
+Conversation and wake-word tests:
 
 ```bash
-.venv/bin/python -m unittest discover -s tests/unit -v
+.venv/bin/python -m unittest tests.unit.test_jarvis_conversation -v
 ```
 
-Run the cross-layer integration test:
+Workflow event tests:
 
 ```bash
-.venv/bin/python -m unittest \
-  tests.integration.test_market_operation_logging -v
+.venv/bin/python -m unittest tests.unit.test_workflow_events -v
 ```
 
-Automated tests replace the Angel One SDK with fake implementations and do not
-make network requests.
+Live login and market-data operations are separate manual integration checks;
+they are not part of the offline regression suite.
 
-## Run examples
+## Storage
 
-Examples are executable modules:
+Application code depends on repository protocols, not DuckDB directly. The
+current adapters are:
 
-```bash
-.venv/bin/python -m examples.candle_conversion
-.venv/bin/python -m examples.angel_login
-.venv/bin/python -m examples.market_quote
-.venv/bin/python -m examples.historical_data
-.venv/bin/python -m examples.market_agent
+- `InMemoryJarvisStorage` for tests and transient workflows
+- `DuckDBJarvisStorage` for local analytical persistence
+
+DuckDB schema version 3 stores market datasets, normalized candles, strategy
+configuration and weights, backtest evaluations/trades/equity/performance, and
+debate transcripts/verdicts with signal signatures for precedent retrieval.
+Generated databases are local artifacts and must not be committed.
+
+See [docs/backtest-storage-schema.md](docs/backtest-storage-schema.md) for the
+schema and example dashboard queries.
+
+## Logging and safety
+
+Structured logs may contain event names, operation IDs, exchange/symbol
+identifiers, request duration, counts, failure classification, and state names.
+They must not contain credentials, authorization headers, tokens, raw vendor
+responses, raw exception messages, prompts containing secrets, or model
+credentials.
+
+Known LLM failures are classified into configuration, authentication, provider
+availability, rate limit, invalid response, and unknown failure envelopes.
+Those envelopes provide separate display and spoken copy and explicitly state
+that no investment conclusion was produced.
+
+### Prompt and conversation review log
+
+An opt-in development audit trail can record the full sanitized Jarvis
+conversation and every agent-level Jarvis/Bull/Bear/Judge exchange:
+
+```dotenv
+JARVIS_PROMPT_AUDIT_ENABLED="true"
+JARVIS_PROMPT_AUDIT_PATH="logs/jarvis-prompt-audit.jsonl"
 ```
 
-Except for candle conversion, these examples may authenticate with or request
-data from Angel One.
+Each JSONL record identifies the IST timestamp, event type, actor, session ID,
+operation ID, and payload. LLM request records contain the exact system prompt,
+dynamic messages, response-model name, and JSON schema. Successful response
+records contain provider/model metadata, attempt count, and the validated
+structured output. Grounding retries are separate records, making prompt
+improvements reviewable round by round.
 
-## Logging and secret safety
+Wake, greeting, clarification, and safe failure copy remain deterministic.
+After a successful debate, the provider-neutral Jarvis presentation agent uses
+the approved Chief Investment Research Assistant persona to produce a concise
+CEO briefing plus detailed technical, Bull, Bear, and Judge explanations. Its
+exact system prompt, evidence context, correction retries, and validated
+structured response are logged with actor `jarvis` when auditing is enabled.
+Structural validation rejects a briefing that changes the symbol, interval,
+technical stance/score, verdict, confidence, decisive evidence, argument IDs,
+or any technical evidence metadata. Multi-timeframe briefings also attach an
+application-owned long-only trade block. A bullish Judge plus bullish daily
+profile may produce a daily-structure/ATR stop and exact 2R/3R targets; a
+non-bullish verdict, non-bullish daily profile, blocked 2R target, or missing
+stop evidence produces `NO TRADE`. The LLM cannot change those values. The
+validated raw result remains available if the presentation provider fails.
 
-Executable entry points configure structured JSON logging.
+The audit is disabled by default because it intentionally contains full user
+text, technical evidence supplied to agents, debate context, and model output.
+Recognized credentials and bearer tokens are redacted, the file is created with
+owner-only permissions, and `logs/` is git-ignored. This is diagnostic evidence,
+not a substitute for access control, retention, rotation, or secure deletion.
 
-Logs can contain:
+## Documentation
 
-- Event names
-- Operation IDs
-- Exchange and instrument identifiers
-- Request duration
-- Candle counts
-- Exception types
+- [Current implementation baseline](docs/current-baseline.md)
+- [Continuation handoff and exact next steps](docs/continuation-handoff.md)
+- [Backtest and research storage schema](docs/backtest-storage-schema.md)
+- [Executable examples](examples/README.md)
 
-Logs must not contain:
+## Next implementation areas
 
-- API keys
-- Client codes
-- PINs
-- TOTP secrets
-- Authorization headers
-- Access, refresh, feed, or JWT tokens
-- Raw vendor responses
-- Vendor exception messages
-
-Sensitive values are redacted as `[REDACTED]`.
-
-Expected application failures at executable entry points exit with status 1
-without rendering chained vendor tracebacks.
-
-## Next phase
-
-Phase 2 focuses on quantitative technical analysis:
-
-1. Indicator contracts and typed results
-2. SMA and EMA
-3. RSI
-4. MACD
-5. Bollinger Bands
-6. ATR and volatility
-7. Volume-based indicators
-8. Trend and support/resistance structure
-9. Swing-trading signal profiles
-10. Long-term technical profiles
-11. Historical analysis
-12. Backtesting
+1. Persist the complete multi-timeframe result through new database-neutral
+   repository ports and normalized DuckDB tables.
+2. Add dashboard read models for daily/weekly charts, evidence, debate, and the
+   long-only plan/no-trade outcome.
+3. Add a transport-neutral application API around the conversation session.
+4. Stream conversation and research workflow events over WebSocket/SSE.
+5. Add speech-to-text and text-to-speech adapters without coupling the domain
+   session to an audio vendor.
+6. Build the interactive Jarvis dashboard against the typed event and result
+   contracts.
+7. Add user-supplied document ingestion, citation-preserving RAG, and a
+   financial-analysis agent.
+8. Combine strictly document-grounded fundamentals with existing technical and
+   price-action evidence before expanding the Judge's final report.
 
 ## Disclaimer
 
 This project is for research and educational use. Its output is not investment
-advice and should not be treated as a guarantee of future market performance.
+advice, does not guarantee future performance, and must not be treated as an
+instruction to place a trade.

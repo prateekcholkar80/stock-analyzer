@@ -1,12 +1,15 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from app.audit.prompt_audit import NullPromptAuditSink, PromptAuditSink
 from app.agents.bear_agent import BearDebateAgent
 from app.agents.bull_agent import BullDebateAgent
 from app.agents.debate_judge_agent import DebateJudgeAgent
 from app.exceptions import LLMConfigurationError
 from app.llm.config import LLMRole, LLMSettings, get_llm_settings
+from app.llm.audited_gateway import PromptAuditedLLMGateway
 from app.llm.factory import GatewayBuilder, LLMGatewayFactory
+from app.llm.gateway import StructuredLLMGateway
 from app.llm.preflight import LLMPreflightValidator
 from app.models.llm import LLMPreflightResult
 from app.orchestration.agent_orchestrator import AgentOrchestrator
@@ -18,6 +21,9 @@ from app.orchestration.debate_orchestrator import (
 from app.use_cases.pull_rolling_market_series import PullRollingMarketSeries
 from app.use_cases.run_end_to_end_swing_analysis import (
     RunEndToEndSwingAnalysis,
+)
+from app.use_cases.run_end_to_end_multi_timeframe_swing_analysis import (
+    RunEndToEndMultiTimeframeSwingAnalysis,
 )
 
 
@@ -41,6 +47,7 @@ def compose_full_debate(
     orchestrator_config: DebateOrchestratorConfig | None = None,
     gateway_builder: GatewayBuilder | None = None,
     preflight_builder: PreflightBuilder = LLMPreflightValidator,
+    prompt_audit_sink: PromptAuditSink | None = None,
 ) -> FullDebateComposition:
     """Build the complete provider-neutral panel after local preflight."""
     resolved_settings = settings or get_llm_settings()
@@ -89,13 +96,25 @@ def compose_full_debate(
         )
 
     bull_agent = BullDebateAgent(
-        gateway_factory.for_role(LLMRole.BULL)
+        _gateway_for_agent(
+            gateway_factory,
+            LLMRole.BULL,
+            prompt_audit_sink,
+        )
     )
     bear_agent = BearDebateAgent(
-        gateway_factory.for_role(LLMRole.BEAR)
+        _gateway_for_agent(
+            gateway_factory,
+            LLMRole.BEAR,
+            prompt_audit_sink,
+        )
     )
     judge_agent = DebateJudgeAgent(
-        gateway_factory.for_role(LLMRole.JUDGE)
+        _gateway_for_agent(
+            gateway_factory,
+            LLMRole.JUDGE,
+            prompt_audit_sink,
+        )
     )
     orchestrator = DebateOrchestrator(
         bull_agent=bull_agent,
@@ -121,6 +140,7 @@ def compose_end_to_end_swing_analysis(
     orchestrator_config: DebateOrchestratorConfig | None = None,
     gateway_builder: GatewayBuilder | None = None,
     preflight_builder: PreflightBuilder = LLMPreflightValidator,
+    prompt_audit_sink: PromptAuditSink | None = None,
 ) -> RunEndToEndSwingAnalysis:
     """Compose a market-to-debate use case only after LLM readiness."""
     debate = compose_full_debate(
@@ -129,6 +149,7 @@ def compose_end_to_end_swing_analysis(
         orchestrator_config=orchestrator_config,
         gateway_builder=gateway_builder,
         preflight_builder=preflight_builder,
+        prompt_audit_sink=prompt_audit_sink,
     )
     return RunEndToEndSwingAnalysis(
         rolling_fetch,
@@ -136,3 +157,42 @@ def compose_end_to_end_swing_analysis(
         debate_orchestrator=debate.orchestrator,
         llm_preflight=debate.preflight_result,
     )
+
+
+def compose_end_to_end_multi_timeframe_swing_analysis(
+    rolling_fetch: PullRollingMarketSeries,
+    *,
+    settings: LLMSettings | None = None,
+    archive: DebateArchive | None = None,
+    agent_orchestrator: AgentOrchestrator | None = None,
+    orchestrator_config: DebateOrchestratorConfig | None = None,
+    gateway_builder: GatewayBuilder | None = None,
+    preflight_builder: PreflightBuilder = LLMPreflightValidator,
+    prompt_audit_sink: PromptAuditSink | None = None,
+) -> RunEndToEndMultiTimeframeSwingAnalysis:
+    """Compose the hourly -> daily/weekly -> debate conversation path."""
+    debate = compose_full_debate(
+        settings=settings,
+        archive=archive,
+        orchestrator_config=orchestrator_config,
+        gateway_builder=gateway_builder,
+        preflight_builder=preflight_builder,
+        prompt_audit_sink=prompt_audit_sink,
+    )
+    return RunEndToEndMultiTimeframeSwingAnalysis(
+        rolling_fetch,
+        agent_orchestrator=agent_orchestrator,
+        debate_orchestrator=debate.orchestrator,
+        llm_preflight=debate.preflight_result,
+    )
+
+
+def _gateway_for_agent(
+    factory: LLMGatewayFactory,
+    role: LLMRole,
+    sink: PromptAuditSink | None,
+) -> StructuredLLMGateway:
+    gateway = factory.for_role(role)
+    if sink is None or isinstance(sink, NullPromptAuditSink):
+        return gateway
+    return PromptAuditedLLMGateway(gateway, role, sink)

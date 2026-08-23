@@ -265,7 +265,8 @@ class JarvisSwingResearchCompositionTests(unittest.TestCase):
         executor = RecordingExecutor()
 
         with patch(
-            "app.composition.research.compose_end_to_end_swing_analysis",
+            "app.composition.research."
+            "compose_end_to_end_multi_timeframe_swing_analysis",
             return_value=executor,
         ) as compose_executor:
             facade = compose_jarvis_swing_research(

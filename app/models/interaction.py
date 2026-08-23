@@ -4,8 +4,13 @@ from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
+from app.models.debate import AgenticDebateResult
 from app.models.llm import JarvisLLMFailureResponse
-from app.models.storage import EndToEndSwingAnalysisResult
+from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
+from app.models.storage import (
+    EndToEndSwingAnalysisResult,
+    MultiTimeframeEndToEndSwingAnalysisResult,
+)
 from app.models.technical import TechnicalModel
 
 
@@ -79,8 +84,14 @@ class JarvisSwingAnalysisResponse(TechnicalModel):
     )
     operation_id: str = Field(min_length=1)
     status: JarvisCommandStatus
-    result: EndToEndSwingAnalysisResult | None = None
+    result: (
+        EndToEndSwingAnalysisResult
+        | MultiTimeframeEndToEndSwingAnalysisResult
+        | None
+    ) = None
     failure: JarvisLLMFailureResponse | None = None
+    multi_timeframe_review: MultiTimeframeEvidenceReview | None = None
+    multi_timeframe_debate: AgenticDebateResult | None = None
 
     @field_validator("operation_id")
     @classmethod
@@ -92,12 +103,42 @@ class JarvisSwingAnalysisResponse(TechnicalModel):
 
     @model_validator(mode="after")
     def require_exclusive_payload(self) -> Self:
+        has_review = self.multi_timeframe_review is not None
+        has_debate = self.multi_timeframe_debate is not None
+        if has_review != has_debate:
+            raise ValueError(
+                "Jarvis multi-timeframe conversation context requires both "
+                "technical review and debate"
+            )
+        if has_review and has_debate:
+            package = self.multi_timeframe_review.released_evidence
+            debate = self.multi_timeframe_debate
+            if package is None or not debate.decision.accepted:
+                raise ValueError(
+                    "Jarvis conversation can retain only approved "
+                    "multi-timeframe context"
+                )
+            if (
+                debate.submission.technical_submission_id
+                != package.package_fingerprint
+                or debate.submission.technical_decision_id
+                != self.multi_timeframe_review.decision.decision_id
+            ):
+                raise ValueError(
+                    "Jarvis conversation context must reference one "
+                    "technical review chain"
+                )
         if self.status is JarvisCommandStatus.COMPLETED:
             if self.result is None or self.failure is not None:
                 raise ValueError(
                     "completed Jarvis response requires only a result"
                 )
-        elif self.result is not None or self.failure is None:
+        elif (
+            self.result is not None
+            or self.failure is None
+            or has_review
+            or has_debate
+        ):
             raise ValueError(
                 "failed Jarvis response requires only an LLM failure"
             )
@@ -116,12 +157,19 @@ class JarvisSwingAnalysisResponse(TechnicalModel):
         cls,
         *,
         operation_id: str,
-        result: EndToEndSwingAnalysisResult,
+        result: (
+            EndToEndSwingAnalysisResult
+            | MultiTimeframeEndToEndSwingAnalysisResult
+        ),
+        multi_timeframe_review: MultiTimeframeEvidenceReview | None = None,
+        multi_timeframe_debate: AgenticDebateResult | None = None,
     ) -> "JarvisSwingAnalysisResponse":
         return cls(
             operation_id=operation_id,
             status=JarvisCommandStatus.COMPLETED,
             result=result,
+            multi_timeframe_review=multi_timeframe_review,
+            multi_timeframe_debate=multi_timeframe_debate,
         )
 
     @classmethod

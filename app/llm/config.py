@@ -20,6 +20,14 @@ class LLMRole(StrEnum):
     BULL = "bull"
     BEAR = "bear"
     JUDGE = "judge"
+    JARVIS = "jarvis"
+
+
+DEBATE_LLM_ROLES = (
+    LLMRole.BULL,
+    LLMRole.BEAR,
+    LLMRole.JUDGE,
+)
 
 
 class LLMRoleSettings(TechnicalModel):
@@ -76,6 +84,10 @@ class LLMSettings(BaseModel):
         default=None,
         alias="JARVIS_JUDGE_LLM_MODEL",
     )
+    jarvis_model: str | None = Field(
+        default=None,
+        alias="JARVIS_PERSONA_LLM_MODEL",
+    )
 
     bull_temperature: float = Field(
         default=0.4,
@@ -95,6 +107,12 @@ class LLMSettings(BaseModel):
         le=2,
         alias="JARVIS_JUDGE_LLM_TEMPERATURE",
     )
+    jarvis_temperature: float = Field(
+        default=0.2,
+        ge=0,
+        le=2,
+        alias="JARVIS_PERSONA_LLM_TEMPERATURE",
+    )
 
     bull_max_tokens: int = Field(
         default=800,
@@ -111,12 +129,18 @@ class LLMSettings(BaseModel):
         gt=0,
         alias="JARVIS_JUDGE_LLM_MAX_TOKENS",
     )
+    jarvis_max_tokens: int = Field(
+        default=5_000,
+        gt=0,
+        alias="JARVIS_PERSONA_LLM_MAX_TOKENS",
+    )
 
     @field_validator(
         "shared_model",
         "bull_model",
         "bear_model",
         "judge_model",
+        "jarvis_model",
         mode="before",
     )
     @classmethod
@@ -132,7 +156,7 @@ class LLMSettings(BaseModel):
     def require_model_for_every_role(self) -> "LLMSettings":
         missing = [
             role.value
-            for role in LLMRole
+            for role in DEBATE_LLM_ROLES
             if self._model_for(role) is None
         ]
         if missing:
@@ -147,6 +171,7 @@ class LLMSettings(BaseModel):
             LLMRole.BULL: self.bull_model,
             LLMRole.BEAR: self.bear_model,
             LLMRole.JUDGE: self.judge_model,
+            LLMRole.JARVIS: self.jarvis_model or self.judge_model,
         }[role]
         return override or self.shared_model
 
@@ -162,11 +187,13 @@ class LLMSettings(BaseModel):
             LLMRole.BULL: self.bull_temperature,
             LLMRole.BEAR: self.bear_temperature,
             LLMRole.JUDGE: self.judge_temperature,
+            LLMRole.JARVIS: self.jarvis_temperature,
         }[role]
         max_tokens = {
             LLMRole.BULL: self.bull_max_tokens,
             LLMRole.BEAR: self.bear_max_tokens,
             LLMRole.JUDGE: self.judge_max_tokens,
+            LLMRole.JARVIS: self.jarvis_max_tokens,
         }[role]
         return LLMRoleSettings(
             role=role,

@@ -15,6 +15,13 @@ class DebateSide(StrEnum):
     BEAR = "bear"
 
 
+class TimeframeRelationship(StrEnum):
+    ALIGNED = "aligned"
+    CONFLICTED = "conflicted"
+    MIXED = "mixed"
+    INSUFFICIENT = "insufficient"
+
+
 class DebateTerminationReason(StrEnum):
     MAX_ROUNDS_REACHED = "max_rounds_reached"
     STALL_DETECTED = "stall_detected"
@@ -30,6 +37,7 @@ class BullBearArgument(TechnicalModel):
     rebuts_argument_id: str | None = None
     model_id: str = Field(min_length=1)
     generated_at: datetime
+    timeframe_relationship: TimeframeRelationship | None = None
 
     @field_validator("argument_id", "thesis", "model_id")
     @classmethod
@@ -298,3 +306,55 @@ class AgenticDebateResult(TechnicalModel):
         if not self.decision.accepted:
             return None
         return self.submission.verdict
+
+
+class JudgeFollowUpAnswer(TechnicalModel):
+    """Evidence-grounded answer from the same substantive debate Judge."""
+
+    question: str = Field(min_length=1, max_length=2_000)
+    answer: str = Field(min_length=1)
+    evidence_citations: tuple[str, ...] = Field(min_length=1)
+    technical_package_fingerprint: str = Field(
+        pattern=r"^[a-f0-9]{64}$"
+    )
+    debate_verdict_id: str | None = Field(default=None, min_length=1)
+    judge_agent_id: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
+    generated_at: datetime
+
+    @field_validator(
+        "question",
+        "answer",
+        "debate_verdict_id",
+        "judge_agent_id",
+        "model_id",
+    )
+    @classmethod
+    def normalize_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Judge follow-up text cannot be blank")
+        return normalized
+
+    @field_validator("evidence_citations")
+    @classmethod
+    def require_unique_citations(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if any(not value.strip() for value in values):
+            raise ValueError("Judge follow-up citations cannot be blank")
+        if len(values) != len(set(values)):
+            raise ValueError("Judge follow-up citations must be unique")
+        return values
+
+    @field_validator("generated_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "Judge follow-up timestamp must include timezone information"
+            )
+        return value

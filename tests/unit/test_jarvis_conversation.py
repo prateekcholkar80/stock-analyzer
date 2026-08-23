@@ -1,6 +1,9 @@
 import threading
 import unittest
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+from pydantic import ValidationError
 
 from app.conversation.config import JarvisConversationConfig
 from app.conversation.events import InMemoryConversationEventSink
@@ -17,9 +20,31 @@ from app.models.conversation import (
     ConversationState,
     InputChannel,
 )
+from app.models.debate import (
+    AgenticDebateResult,
+    JudgeFollowUpAnswer,
+)
 from app.models.interaction import JarvisSwingAnalysisResponse
+from app.models.presentation import (
+    JarvisCaseExplanation,
+    JarvisResearchExplanation,
+    JarvisTechnicalExplanation,
+)
+from app.models.signals import (
+    SignalCategory,
+    SignalDirection,
+    SignalStrength,
+    SwingTradingStance,
+)
 from app.models.storage import EndToEndSwingAnalysisResult
+from app.orchestration.agent_orchestrator import AgentOrchestrator
 from app.presentation.llm_failures import present_llm_failure
+from tests.unit.test_build_multi_timeframe_evidence import (
+    _cyclical_timeframes,
+)
+from tests.unit.test_run_end_to_end_multi_timeframe_swing_analysis import (
+    _use_case as _multi_end_to_end_use_case,
+)
 
 
 def _result():
@@ -61,6 +86,115 @@ class BlockingResearchExecutor:
         self.started.set()
         self.release.wait(timeout=2)
         return _completed_response()
+
+
+class RecordingPresenter:
+    def __init__(self, failure=None):
+        self.failure = failure
+        self.calls = []
+
+    def explain(self, result, *, user_name):
+        self.calls.append((result, user_name))
+        if self.failure is not None:
+            raise self.failure
+        return JarvisResearchExplanation(
+            symbol="RELIANCE-EQ",
+            interval="ONE_DAY",
+            technical_stance=SwingTradingStance.BULLISH,
+            technical_score=20.0,
+            verdict_id="verdict-1",
+            judge_winner=SignalDirection.BULLISH,
+            judge_confidence_percentage=70.0,
+            decisive_evidence_ids=("trend-1",),
+            executive_evidence_ids=("trend-1",),
+            executive_briefing="CEO briefing: the evidence leans bullish.",
+            judge_conclusion_explanation="The bull case was stronger.",
+            technical_findings=(
+                JarvisTechnicalExplanation(
+                    evidence_id="trend-1",
+                    name="Trend",
+                    category=SignalCategory.TREND,
+                    direction=SignalDirection.BULLISH,
+                    strength=SignalStrength.MODERATE,
+                    fact_explanation="The trend evidence is bullish.",
+                    inference="This supports the bullish swing case.",
+                ),
+            ),
+            bull_case=JarvisCaseExplanation(
+                summary="Bull case.",
+                argument_ids=("bull-1",),
+                evidence_ids=("trend-1",),
+            ),
+            bear_case=JarvisCaseExplanation(
+                summary="Bear case.",
+                argument_ids=("bear-1",),
+                evidence_ids=("trend-1",),
+            ),
+            limitations=("Technical evidence only.",),
+            disclaimer="Research, not guaranteed advice.",
+            provider="fake-provider",
+            model_id="fake-jarvis",
+            generated_at=datetime.now(UTC),
+        )
+
+
+class RecordingJudgeFollowUpExecutor:
+    def __init__(self):
+        self.calls = []
+
+    def execute(
+        self,
+        question,
+        *,
+        technical_review,
+        debate_result,
+    ):
+        self.calls.append(
+            (question, technical_review, debate_result)
+        )
+        return JudgeFollowUpAnswer(
+            question=question,
+            answer="Weekly support is the approved weekly support zone.",
+            evidence_citations=(
+                technical_review.evidence_package.weekly.nearest_support
+                .qualified_zone_id,
+            ),
+            technical_package_fingerprint=(
+                technical_review.evidence_package.package_fingerprint
+            ),
+            debate_verdict_id="verdict-1",
+            judge_agent_id="jarvis.debate_judge_agent.v1",
+            model_id="fake-judge",
+            generated_at=datetime.now(UTC),
+        )
+
+
+def _multi_timeframe_response():
+    review = AgentOrchestrator().run_multi_timeframe_analysis(
+        _cyclical_timeframes()
+    )
+    package = review.evidence_package
+    evaluated_at = datetime.now(UTC)
+    debate = AgenticDebateResult.model_construct(
+        orchestrator_id="jarvis.debate_orchestrator.v1",
+        submission=SimpleNamespace(
+            submission_id="debate-submission-1",
+            technical_submission_id=package.package_fingerprint,
+            technical_decision_id=review.decision.decision_id,
+            evaluated_at=evaluated_at,
+        ),
+        decision=SimpleNamespace(
+            accepted=True,
+            submission_id="debate-submission-1",
+            decided_at=evaluated_at,
+        ),
+    )
+    return JarvisSwingAnalysisResponse.completed(
+        operation_id="operation-multi",
+        result=_result(),
+        multi_timeframe_review=review,
+        multi_timeframe_debate=debate,
+    )
 
 
 class JarvisWakePhraseTests(unittest.TestCase):
@@ -153,6 +287,72 @@ class JarvisConversationSessionTests(unittest.TestCase):
         self.assertEqual(turn.state_after, ConversationState.DORMANT)
         self.assertIsNotNone(turn.research_response)
 
+    def test_success_uses_persona_briefing_and_preserves_structured_result(self):
+        presenter = RecordingPresenter()
+        session = JarvisConversationSession(
+            self.executor,
+            JarvisConversationConfig(user_name="Prateek"),
+            research_presenter=presenter,
+            session_id_factory=lambda: "session-persona",
+        )
+
+        turn = session.handle_text("Hey Jarvis analyze Reliance")
+
+        self.assertEqual(
+            turn.display_message,
+            "CEO briefing: the evidence leans bullish.",
+        )
+        self.assertIsNotNone(turn.research_response)
+        self.assertIsNotNone(turn.research_explanation)
+        self.assertEqual(presenter.calls[0][1], "Prateek")
+
+    def test_multi_timeframe_success_uses_ceo_presenter(self):
+        result = _multi_end_to_end_use_case(winner="bearish").execute(
+            "NSE", "2885", "RELIANCE-EQ", "ONE_HOUR"
+        )
+        research = RecordingResearchExecutor(
+            response=JarvisSwingAnalysisResponse.completed(
+                operation_id="operation-multi-presented",
+                result=result,
+                multi_timeframe_review=result.technical_review,
+                multi_timeframe_debate=result.debate_result,
+            )
+        )
+        presenter = RecordingPresenter()
+        session = JarvisConversationSession(
+            research,
+            JarvisConversationConfig(user_name="Prateek"),
+            research_presenter=presenter,
+            session_id_factory=lambda: "session-multi-presented",
+        )
+
+        turn = session.handle_text("Hey Jarvis analyze Reliance")
+
+        self.assertEqual(
+            turn.display_message,
+            "CEO briefing: the evidence leans bullish.",
+        )
+        self.assertIs(presenter.calls[0][0], result)
+
+    def test_persona_failure_is_candid_and_keeps_validated_research(self):
+        presenter = RecordingPresenter(
+            LLMConfigurationError("provider secret")
+        )
+        session = JarvisConversationSession(
+            self.executor,
+            JarvisConversationConfig(user_name="Prateek"),
+            research_presenter=presenter,
+            session_id_factory=lambda: "session-persona-failure",
+        )
+
+        turn = session.handle_text("Hey Jarvis analyze Reliance")
+
+        self.assertEqual(turn.outcome, ConversationOutcome.COMPLETED)
+        self.assertIn("unscheduled chai", turn.display_message)
+        self.assertNotIn("secret", turn.display_message)
+        self.assertIsNotNone(turn.research_response)
+        self.assertIsNone(turn.research_explanation)
+
     def test_voice_wake_phrase_and_command_execute_immediately(self):
         turn = self.session.handle_voice_transcript(
             "Hey Jarvis analyze TCS for a swing trade"
@@ -180,6 +380,117 @@ class JarvisConversationSessionTests(unittest.TestCase):
 
         self.assertEqual(turn.outcome, ConversationOutcome.COMPLETED)
         self.assertEqual(len(self.executor.calls), 1)
+
+    def test_retains_multi_timeframe_context_for_judge_follow_up(self):
+        research = RecordingResearchExecutor(
+            response=_multi_timeframe_response()
+        )
+        follow_up = RecordingJudgeFollowUpExecutor()
+        session = JarvisConversationSession(
+            research,
+            JarvisConversationConfig(user_name="Prateek"),
+            judge_follow_up_executor=follow_up,
+            session_id_factory=lambda: "session-follow-up",
+        )
+        session.handle_text("Hey Jarvis analyze Reliance")
+
+        turn = session.handle_text(
+            "Hey Jarvis, tell me where support is on a weekly basis?"
+        )
+
+        self.assertEqual(turn.outcome, ConversationOutcome.COMPLETED)
+        self.assertEqual(
+            turn.display_message,
+            "Weekly support is the approved weekly support zone.",
+        )
+        self.assertIsNotNone(turn.judge_follow_up)
+        self.assertEqual(len(research.calls), 1)
+        self.assertEqual(len(follow_up.calls), 1)
+        self.assertIs(
+            follow_up.calls[0][1],
+            research.response.multi_timeframe_review,
+        )
+
+    def test_new_analysis_does_not_reuse_retained_judge_context(self):
+        research = RecordingResearchExecutor(
+            response=_multi_timeframe_response()
+        )
+        follow_up = RecordingJudgeFollowUpExecutor()
+        session = JarvisConversationSession(
+            research,
+            JarvisConversationConfig(user_name="Prateek"),
+            judge_follow_up_executor=follow_up,
+            session_id_factory=lambda: "session-new-analysis",
+        )
+        session.handle_text("Hey Jarvis analyze Reliance")
+
+        turn = session.handle_text(
+            "Hey Jarvis analyze TCS for a swing trade"
+        )
+
+        self.assertEqual(turn.outcome, ConversationOutcome.COMPLETED)
+        self.assertEqual(len(research.calls), 2)
+        self.assertEqual(follow_up.calls, [])
+
+    def test_legacy_success_clears_previous_multi_timeframe_context(self):
+        research = RecordingResearchExecutor(
+            response=_multi_timeframe_response()
+        )
+        follow_up = RecordingJudgeFollowUpExecutor()
+        session = JarvisConversationSession(
+            research,
+            JarvisConversationConfig(user_name="Prateek"),
+            judge_follow_up_executor=follow_up,
+            session_id_factory=lambda: "session-context-replaced",
+        )
+        session.handle_text("Hey Jarvis analyze Reliance")
+        research.response = _completed_response()
+        session.handle_text("Hey Jarvis analyze TCS for a swing trade")
+
+        session.handle_text("Hey Jarvis where is weekly support?")
+
+        self.assertEqual(len(research.calls), 3)
+        self.assertEqual(follow_up.calls, [])
+
+    def test_failed_new_analysis_clears_previous_context(self):
+        research = RecordingResearchExecutor(
+            response=_multi_timeframe_response()
+        )
+        follow_up = RecordingJudgeFollowUpExecutor()
+        session = JarvisConversationSession(
+            research,
+            JarvisConversationConfig(user_name="Prateek"),
+            judge_follow_up_executor=follow_up,
+            session_id_factory=lambda: "session-failed-replacement",
+        )
+        session.handle_text("Hey Jarvis analyze Reliance")
+        failure = present_llm_failure(
+            LLMConfigurationError("secret"),
+            operation_id="operation-failed-replacement",
+        )
+        research.response = JarvisSwingAnalysisResponse.llm_failure(
+            operation_id="operation-failed-replacement",
+            failure=failure,
+        )
+
+        failed_turn = session.handle_text(
+            "Hey Jarvis analyze TCS for a swing trade"
+        )
+        session.handle_text("Hey Jarvis where is weekly support?")
+
+        self.assertEqual(failed_turn.outcome, ConversationOutcome.FAILED)
+        self.assertEqual(len(research.calls), 3)
+        self.assertEqual(follow_up.calls, [])
+
+    def test_response_rejects_partial_follow_up_context(self):
+        response = _multi_timeframe_response()
+
+        with self.assertRaisesRegex(ValidationError, "requires both"):
+            JarvisSwingAnalysisResponse.completed(
+                operation_id="partial-context",
+                result=_result(),
+                multi_timeframe_review=response.multi_timeframe_review,
+            )
 
     def test_resolution_failure_requests_clarification_and_keeps_listening(self):
         executor = RecordingResearchExecutor(

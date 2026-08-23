@@ -4,6 +4,13 @@ from threading import RLock
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
+from app.audit.prompt_audit import (
+    PromptAuditActor,
+    PromptAuditEventType,
+    PromptAuditRecorder,
+    PromptAuditSink,
+    prompt_audit_session_context,
+)
 from app.conversation.config import JarvisConversationConfig
 from app.conversation.events import (
     ConversationEventEmitter,
@@ -30,6 +37,19 @@ from app.models.interaction import (
     JarvisCommandStatus,
     JarvisSwingAnalysisResponse,
 )
+from app.models.debate import (
+    AgenticDebateResult,
+    JudgeFollowUpAnswer,
+)
+from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
+from app.models.presentation import (
+    JarvisMultiTimeframeResearchExplanation,
+    JarvisResearchExplanation,
+)
+from app.models.storage import (
+    EndToEndSwingAnalysisResult,
+    MultiTimeframeEndToEndSwingAnalysisResult,
+)
 
 
 @runtime_checkable
@@ -40,6 +60,35 @@ class SwingResearchExecutor(Protocol):
         *,
         to_date: datetime | None = None,
     ) -> JarvisSwingAnalysisResponse:
+        ...
+
+
+@runtime_checkable
+class ResearchPresentationExecutor(Protocol):
+    def explain(
+        self,
+        result: (
+            EndToEndSwingAnalysisResult
+            | MultiTimeframeEndToEndSwingAnalysisResult
+        ),
+        *,
+        user_name: str,
+    ) -> (
+        JarvisResearchExplanation
+        | JarvisMultiTimeframeResearchExplanation
+    ):
+        ...
+
+
+@runtime_checkable
+class JudgeFollowUpExecutor(Protocol):
+    def execute(
+        self,
+        question: str,
+        *,
+        technical_review: MultiTimeframeEvidenceReview,
+        debate_result: AgenticDebateResult,
+    ) -> JudgeFollowUpAnswer:
         ...
 
 
@@ -65,12 +114,27 @@ class JarvisConversationSession:
         *,
         wake_detector: WakePhraseDetector | None = None,
         event_sink: ConversationEventSink | None = None,
+        prompt_audit_sink: PromptAuditSink | None = None,
+        research_presenter: ResearchPresentationExecutor | None = None,
+        judge_follow_up_executor: JudgeFollowUpExecutor | None = None,
         session_id_factory: Callable[[], str] | None = None,
     ) -> None:
         if not isinstance(research_executor, SwingResearchExecutor):
             raise ValueError("conversation requires a swing research executor")
         if not isinstance(config, JarvisConversationConfig):
             raise ValueError("conversation requires validated settings")
+        if research_presenter is not None and not isinstance(
+            research_presenter,
+            ResearchPresentationExecutor,
+        ):
+            raise ValueError("conversation requires a research presenter")
+        if judge_follow_up_executor is not None and not isinstance(
+            judge_follow_up_executor,
+            JudgeFollowUpExecutor,
+        ):
+            raise ValueError(
+                "conversation requires a Judge follow-up executor"
+            )
         detector = wake_detector or NormalizedWakePhraseDetector(
             config.wake_phrase
         )
@@ -86,14 +150,21 @@ class JarvisConversationSession:
             raise ValueError("conversation session ID factory must be callable")
 
         self._research_executor = research_executor
+        self._research_presenter = research_presenter
+        self._judge_follow_up_executor = judge_follow_up_executor
         self._config = config
         self._wake_detector = detector
         self._event_sink = event_sink
+        self._prompt_audit = PromptAuditRecorder(prompt_audit_sink)
         self._session_id_factory = id_factory
         self._state = ConversationState.DORMANT
         self._session_id: str | None = None
         self._emitter: ConversationEventEmitter | None = None
         self._lock = RLock()
+        self._last_multi_timeframe_review: (
+            MultiTimeframeEvidenceReview | None
+        ) = None
+        self._last_multi_timeframe_debate: AgenticDebateResult | None = None
 
     @property
     def state(self) -> ConversationState:
@@ -137,6 +208,7 @@ class JarvisConversationSession:
                 ConversationState.PROCESSING,
                 ConversationState.RESPONDING,
             }:
+                self._record_input(utterance, state_before)
                 return self._turn(
                     utterance,
                     state_before=state_before,
@@ -161,6 +233,8 @@ class JarvisConversationSession:
             elif detected_command is not None:
                 command = detected_command
 
+            self._record_input(utterance, state_before)
+
             if not command:
                 greeting = (
                     f"Hello {self._config.user_name}. "
@@ -181,14 +255,60 @@ class JarvisConversationSession:
             active_session_id = self._session_id
 
         try:
-            response = self._research_executor.execute(
-                command,
-                to_date=to_date,
-            )
-            if not isinstance(response, JarvisSwingAnalysisResponse):
-                raise ValueError(
-                    "research executor returned an invalid response"
-                )
+            assert active_session_id is not None
+            explanation = None
+            presentation_failed = False
+            response = None
+            follow_up_answer = None
+            with prompt_audit_session_context(active_session_id):
+                follow_up_context = self._follow_up_context(command)
+                if follow_up_context is not None:
+                    technical_review, debate_result = follow_up_context
+                    follow_up_answer = self._judge_follow_up_executor.execute(
+                        command,
+                        technical_review=technical_review,
+                        debate_result=debate_result,
+                    )
+                    if not isinstance(
+                        follow_up_answer,
+                        JudgeFollowUpAnswer,
+                    ):
+                        raise ValueError(
+                            "Judge follow-up executor returned an invalid answer"
+                        )
+                else:
+                    # A fresh request supersedes the previous instrument. Do
+                    # this before execution so a failed replacement cannot
+                    # leave stale evidence available to a later follow-up.
+                    self._clear_multi_timeframe_context()
+                    response = self._research_executor.execute(
+                        command,
+                        to_date=to_date,
+                    )
+                    if not isinstance(response, JarvisSwingAnalysisResponse):
+                        raise ValueError(
+                            "research executor returned an invalid response"
+                        )
+                    if response.status is JarvisCommandStatus.COMPLETED:
+                        self._remember_multi_timeframe_context(response)
+                        if (
+                            self._research_presenter is not None
+                            and isinstance(
+                                response.result,
+                                (
+                                    EndToEndSwingAnalysisResult,
+                                    MultiTimeframeEndToEndSwingAnalysisResult,
+                                ),
+                            )
+                        ):
+                            assert response.result is not None
+                            try:
+                                explanation = self._research_presenter.explain(
+                                    response.result,
+                                    user_name=self._config.user_name,
+                                )
+                            except ApplicationError:
+                                presentation_failed = True
         except (
             IntentRecognitionError,
             InstrumentNotFoundError,
@@ -203,6 +323,15 @@ class JarvisConversationSession:
             return self._application_failure_turn(utterance, state_before)
         except Exception:
             with self._lock:
+                self._prompt_audit.record(
+                    PromptAuditEventType.CONVERSATION_OUTPUT,
+                    PromptAuditActor.JARVIS,
+                    {
+                        "outcome": "unexpected_failure",
+                        "error_type": "unexpected_application_defect",
+                    },
+                    session_id=active_session_id,
+                )
                 self._transition(ConversationState.FAILED, utterance.channel)
                 self._transition(ConversationState.DORMANT, utterance.channel)
                 self._clear_session()
@@ -210,10 +339,32 @@ class JarvisConversationSession:
 
         with self._lock:
             self._transition(ConversationState.RESPONDING, utterance.channel)
-            if response.status is JarvisCommandStatus.COMPLETED:
+            if follow_up_answer is not None:
                 outcome = ConversationOutcome.COMPLETED
-                display_message = "Jarvis completed the swing-trade analysis."
-                spoken_message = "I've completed the swing-trade analysis."
+                display_message = follow_up_answer.answer
+                spoken_message = follow_up_answer.answer
+            elif response.status is JarvisCommandStatus.COMPLETED:
+                outcome = ConversationOutcome.COMPLETED
+                if explanation is not None:
+                    display_message = explanation.executive_briefing
+                    spoken_message = explanation.executive_briefing
+                elif presentation_failed:
+                    display_message = (
+                        "The evidence and debate are complete, but my CEO "
+                        "briefing service has gone for an unscheduled chai. "
+                        "The validated raw result is still available."
+                    )
+                    spoken_message = (
+                        "The analysis is complete, but I couldn't prepare "
+                        "the briefing. The validated result is still available."
+                    )
+                else:
+                    display_message = (
+                        "Jarvis completed the swing-trade analysis."
+                    )
+                    spoken_message = (
+                        "I've completed the swing-trade analysis."
+                    )
             else:
                 outcome = ConversationOutcome.FAILED
                 assert response.failure is not None
@@ -227,6 +378,8 @@ class JarvisConversationSession:
                 display_message=display_message,
                 spoken_message=spoken_message,
                 research_response=response,
+                research_explanation=explanation,
+                judge_follow_up=follow_up_answer,
                 session_id=active_session_id,
             )
             self._clear_session()
@@ -325,9 +478,15 @@ class JarvisConversationSession:
         display_message: str | None = None,
         spoken_message: str | None = None,
         research_response: JarvisSwingAnalysisResponse | None = None,
+        research_explanation: (
+            JarvisResearchExplanation
+            | JarvisMultiTimeframeResearchExplanation
+            | None
+        ) = None,
+        judge_follow_up: JudgeFollowUpAnswer | None = None,
         session_id: str | None = None,
     ) -> JarvisConversationTurn:
-        return JarvisConversationTurn(
+        turn = JarvisConversationTurn(
             session_id=session_id or self._session_id,
             outcome=outcome,
             state_before=state_before,
@@ -336,9 +495,124 @@ class JarvisConversationSession:
             display_message=display_message,
             spoken_message=spoken_message,
             research_response=research_response,
+            research_explanation=research_explanation,
+            judge_follow_up=judge_follow_up,
+        )
+        if outcome is not ConversationOutcome.IGNORED:
+            self._prompt_audit.record(
+                PromptAuditEventType.CONVERSATION_OUTPUT,
+                PromptAuditActor.JARVIS,
+                {
+                    "outcome": turn.outcome.value,
+                    "state_before": turn.state_before.value,
+                    "state_after": turn.state_after.value,
+                    "input_channel": turn.input_channel.value,
+                    "display_message": turn.display_message,
+                    "spoken_message": turn.spoken_message,
+                    "research_explanation": (
+                        turn.research_explanation.model_dump(mode="json")
+                        if turn.research_explanation is not None
+                        else None
+                    ),
+                    "judge_follow_up": (
+                        turn.judge_follow_up.model_dump(mode="json")
+                        if turn.judge_follow_up is not None
+                        else None
+                    ),
+                },
+                session_id=turn.session_id,
+                operation_id=(
+                    turn.research_response.operation_id
+                    if turn.research_response is not None
+                    else None
+                ),
+            )
+        return turn
+
+    def _record_input(
+        self,
+        utterance: JarvisUtterance,
+        state_before: ConversationState,
+    ) -> None:
+        self._prompt_audit.record(
+            PromptAuditEventType.CONVERSATION_INPUT,
+            PromptAuditActor.USER,
+            {
+                "content": utterance.text,
+                "input_channel": utterance.channel.value,
+                "state_before": state_before.value,
+            },
+            session_id=self._session_id,
         )
 
     def _clear_session(self) -> None:
         self._session_id = None
         self._emitter = None
 
+    def _follow_up_context(
+        self,
+        command: str,
+    ) -> tuple[MultiTimeframeEvidenceReview, AgenticDebateResult] | None:
+        if (
+            self._judge_follow_up_executor is None
+            or self._last_multi_timeframe_review is None
+            or self._last_multi_timeframe_debate is None
+            or not _looks_like_analysis_follow_up(command)
+        ):
+            return None
+        return (
+            self._last_multi_timeframe_review,
+            self._last_multi_timeframe_debate,
+        )
+
+    def _remember_multi_timeframe_context(
+        self,
+        response: JarvisSwingAnalysisResponse,
+    ) -> None:
+        review = response.multi_timeframe_review
+        debate = response.multi_timeframe_debate
+        if review is None or debate is None:
+            self._clear_multi_timeframe_context()
+            return
+        self._last_multi_timeframe_review = review
+        self._last_multi_timeframe_debate = debate
+
+    def _clear_multi_timeframe_context(self) -> None:
+        self._last_multi_timeframe_review = None
+        self._last_multi_timeframe_debate = None
+
+
+_FOLLOW_UP_TERMS = frozenset(
+    {
+        "support",
+        "resistance",
+        "pivot",
+        "daily",
+        "weekly",
+        "evidence",
+        "judge",
+        "verdict",
+        "conclusion",
+        "explain",
+        "why",
+        "tell me more",
+    }
+)
+_NEW_ANALYSIS_TERMS = (
+    "analyze ",
+    "analyse ",
+    "analysis of ",
+    "research ",
+    "swing trade",
+    "how is ",
+    "how's ",
+    "how does ",
+    "look at ",
+)
+
+
+def _looks_like_analysis_follow_up(command: str) -> bool:
+    normalized = " ".join(command.casefold().split())
+    if any(term in normalized for term in _NEW_ANALYSIS_TERMS):
+        return False
+    return any(term in normalized for term in _FOLLOW_UP_TERMS)

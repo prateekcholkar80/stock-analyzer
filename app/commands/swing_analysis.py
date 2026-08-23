@@ -8,7 +8,10 @@ from app.models.interaction import (
     JarvisSwingAnalysisResponse,
     SwingAnalysisCommand,
 )
-from app.models.storage import EndToEndSwingAnalysisResult
+from app.models.storage import (
+    EndToEndSwingAnalysisResult,
+    MultiTimeframeEndToEndSwingAnalysisResult,
+)
 from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.presentation.llm_failures import present_llm_failure
 from app.workflow.events import WorkflowEventEmitter
@@ -27,7 +30,10 @@ class SwingAnalysisExecutor(Protocol):
         *,
         to_date: datetime | None = None,
         event_emitter: WorkflowEventEmitter | None = None,
-    ) -> EndToEndSwingAnalysisResult:
+    ) -> (
+        EndToEndSwingAnalysisResult
+        | MultiTimeframeEndToEndSwingAnalysisResult
+    ):
         ...
 
 
@@ -92,7 +98,13 @@ class JarvisSwingAnalysisCommandHandler:
                     to_date=command.to_date,
                     event_emitter=active_emitter,
                 )
-                if not isinstance(result, EndToEndSwingAnalysisResult):
+                if not isinstance(
+                    result,
+                    (
+                        EndToEndSwingAnalysisResult,
+                        MultiTimeframeEndToEndSwingAnalysisResult,
+                    ),
+                ):
                     raise ValueError(
                         "swing-analysis executor returned an invalid result"
                     )
@@ -148,7 +160,17 @@ class JarvisSwingAnalysisCommandHandler:
                     "interval": command.interval,
                 },
             )
+            response_context = {}
+            if isinstance(
+                result,
+                MultiTimeframeEndToEndSwingAnalysisResult,
+            ):
+                response_context = {
+                    "multi_timeframe_review": result.technical_review,
+                    "multi_timeframe_debate": result.debate_result,
+                }
             return JarvisSwingAnalysisResponse.completed(
                 operation_id=active_operation_id,
                 result=result,
+                **response_context,
             )

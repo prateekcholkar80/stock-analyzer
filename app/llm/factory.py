@@ -5,7 +5,12 @@ from threading import RLock
 
 from app.exceptions import LLMConfigurationError
 from app.llm.adapters.litellm_gateway import LiteLLMStructuredGateway
-from app.llm.config import LLMRole, LLMRoleSettings, LLMSettings
+from app.llm.config import (
+    DEBATE_LLM_ROLES,
+    LLMRole,
+    LLMRoleSettings,
+    LLMSettings,
+)
 from app.llm.gateway import StructuredLLMGateway
 from app.logging_config import get_operation_id
 
@@ -35,7 +40,7 @@ class LLMGatewayFactory:
     def configuration_fingerprint(self) -> str:
         payload = {
             role.value: self.settings.for_role(role).model_dump(mode="json")
-            for role in LLMRole
+            for role in DEBATE_LLM_ROLES
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return sha256(serialized.encode("utf-8")).hexdigest()

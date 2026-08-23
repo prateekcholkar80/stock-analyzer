@@ -14,6 +14,11 @@ from app.models.agentic import AgenticSwingAnalysisResult
 from app.models.backtest import WalkForwardBacktestResult
 from app.models.debate import AgenticDebateResult, DebateTerminationReason
 from app.models.market import HistoricalCandleSeries
+from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
+from app.models.multi_timeframe_trade import (
+    MultiTimeframeLongTradePlanResult,
+    MultiTimeframeTradeReason,
+)
 from app.models.signals import (
     SignalDirection,
     SignalStrength,
@@ -259,6 +264,86 @@ class EndToEndSwingAnalysisResult(StorageModel):
     @property
     def dataset_id(self) -> str:
         return self.stored.dataset_id
+
+
+class MultiTimeframeEndToEndSwingAnalysisResult(StorageModel):
+    """Full hourly pull -> daily/weekly evidence -> debate trail."""
+
+    use_case_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    market_dataset_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    fetch: RollingFetchReceipt
+    technical_review: MultiTimeframeEvidenceReview
+    debate_result: AgenticDebateResult
+    trade_plan_result: MultiTimeframeLongTradePlanResult
+
+    @model_validator(mode="after")
+    def validate_review_chain(self) -> Self:
+        if self.market_dataset_id != self.fetch.dataset_id:
+            raise ValueError(
+                "multi-timeframe result must reference its fetched dataset"
+            )
+        package = self.technical_review.released_evidence
+        if package is None:
+            raise ValueError(
+                "multi-timeframe result requires released technical evidence"
+            )
+        if not self.debate_result.decision.accepted:
+            raise ValueError(
+                "multi-timeframe result requires an approved debate"
+            )
+        submission = self.debate_result.submission
+        if (
+            submission.technical_submission_id
+            != package.package_fingerprint
+            or submission.technical_decision_id
+            != self.technical_review.decision.decision_id
+        ):
+            raise ValueError(
+                "multi-timeframe result debate must match technical review"
+            )
+        trade = self.trade_plan_result
+        if (
+            trade.technical_package_fingerprint
+            != package.package_fingerprint
+            or trade.technical_decision_id
+            != self.technical_review.decision.decision_id
+            or trade.debate_verdict_id != submission.verdict.verdict_id
+        ):
+            raise ValueError(
+                "multi-timeframe trade plan must match the approved chain"
+            )
+        planning = trade.daily_planning_result
+        if planning is not None:
+            daily = package.technical_analysis.daily_submission
+            if (
+                planning.submission.technical_submission_id
+                != daily.submission_id
+                or planning.submission.technical_decision_id
+                != (
+                    f"{self.technical_review.decision.decision_id}:"
+                    "daily_trade_projection"
+                )
+            ):
+                raise ValueError(
+                    "multi-timeframe trade plan must use the daily submission"
+                )
+        verdict = submission.verdict
+        if (
+            verdict.winner is not SignalDirection.BULLISH
+            and trade.reason is not MultiTimeframeTradeReason.JUDGE_NOT_BULLISH
+        ):
+            raise ValueError(
+                "non-bullish Judge verdict cannot produce a long trade plan"
+            )
+        return self
 
 
 class BacktestRunSummary(StorageModel):

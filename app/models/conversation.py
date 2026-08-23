@@ -5,7 +5,12 @@ from typing import Literal
 from pydantic import ConfigDict, Field, field_validator
 
 from app.models.interaction import JarvisSwingAnalysisResponse
+from app.models.presentation import (
+    JarvisMultiTimeframeResearchExplanation,
+    JarvisResearchExplanation,
+)
 from app.models.technical import TechnicalModel
+from app.models.debate import JudgeFollowUpAnswer
 
 
 IST_OFFSET = timedelta(hours=5, minutes=30)
@@ -67,6 +72,12 @@ class JarvisConversationTurn(TechnicalModel):
     display_message: str | None = Field(default=None, min_length=1)
     spoken_message: str | None = Field(default=None, min_length=1)
     research_response: JarvisSwingAnalysisResponse | None = None
+    research_explanation: (
+        JarvisResearchExplanation
+        | JarvisMultiTimeframeResearchExplanation
+        | None
+    ) = None
+    judge_follow_up: JudgeFollowUpAnswer | None = None
 
     @field_validator("session_id", "display_message", "spoken_message")
     @classmethod
@@ -110,4 +121,3 @@ class JarvisConversationEvent(TechnicalModel):
         if value.tzinfo is None or value.utcoffset() != IST_OFFSET:
             raise ValueError("conversation event timestamp must be in IST")
         return value
-

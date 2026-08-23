@@ -8,7 +8,11 @@ from pydantic import ConfigDict, Field
 from app.agents.bear_agent import BearDebateAgent
 from app.agents.bull_agent import BullDebateAgent
 from app.agents.debate_judge_agent import DebateJudgeAgent
-from app.exceptions import AgentSubmissionRejectedError
+from app.agents._debate_support import valid_multi_timeframe_evidence_ids
+from app.exceptions import (
+    AgentSubmissionRejectedError,
+    LLMResponseValidationError,
+)
 from app.models.agentic import (
     AgenticSwingAnalysisResult,
     JarvisJudgeDecision,
@@ -21,7 +25,9 @@ from app.models.debate import (
     DebateRound,
     DebateTerminationReason,
     DebateVerdict,
+    JudgeFollowUpAnswer,
 )
+from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
 from app.models.signals import SignalDirection, SwingTradingSignalProfile
 from app.models.storage import DebateRunSummary, StoredDebateRun
 from app.models.technical import TechnicalModel
@@ -100,7 +106,11 @@ class JarvisDebateJudge:
             "expected debate configuration",
             expected_configuration_fingerprint,
         )
-        if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1:
+        if (
+            isinstance(max_rounds, bool)
+            or not isinstance(max_rounds, int)
+            or max_rounds < 1
+        ):
             raise ValueError("expected debate max rounds must be a positive integer")
         self.max_rounds = max_rounds
 
@@ -216,6 +226,144 @@ class JarvisDebateJudge:
                 "termination reason"
             )
 
+        if _chronological(submission):
+            passed_checks.append("chronological_debate_sequence")
+        else:
+            reasons.append(
+                "debate artifacts are not in chronological order"
+            )
+
+        verdict = (
+            JarvisJudgeVerdict.REJECTED
+            if reasons
+            else JarvisJudgeVerdict.ACCEPTED
+        )
+        return JarvisJudgeDecision(
+            decision_id=f"{self.judge_id}:{submission.submission_id}",
+            judge_id=self.judge_id,
+            submission_id=submission.submission_id,
+            verdict=verdict,
+            decided_at=submission.evaluated_at,
+            passed_checks=tuple(passed_checks),
+            reasons=tuple(reasons),
+        )
+
+    def review_multi_timeframe(
+        self,
+        submission: BullBearDebateSubmission,
+        technical_review: MultiTimeframeEvidenceReview,
+    ) -> JarvisJudgeDecision:
+        """Audit a debate against the exact Judge-released package."""
+        if not isinstance(submission, BullBearDebateSubmission):
+            raise ValueError(
+                "Jarvis debate judge requires a debate submission"
+            )
+        if not isinstance(
+            technical_review,
+            MultiTimeframeEvidenceReview,
+        ):
+            raise ValueError(
+                "multi-timeframe debate requires its technical review"
+            )
+        submission = BullBearDebateSubmission.model_validate(
+            submission.model_dump(exclude_computed_fields=True)
+        )
+        technical_review = MultiTimeframeEvidenceReview.model_validate(
+            technical_review.model_dump(exclude_computed_fields=True)
+        )
+        package = technical_review.released_evidence
+        if package is None:
+            raise AgentSubmissionRejectedError(
+                "debate requires Judge-released multi-timeframe evidence"
+            )
+
+        passed_checks = ["debate_submission_schema_valid"]
+        reasons: list[str] = []
+        if submission.agent_id == self.expected_agent_id:
+            passed_checks.append("expected_debate_agent_identity")
+        else:
+            reasons.append(
+                "submission came from an unexpected debate process"
+            )
+        if (
+            submission.configuration_fingerprint
+            == self.expected_configuration_fingerprint
+        ):
+            passed_checks.append("expected_debate_configuration")
+        else:
+            reasons.append(
+                "submission used an unexpected debate configuration"
+            )
+        if (
+            submission.technical_submission_id
+            == package.package_fingerprint
+            and submission.technical_decision_id
+            == technical_review.decision.decision_id
+        ):
+            passed_checks.append("multi_timeframe_technical_review_chain")
+        else:
+            reasons.append(
+                "debate does not reference the released technical package"
+            )
+        if submission.input_fingerprint == package.package_fingerprint:
+            passed_checks.append("exact_multi_timeframe_input_fingerprint")
+        else:
+            reasons.append(
+                "debate input does not match the released evidence package"
+            )
+
+        valid_ids = valid_multi_timeframe_evidence_ids(package)
+        cited_ids = {
+            citation
+            for debate_round in submission.transcript.rounds
+            for argument in (
+                debate_round.bull_argument,
+                debate_round.bear_argument,
+            )
+            for citation in argument.evidence_citations
+        }
+        if cited_ids.issubset(valid_ids):
+            passed_checks.append("qualified_debate_citations_grounded")
+        else:
+            reasons.append(
+                "debate cites ids outside the multi-timeframe package"
+            )
+        arguments = tuple(
+            argument
+            for debate_round in submission.transcript.rounds
+            for argument in (
+                debate_round.bull_argument,
+                debate_round.bear_argument,
+            )
+        )
+        if all(
+            argument.timeframe_relationship is not None
+            for argument in arguments
+        ):
+            passed_checks.append("timeframe_relationships_declared")
+        else:
+            reasons.append(
+                "every multi-timeframe argument must classify the "
+                "timeframe relationship"
+            )
+        if set(submission.verdict.decisive_evidence_ids).issubset(
+            valid_ids
+        ):
+            passed_checks.append("qualified_verdict_citations_grounded")
+        else:
+            reasons.append(
+                "verdict cites ids outside the multi-timeframe package"
+            )
+        if _round_count_valid(
+            submission,
+            self.max_rounds,
+        ):
+            passed_checks.append("round_count_consistent_with_termination")
+        else:
+            reasons.append(
+                "debate round count is not consistent with its "
+                "termination reason"
+            )
         if _chronological(submission):
             passed_checks.append("chronological_debate_sequence")
         else:
@@ -447,6 +595,207 @@ class DebateOrchestrator:
             )
         return result.submission.verdict
 
+    def run_multi_timeframe_debate(
+        self,
+        technical_review: MultiTimeframeEvidenceReview,
+        *,
+        event_emitter: WorkflowEventEmitter | None = None,
+    ) -> AgenticDebateResult:
+        """Debate the unchanged daily/weekly package released by Jarvis."""
+        if not isinstance(
+            technical_review,
+            MultiTimeframeEvidenceReview,
+        ):
+            raise ValueError(
+                "multi-timeframe debate requires a technical review"
+            )
+        technical_review = MultiTimeframeEvidenceReview.model_validate(
+            technical_review.model_dump(exclude_computed_fields=True)
+        )
+        package = technical_review.released_evidence
+        if package is None:
+            raise AgentSubmissionRejectedError(
+                "multi-timeframe debate requires Judge-released evidence"
+            )
+        if event_emitter is not None and not isinstance(
+            event_emitter,
+            WorkflowEventEmitter,
+        ):
+            raise ValueError("debate requires a workflow event emitter")
+        for label, agent, method_name in (
+            ("bull", self.bull_agent, "generate_multi_timeframe_argument"),
+            ("bear", self.bear_agent, "generate_multi_timeframe_argument"),
+            ("judge", self.judge_agent, "render_multi_timeframe_verdict"),
+        ):
+            if not callable(getattr(agent, method_name, None)):
+                raise ValueError(
+                    f"{label} agent does not support multi-timeframe debate"
+                )
+
+        identity = package.technical_analysis.timeframes.hourly
+        session = DebateSession()
+        flat_arguments: tuple[BullBearArgument, ...] = ()
+        for round_number in range(1, self.config.max_rounds + 1):
+            bull_argument = _run_debate_stage(
+                event_emitter,
+                WorkflowStage.BULL_DEBATING,
+                round_number,
+                identity.exchange,
+                identity.symbol,
+                lambda: self.bull_agent.generate_multi_timeframe_argument(
+                    technical_review=technical_review,
+                    transcript_so_far=flat_arguments,
+                    round_number=round_number,
+                ),
+            )
+            flat_arguments = (*flat_arguments, bull_argument)
+            bear_argument = _run_debate_stage(
+                event_emitter,
+                WorkflowStage.BEAR_DEBATING,
+                round_number,
+                identity.exchange,
+                identity.symbol,
+                lambda: self.bear_agent.generate_multi_timeframe_argument(
+                    technical_review=technical_review,
+                    transcript_so_far=flat_arguments,
+                    round_number=round_number,
+                ),
+            )
+            flat_arguments = (*flat_arguments, bear_argument)
+            session.record_round(
+                DebateRound(
+                    round_number=round_number,
+                    bull_argument=bull_argument,
+                    bear_argument=bear_argument,
+                )
+            )
+            if len(session.rounds) >= 2 and _is_stalled(
+                session.rounds[-2],
+                session.rounds[-1],
+            ):
+                session.mark_stalled()
+                break
+        else:
+            session.mark_max_rounds_reached()
+
+        transcript = session.to_transcript()
+        verdict = _run_debate_stage(
+            event_emitter,
+            WorkflowStage.JUDGE_REVIEWING,
+            None,
+            identity.exchange,
+            identity.symbol,
+            lambda: self.judge_agent.render_multi_timeframe_verdict(
+                technical_review=technical_review,
+                transcript=transcript,
+            ),
+        )
+        verdict = _normalize_verdict(
+            verdict,
+            termination_reason=transcript.termination_reason,
+            indecisive_confidence_threshold=(
+                self.config.indecisive_confidence_threshold
+            ),
+        )
+        session.attach_verdict(verdict)
+        submission = BullBearDebateSubmission(
+            submission_id=(
+                f"{SUBMISSION_AGENT_ID}:{package.package_fingerprint}:"
+                f"{self.configuration_fingerprint}"
+            ),
+            agent_id=SUBMISSION_AGENT_ID,
+            technical_submission_id=package.package_fingerprint,
+            technical_decision_id=technical_review.decision.decision_id,
+            input_fingerprint=package.package_fingerprint,
+            configuration_fingerprint=self.configuration_fingerprint,
+            transcript=transcript,
+            verdict=verdict,
+            evaluated_at=verdict.generated_at,
+        )
+        decision = self.structural_judge.review_multi_timeframe(
+            submission,
+            technical_review,
+        )
+        return AgenticDebateResult(
+            orchestrator_id=self.orchestrator_id,
+            submission=submission,
+            decision=decision,
+        )
+
+    def answer_multi_timeframe_follow_up(
+        self,
+        question: str,
+        technical_review: MultiTimeframeEvidenceReview,
+        debate_result: AgenticDebateResult,
+    ) -> JudgeFollowUpAnswer:
+        """Relay Jarvis's follow-up to the same substantive Judge."""
+        if not isinstance(
+            technical_review,
+            MultiTimeframeEvidenceReview,
+        ):
+            raise ValueError(
+                "Judge follow-up requires a technical review"
+            )
+        if not isinstance(debate_result, AgenticDebateResult):
+            raise ValueError("Judge follow-up requires a debate result")
+        technical_review = MultiTimeframeEvidenceReview.model_validate(
+            technical_review.model_dump(exclude_computed_fields=True)
+        )
+        debate_result = AgenticDebateResult.model_validate(
+            debate_result.model_dump(exclude_computed_fields=True)
+        )
+        if not debate_result.decision.accepted:
+            raise AgentSubmissionRejectedError(
+                "Judge follow-up requires an approved debate"
+            )
+        package = technical_review.released_evidence
+        if package is None:
+            raise AgentSubmissionRejectedError(
+                "Judge follow-up requires released technical evidence"
+            )
+        submission = debate_result.submission
+        if (
+            submission.technical_submission_id
+            != package.package_fingerprint
+            or submission.technical_decision_id
+            != technical_review.decision.decision_id
+        ):
+            raise AgentSubmissionRejectedError(
+                "Judge follow-up context does not match the debate"
+            )
+        answer_method = getattr(self.judge_agent, "answer_follow_up", None)
+        if not callable(answer_method):
+            raise ValueError("Judge agent does not support follow-up questions")
+        answer = answer_method(
+            question=question,
+            technical_review=technical_review,
+            verdict=submission.verdict,
+        )
+        if not isinstance(answer, JudgeFollowUpAnswer):
+            raise LLMResponseValidationError(
+                "Judge returned an invalid follow-up response"
+            )
+        answer = JudgeFollowUpAnswer.model_validate(
+            answer.model_dump(exclude_computed_fields=True)
+        )
+        valid_ids = valid_multi_timeframe_evidence_ids(package)
+        if not set(answer.evidence_citations).issubset(valid_ids):
+            raise LLMResponseValidationError(
+                "Judge follow-up cited evidence outside the approved package"
+            )
+        if (
+            answer.technical_package_fingerprint
+            != package.package_fingerprint
+            or answer.debate_verdict_id != submission.verdict.verdict_id
+            or answer.judge_agent_id != self.judge_agent.agent_id
+            or answer.question != question.strip()
+            or answer.generated_at < submission.verdict.generated_at
+        ):
+            raise LLMResponseValidationError(
+                "Judge follow-up does not match the approved analysis context"
+            )
+        return answer
+
 
 def _run_debate_stage(
     emitter: WorkflowEventEmitter | None,
@@ -574,6 +923,18 @@ def _chronological(submission: BullBearDebateSubmission) -> bool:
                 return False
             previous_timestamp = argument.generated_at
     return submission.verdict.generated_at >= previous_timestamp
+
+
+def _round_count_valid(
+    submission: BullBearDebateSubmission,
+    max_rounds: int,
+) -> bool:
+    round_count = submission.transcript.round_count
+    if submission.transcript.termination_reason is (
+        DebateTerminationReason.MAX_ROUNDS_REACHED
+    ):
+        return round_count == max_rounds
+    return 1 <= round_count <= max_rounds
 
 
 def _validate_debate_side_agent(label: str, agent) -> None:

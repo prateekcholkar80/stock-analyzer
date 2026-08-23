@@ -28,6 +28,10 @@ from app.models.agentic import (
 )
 from app.models.execution import HistoricalTradeExecution
 from app.models.market import HistoricalCandleSeries
+from app.models.multi_timeframe_evidence import (
+    MultiTimeframeEvidencePackage,
+    MultiTimeframeEvidenceReview,
+)
 from app.models.signals import (
     SignalCategory,
     SignalProvenance,
@@ -85,150 +89,15 @@ class JarvisSwingJudge:
         market_series: HistoricalCandleSeries,
     ) -> JarvisJudgeDecision:
         """Return an auditable acceptance or rejection verdict."""
-        if not isinstance(submission, TechnicalSwingAgentSubmission):
-            raise ValueError(
-                "Jarvis judge requires a technical agent submission"
-            )
-        submission = TechnicalSwingAgentSubmission.model_validate(
-            submission.model_dump(exclude_computed_fields=True)
+        submission, passed_checks, reasons = technical_submission_checks(
+            submission,
+            market_series,
+            expected_agent_id=self.expected_agent_id,
+            expected_evaluator_id=self.expected_evaluator_id,
+            expected_configuration_fingerprint=(
+                self.expected_configuration_fingerprint
+            ),
         )
-
-        passed_checks = ["submission_schema_valid"]
-        reasons = []
-
-        if submission.agent_id == self.expected_agent_id:
-            passed_checks.append("expected_agent_identity")
-        else:
-            reasons.append("submission came from an unexpected agent")
-
-        if submission.evaluator_id == self.expected_evaluator_id:
-            passed_checks.append("expected_evaluator_version")
-        else:
-            reasons.append(
-                "submission used an unexpected evaluator version"
-            )
-
-        if (
-            submission.configuration_fingerprint
-            == self.expected_configuration_fingerprint
-        ):
-            passed_checks.append("expected_evaluator_configuration")
-        else:
-            reasons.append(
-                "submission used an unexpected evaluator configuration"
-            )
-
-        market_identity = (
-            market_series.exchange,
-            market_series.symbol_token,
-            market_series.symbol,
-            market_series.interval,
-            market_series.source,
-            market_series.retrieved_at,
-        )
-        submission_identity = (
-            submission.exchange,
-            submission.symbol_token,
-            submission.symbol,
-            submission.interval,
-            submission.source,
-            submission.source_retrieved_at,
-        )
-        if submission_identity == market_identity:
-            passed_checks.append("market_source_identity")
-        else:
-            reasons.append(
-                "submission does not match the assigned market source"
-            )
-
-        if submission.input_fingerprint == market_series_fingerprint(
-            market_series
-        ):
-            passed_checks.append("exact_market_prefix_fingerprint")
-        else:
-            reasons.append(
-                "submission fingerprint does not match the assigned "
-                "market prefix"
-            )
-
-        if (
-            submission.input_candle_count
-            == len(market_series.candles)
-        ):
-            passed_checks.append("input_candle_count")
-        else:
-            reasons.append(
-                "submission candle count does not match the assigned "
-                "prefix"
-            )
-
-        latest_timestamp = (
-            market_series.candles[-1].timestamp
-            if market_series.candles
-            else None
-        )
-        if submission.evaluated_at == latest_timestamp:
-            passed_checks.append("point_in_time_boundary")
-        else:
-            reasons.append(
-                "submission was not evaluated at the assigned prefix "
-                "boundary"
-            )
-
-        evidence = submission.profile.snapshot.evidence
-        if all(
-            item.provenance is SignalProvenance.DETERMINISTIC
-            for item in evidence
-        ):
-            passed_checks.append("deterministic_evidence")
-        else:
-            reasons.append(
-                "submission contains non-deterministic technical evidence"
-            )
-
-        availability_times = {
-            item.available_at
-            for item in evidence
-        }
-        if availability_times == {submission.evaluated_at}:
-            passed_checks.append("synchronized_evidence")
-        else:
-            reasons.append(
-                "submission evidence is not synchronized to evaluation"
-            )
-
-        sources = {item.source for item in evidence}
-        if (
-            sources == UNIFIED_SWING_EVIDENCE_SOURCES
-            and len(evidence) == len(UNIFIED_SWING_EVIDENCE_SOURCES)
-        ):
-            passed_checks.append("required_evidence_sources")
-        else:
-            reasons.append(
-                "submission does not contain the complete unified "
-                "evidence set"
-            )
-
-        if set(submission.profile.covered_categories) == set(
-            SignalCategory
-        ):
-            passed_checks.append("all_signal_categories")
-        else:
-            reasons.append(
-                "submission does not cover every technical category"
-            )
-
-        if isclose(
-            submission.profile.coverage_percentage,
-            100.0,
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        ):
-            passed_checks.append("full_weighted_coverage")
-        else:
-            reasons.append(
-                "submission does not provide full weighted coverage"
-            )
 
         verdict = (
             JarvisJudgeVerdict.REJECTED
@@ -246,6 +115,283 @@ class JarvisSwingJudge:
             passed_checks=tuple(passed_checks),
             reasons=tuple(reasons),
         )
+
+    def review_multi_timeframe(
+        self,
+        evidence_package: MultiTimeframeEvidencePackage,
+        assigned_analysis: object,
+    ) -> JarvisJudgeDecision:
+        """Gate a complete daily/weekly package without interpreting it."""
+        from app.models.timeframes import MultiTimeframeTechnicalAnalysis
+
+        if not isinstance(
+            evidence_package,
+            MultiTimeframeEvidencePackage,
+        ):
+            raise ValueError(
+                "multi-timeframe review requires a validated evidence package"
+            )
+        if not isinstance(
+            assigned_analysis,
+            MultiTimeframeTechnicalAnalysis,
+        ):
+            raise ValueError(
+                "multi-timeframe review requires its assigned analysis"
+            )
+        evidence_package = MultiTimeframeEvidencePackage.model_validate(
+            evidence_package.model_dump(exclude_computed_fields=True)
+        )
+        assigned_analysis = MultiTimeframeTechnicalAnalysis.model_validate(
+            assigned_analysis.model_dump(exclude_computed_fields=True)
+        )
+
+        passed_checks = ["multi_timeframe_package_schema_valid"]
+        reasons: list[str] = []
+        if evidence_package.technical_analysis == assigned_analysis:
+            passed_checks.append("exact_multi_timeframe_assignment")
+        else:
+            reasons.append(
+                "evidence package does not match the assigned analysis"
+            )
+
+        analysis = evidence_package.technical_analysis
+        if analysis.execution_mode == "parallel":
+            passed_checks.append("parallel_timeframe_execution_complete")
+        else:
+            reasons.append("daily and weekly execution was not parallel")
+        for label, submission, receipt, series in (
+            (
+                "daily",
+                analysis.daily_submission,
+                analysis.daily_validation,
+                analysis.timeframes.daily,
+            ),
+            (
+                "weekly",
+                analysis.weekly_submission,
+                analysis.weekly_validation,
+                analysis.timeframes.weekly,
+            ),
+        ):
+            _, recomputed_checks, submission_reasons = (
+                technical_submission_checks(
+                    submission,
+                    series,
+                    expected_agent_id=submission.agent_id,
+                    expected_evaluator_id=submission.evaluator_id,
+                    expected_configuration_fingerprint=(
+                        submission.configuration_fingerprint
+                    ),
+                )
+            )
+            expected_validation_id = (
+                f"{receipt.validator_id}:{label}:"
+                f"{submission.input_fingerprint}"
+            )
+            receipt_matches = (
+                receipt.accepted
+                and receipt.validation_id == expected_validation_id
+                and receipt.passed_checks == tuple(recomputed_checks)
+            )
+            if not submission_reasons and receipt_matches:
+                passed_checks.append(
+                    f"{label}_technical_submission_approved"
+                )
+            else:
+                reasons.append(
+                    f"{label} technical validation receipt is invalid"
+                )
+
+        daily_ids = {
+            item.qualified_evidence_id
+            for item in evidence_package.daily.evidence
+        }
+        weekly_ids = {
+            item.qualified_evidence_id
+            for item in evidence_package.weekly.evidence
+        }
+        expected_count = len(UNIFIED_SWING_EVIDENCE_SOURCES)
+        if (
+            len(daily_ids) == expected_count
+            and len(weekly_ids) == expected_count
+        ):
+            passed_checks.append("complete_daily_and_weekly_evidence")
+        else:
+            reasons.append(
+                "daily and weekly evidence sets must both be complete"
+            )
+        if daily_ids.isdisjoint(weekly_ids):
+            passed_checks.append("timeframe_evidence_ids_disjoint")
+        else:
+            reasons.append("daily and weekly evidence ids must be disjoint")
+
+        passed_checks.extend(
+            (
+                "timeframe_lineage_verified",
+                "package_fingerprint_verified",
+                "point_in_time_structure_verified",
+                "evidence_preserved_without_reinterpretation",
+            )
+        )
+        verdict = (
+            JarvisJudgeVerdict.REJECTED
+            if reasons
+            else JarvisJudgeVerdict.ACCEPTED
+        )
+        decided_at = max(
+            evidence_package.daily.evaluated_at,
+            evidence_package.weekly.evaluated_at,
+        )
+        return JarvisJudgeDecision(
+            decision_id=(
+                f"{self.judge_id}:multi_timeframe:"
+                f"{evidence_package.package_fingerprint}"
+            ),
+            judge_id=self.judge_id,
+            submission_id=evidence_package.package_fingerprint,
+            verdict=verdict,
+            decided_at=decided_at,
+            passed_checks=tuple(passed_checks),
+            reasons=tuple(reasons),
+        )
+
+
+def technical_submission_checks(
+    submission: TechnicalSwingAgentSubmission,
+    market_series: HistoricalCandleSeries,
+    *,
+    expected_agent_id: str,
+    expected_evaluator_id: str,
+    expected_configuration_fingerprint: str,
+) -> tuple[TechnicalSwingAgentSubmission, list[str], list[str]]:
+    """Apply technical chain-of-custody checks without forming an opinion."""
+    if not isinstance(submission, TechnicalSwingAgentSubmission):
+        raise ValueError(
+            "technical validation requires a technical agent submission"
+        )
+    submission = TechnicalSwingAgentSubmission.model_validate(
+        submission.model_dump(exclude_computed_fields=True)
+    )
+    expected_agent = _validate_identifier(
+        "expected agent",
+        expected_agent_id,
+    )
+    expected_evaluator = _validate_identifier(
+        "expected evaluator",
+        expected_evaluator_id,
+    )
+    expected_fingerprint = _validate_fingerprint(
+        "expected evaluator configuration",
+        expected_configuration_fingerprint,
+    )
+
+    passed_checks = ["submission_schema_valid"]
+    reasons: list[str] = []
+    if submission.agent_id == expected_agent:
+        passed_checks.append("expected_agent_identity")
+    else:
+        reasons.append("submission came from an unexpected agent")
+    if submission.evaluator_id == expected_evaluator:
+        passed_checks.append("expected_evaluator_version")
+    else:
+        reasons.append("submission used an unexpected evaluator version")
+    if submission.configuration_fingerprint == expected_fingerprint:
+        passed_checks.append("expected_evaluator_configuration")
+    else:
+        reasons.append(
+            "submission used an unexpected evaluator configuration"
+        )
+
+    market_identity = (
+        market_series.exchange,
+        market_series.symbol_token,
+        market_series.symbol,
+        market_series.interval,
+        market_series.source,
+        market_series.retrieved_at,
+    )
+    submission_identity = (
+        submission.exchange,
+        submission.symbol_token,
+        submission.symbol,
+        submission.interval,
+        submission.source,
+        submission.source_retrieved_at,
+    )
+    if submission_identity == market_identity:
+        passed_checks.append("market_source_identity")
+    else:
+        reasons.append("submission does not match the assigned market source")
+    if submission.input_fingerprint == market_series_fingerprint(
+        market_series
+    ):
+        passed_checks.append("exact_market_prefix_fingerprint")
+    else:
+        reasons.append(
+            "submission fingerprint does not match the assigned market prefix"
+        )
+    if submission.input_candle_count == len(market_series.candles):
+        passed_checks.append("input_candle_count")
+    else:
+        reasons.append(
+            "submission candle count does not match the assigned prefix"
+        )
+
+    latest_timestamp = (
+        market_series.candles[-1].timestamp
+        if market_series.candles
+        else None
+    )
+    if submission.evaluated_at == latest_timestamp:
+        passed_checks.append("point_in_time_boundary")
+    else:
+        reasons.append(
+            "submission was not evaluated at the assigned prefix boundary"
+        )
+    evidence = submission.profile.snapshot.evidence
+    if all(
+        item.provenance is SignalProvenance.DETERMINISTIC
+        for item in evidence
+    ):
+        passed_checks.append("deterministic_evidence")
+    else:
+        reasons.append(
+            "submission contains non-deterministic technical evidence"
+        )
+    if {item.available_at for item in evidence} == {
+        submission.evaluated_at
+    }:
+        passed_checks.append("synchronized_evidence")
+    else:
+        reasons.append(
+            "submission evidence is not synchronized to evaluation"
+        )
+    sources = {item.source for item in evidence}
+    if (
+        sources == UNIFIED_SWING_EVIDENCE_SOURCES
+        and len(evidence) == len(UNIFIED_SWING_EVIDENCE_SOURCES)
+    ):
+        passed_checks.append("required_evidence_sources")
+    else:
+        reasons.append(
+            "submission does not contain the complete unified evidence set"
+        )
+    if set(submission.profile.covered_categories) == set(SignalCategory):
+        passed_checks.append("all_signal_categories")
+    else:
+        reasons.append(
+            "submission does not cover every technical category"
+        )
+    if isclose(
+        submission.profile.coverage_percentage,
+        100.0,
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        passed_checks.append("full_weighted_coverage")
+    else:
+        reasons.append("submission does not provide full weighted coverage")
+    return submission, passed_checks, reasons
 
 
 class JarvisTradePlanJudge:
@@ -613,6 +759,74 @@ class AgentOrchestrator:
             submission=submission,
             decision=decision,
         )
+
+    def run_multi_timeframe_analysis(
+        self,
+        timeframes: object,
+        *,
+        timeframe_orchestrator: object | None = None,
+        evidence_builder: object | None = None,
+    ) -> MultiTimeframeEvidenceReview:
+        """Wait for both technical agents and ask the same Judge to release."""
+        from app.models.timeframes import SwingTimeframeSeries
+        from app.orchestration.timeframe_technical_orchestrator import (
+            ParallelTimeframeTechnicalOrchestrator,
+        )
+        from app.use_cases.build_multi_timeframe_evidence import (
+            BuildMultiTimeframeEvidence,
+        )
+
+        if not isinstance(timeframes, SwingTimeframeSeries):
+            raise ValueError(
+                "multi-timeframe analysis requires swing timeframe series"
+            )
+        technical_runner = (
+            timeframe_orchestrator
+            or ParallelTimeframeTechnicalOrchestrator()
+        )
+        if not callable(getattr(technical_runner, "execute", None)):
+            raise ValueError(
+                "multi-timeframe technical orchestrator must provide execute()"
+            )
+        builder = evidence_builder or BuildMultiTimeframeEvidence()
+        if not callable(getattr(builder, "execute", None)):
+            raise ValueError(
+                "multi-timeframe evidence builder must provide execute()"
+            )
+        review = getattr(self.judge, "review_multi_timeframe", None)
+        if not callable(review):
+            raise ValueError(
+                "existing Jarvis Judge must provide review_multi_timeframe()"
+            )
+
+        analysis = technical_runner.execute(timeframes)
+        evidence_package = builder.execute(analysis)
+        decision = review(evidence_package, analysis)
+        return MultiTimeframeEvidenceReview(
+            orchestrator_id=self.orchestrator_id,
+            evidence_package=evidence_package,
+            decision=decision,
+        )
+
+    def require_released_multi_timeframe_evidence(
+        self,
+        timeframes: object,
+        *,
+        timeframe_orchestrator: object | None = None,
+        evidence_builder: object | None = None,
+    ) -> MultiTimeframeEvidencePackage:
+        """Return debate input only when both submissions pass Judge review."""
+        result = self.run_multi_timeframe_analysis(
+            timeframes,
+            timeframe_orchestrator=timeframe_orchestrator,
+            evidence_builder=evidence_builder,
+        )
+        if result.released_evidence is None:
+            reasons = "; ".join(result.decision.reasons)
+            raise AgentSubmissionRejectedError(
+                "Jarvis rejected multi-timeframe evidence: " + reasons
+            )
+        return result.released_evidence
 
     def evaluate_swing_prefix(
         self,

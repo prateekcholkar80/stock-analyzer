@@ -4,7 +4,7 @@ from datetime import datetime
 from pydantic import ValidationError
 
 from app.exceptions import LLMConfigurationError
-from app.llm.config import LLMRole, LLMSettings
+from app.llm.config import DEBATE_LLM_ROLES, LLMRole, LLMSettings
 from app.llm.factory import LLMGatewayFactory
 from app.llm.preflight import LLMPreflightValidator
 from app.logging_config import operation_context
@@ -286,7 +286,7 @@ class LLMPreflightModelTests(unittest.TestCase):
         )
 
     def test_result_rejects_incomplete_duplicate_or_unready_panel(self):
-        valid_roles = tuple(self._role(role) for role in LLMRole)
+        valid_roles = tuple(self._role(role) for role in DEBATE_LLM_ROLES)
         cases = (
             valid_roles[:2],
             (valid_roles[0], valid_roles[0], valid_roles[2]),
@@ -310,7 +310,7 @@ class LLMPreflightModelTests(unittest.TestCase):
                     )
 
     def test_result_rejects_naive_timestamp(self):
-        roles = tuple(self._role(role) for role in LLMRole)
+        roles = tuple(self._role(role) for role in DEBATE_LLM_ROLES)
 
         with self.assertRaises(ValidationError):
             LLMPreflightResult(
@@ -321,7 +321,7 @@ class LLMPreflightModelTests(unittest.TestCase):
             )
 
     def test_result_rejects_invalid_fingerprint(self):
-        roles = tuple(self._role(role) for role in LLMRole)
+        roles = tuple(self._role(role) for role in DEBATE_LLM_ROLES)
 
         with self.assertRaises(ValidationError):
             LLMPreflightResult(

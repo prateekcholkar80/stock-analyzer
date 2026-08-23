@@ -34,6 +34,25 @@ class LLMSettingsTests(unittest.TestCase):
             settings.for_role(LLMRole.JUDGE).model,
             "openai/test-model",
         )
+        self.assertEqual(
+            settings.for_role(LLMRole.JARVIS).model,
+            "openai/test-model",
+        )
+
+    def test_persona_can_override_shared_model_and_generation_settings(self):
+        settings = LLMSettings.from_environment(
+            {
+                "JARVIS_LLM_MODEL": "provider/shared",
+                "JARVIS_PERSONA_LLM_MODEL": "provider/presenter",
+                "JARVIS_PERSONA_LLM_TEMPERATURE": "0.1",
+                "JARVIS_PERSONA_LLM_MAX_TOKENS": "3000",
+            }
+        )
+
+        persona = settings.for_role(LLMRole.JARVIS)
+        self.assertEqual(persona.model, "provider/presenter")
+        self.assertEqual(persona.temperature, 0.1)
+        self.assertEqual(persona.max_tokens, 3000)
 
     def test_role_specific_model_overrides_shared_model(self):
         settings = LLMSettings.from_environment(
@@ -147,6 +166,10 @@ class LLMSettingsTests(unittest.TestCase):
                 temperature=0.0,
                 max_tokens=600,
             ),
+        )
+        self.assertEqual(
+            settings.for_role(LLMRole.JARVIS).max_tokens,
+            5000,
         )
 
     def test_rejects_invalid_temperature_for_each_role(self):

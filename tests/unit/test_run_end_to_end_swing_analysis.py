@@ -11,7 +11,7 @@ from app.agents.debate_judge_agent import DebateJudgeAgent
 from app.agents.technical_swing_agent import TechnicalSwingAgent
 from app.exceptions import AgentSubmissionRejectedError
 from app.llm.gateway import StructuredGeneration
-from app.llm.config import LLMRole
+from app.llm.config import DEBATE_LLM_ROLES, LLMRole
 from app.models.llm import LLMPreflightResult, LLMRolePreflight
 from app.models.agentic import (
     AgenticSwingAnalysisResult,
@@ -119,7 +119,7 @@ def _successful_llm_preflight():
                 credential_ready=True,
                 structured_gateway_ready=True,
             )
-            for role in LLMRole
+            for role in DEBATE_LLM_ROLES
         ),
         checked_at=datetime.now(UTC),
         ready=True,

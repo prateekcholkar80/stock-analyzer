@@ -76,7 +76,7 @@ _SECRET_ASSIGNMENT_PATTERN = re.compile(
         \b
         (?:
             angel[_-]?api[_-]?key
-            | api[_-]?key
+            | (?:[a-z0-9]+[_-])*api[_-]?key
             | angel[_-]?client[_-]?code
             | client[_-]?code
             | angel[_-]?pin
@@ -112,9 +112,9 @@ def _normalize_field_name(name: object) -> str:
 
 
 def _is_sensitive_field(name: object) -> bool:
-    return (
-        _normalize_field_name(name)
-        in _SENSITIVE_FIELD_NAMES
+    normalized = _normalize_field_name(name)
+    return normalized in _SENSITIVE_FIELD_NAMES or normalized.endswith(
+        ("apikey", "clientsecret", "totpsecret")
     )
 
 
@@ -158,6 +158,11 @@ def _redact_value(value: Any) -> Any:
         return _redact_text(value)
 
     return value
+
+
+def redact_for_logging(value: Any) -> Any:
+    """Return a recursively redacted value safe for diagnostic logs."""
+    return _redact_value(value)
 
 
 def create_operation_id() -> str:

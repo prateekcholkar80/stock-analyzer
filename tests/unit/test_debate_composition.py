@@ -1,16 +1,22 @@
 import unittest
 from datetime import UTC, datetime
 
+from app.audit.prompt_audit import InMemoryPromptAuditSink
 from app.composition.debate import (
     compose_end_to_end_swing_analysis,
+    compose_end_to_end_multi_timeframe_swing_analysis,
     compose_full_debate,
 )
 from app.exceptions import LLMConfigurationError
-from app.llm.config import LLMRole, LLMSettings
+from app.llm.config import DEBATE_LLM_ROLES, LLMRole, LLMSettings
+from app.llm.audited_gateway import PromptAuditedLLMGateway
 from app.llm.preflight import LLMPreflightValidator
 from app.models.llm import LLMPreflightResult, LLMRolePreflight
 from app.use_cases.run_end_to_end_swing_analysis import (
     RunEndToEndSwingAnalysis,
+)
+from app.use_cases.run_end_to_end_multi_timeframe_swing_analysis import (
+    RunEndToEndMultiTimeframeSwingAnalysis,
 )
 
 
@@ -67,7 +73,7 @@ def _ready_result(*, fingerprint):
                 credential_ready=True,
                 structured_gateway_ready=True,
             )
-            for role in LLMRole
+            for role in DEBATE_LLM_ROLES
         ),
         checked_at=datetime.now(UTC),
         ready=True,
@@ -106,7 +112,7 @@ class FullDebateCompositionTests(unittest.TestCase):
         )
 
         self.assertTrue(composition.preflight_result.ready)
-        self.assertEqual(set(builder.gateways), set(LLMRole))
+        self.assertEqual(set(builder.gateways), set(DEBATE_LLM_ROLES))
         self.assertIs(
             composition.orchestrator.bull_agent._gateway,
             builder.gateways[LLMRole.BULL],
@@ -136,7 +142,32 @@ class FullDebateCompositionTests(unittest.TestCase):
         )
 
         self.assertEqual(len(builder.gateways), 3)
-        for role in LLMRole:
+        for role in DEBATE_LLM_ROLES:
+            self.assertIs(
+                composition.gateway_factory.for_role(role),
+                builder.gateways[role],
+            )
+
+    def test_wraps_agent_gateways_only_when_prompt_audit_is_enabled(self):
+        builder = RecordingGatewayBuilder()
+
+        composition = compose_full_debate(
+            settings=LLMSettings.from_environment(
+                {"JARVIS_LLM_MODEL": "provider/model"}
+            ),
+            gateway_builder=builder,
+            preflight_builder=_preflight_builder(),
+            prompt_audit_sink=InMemoryPromptAuditSink(),
+        )
+
+        gateways = {
+            LLMRole.BULL: composition.orchestrator.bull_agent._gateway,
+            LLMRole.BEAR: composition.orchestrator.bear_agent._gateway,
+            LLMRole.JUDGE: composition.orchestrator.judge_agent._gateway,
+        }
+        for role, gateway in gateways.items():
+            self.assertIsInstance(gateway, PromptAuditedLLMGateway)
+            self.assertIs(gateway._gateway, builder.gateways[role])
             self.assertIs(
                 composition.gateway_factory.for_role(role),
                 builder.gateways[role],
@@ -169,6 +200,25 @@ class FullDebateCompositionTests(unittest.TestCase):
         )
 
         self.assertIsInstance(use_case, RunEndToEndSwingAnalysis)
+        self.assertIs(use_case.rolling_fetch, rolling_fetch)
+        self.assertTrue(use_case.llm_preflight.ready)
+
+    def test_composes_multi_timeframe_conversation_use_case(self):
+        rolling_fetch = object()
+
+        use_case = compose_end_to_end_multi_timeframe_swing_analysis(
+            rolling_fetch,
+            settings=LLMSettings.from_environment(
+                {"JARVIS_LLM_MODEL": "provider/model"}
+            ),
+            gateway_builder=RecordingGatewayBuilder(),
+            preflight_builder=_preflight_builder(),
+        )
+
+        self.assertIsInstance(
+            use_case,
+            RunEndToEndMultiTimeframeSwingAnalysis,
+        )
         self.assertIs(use_case.rolling_fetch, rolling_fetch)
         self.assertTrue(use_case.llm_preflight.ready)
 

@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 import litellm
 
 from app.exceptions import LLMConfigurationError
-from app.llm.config import LLMRole
+from app.llm.config import DEBATE_LLM_ROLES, LLMRole
 from app.llm.factory import LLMGatewayFactory
 from app.logging_config import get_operation_id
 from app.models.llm import LLMPreflightResult, LLMRolePreflight
@@ -52,7 +52,7 @@ class LLMPreflightValidator:
 
     def validate_full_debate(self) -> LLMPreflightResult:
         resolved: list[tuple[LLMRole, str, str]] = []
-        for role in LLMRole:
+        for role in DEBATE_LLM_ROLES:
             role_settings = self._factory.settings.for_role(role)
             try:
                 _, provider, _, _ = self._provider_resolver(

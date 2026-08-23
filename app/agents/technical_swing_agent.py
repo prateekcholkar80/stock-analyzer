@@ -67,6 +67,38 @@ class TechnicalSwingAgent:
         )
 
 
+class _TimeframeTechnicalSwingAgent(TechnicalSwingAgent):
+    expected_interval: str
+
+    def execute(
+        self,
+        market_series: HistoricalCandleSeries,
+    ) -> TechnicalSwingAgentSubmission:
+        if not isinstance(market_series, HistoricalCandleSeries):
+            raise ValueError(
+                "timeframe technical agent requires a validated series"
+            )
+        if market_series.interval != self.expected_interval:
+            raise ValueError(
+                f"{self.agent_id} requires {self.expected_interval} candles"
+            )
+        return super().execute(market_series)
+
+
+class DailyTechnicalSwingAgent(_TimeframeTechnicalSwingAgent):
+    """Own the deterministic daily swing-analysis assignment."""
+
+    agent_id = "jarvis.daily_technical_swing_agent.v1"
+    expected_interval = "ONE_DAY"
+
+
+class WeeklyTechnicalSwingAgent(_TimeframeTechnicalSwingAgent):
+    """Own the deterministic weekly swing-analysis assignment."""
+
+    agent_id = "jarvis.weekly_technical_swing_agent.v1"
+    expected_interval = "ONE_WEEK"
+
+
 def market_series_fingerprint(
     market_series: HistoricalCandleSeries,
 ) -> str:

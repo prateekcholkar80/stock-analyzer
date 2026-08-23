@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
-from app.llm.config import LLMRole
+from app.llm.config import DEBATE_LLM_ROLES, LLMRole
 from app.models.technical import TechnicalModel
 
 
@@ -98,7 +98,7 @@ class LLMPreflightResult(TechnicalModel):
 
     @model_validator(mode="after")
     def require_complete_ready_panel(self) -> "LLMPreflightResult":
-        expected = set(LLMRole)
+        expected = set(DEBATE_LLM_ROLES)
         observed = {item.role for item in self.roles}
         if observed != expected or len(observed) != len(self.roles):
             raise ValueError("LLM preflight must contain each debate role")
