@@ -117,7 +117,7 @@ class UnifiedSwingEvaluatorTests(unittest.TestCase):
     def test_indicator_and_price_action_parameters_are_auditable(self):
         config = UnifiedSwingEvaluatorConfig(
             fast_ema_period=10,
-            slow_sma_period=30,
+            slow_ema_period=30,
             pivot_left_strength=3,
             pivot_right_strength=2,
             support_resistance_tolerance_percentage=0.75,
@@ -147,7 +147,11 @@ class UnifiedSwingEvaluatorTests(unittest.TestCase):
         )
         self.assertEqual(
             moving_average.observed_values["slow_indicator"],
-            "SMA",
+            "EMA",
+        )
+        self.assertEqual(
+            moving_average.evidence_id,
+            "ma_alignment.ema10.ema30.close",
         )
 
         fair_value_gap = by_source[
@@ -252,6 +256,21 @@ class UnifiedSwingEvaluatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "validated evaluator"):
             UnifiedSwingEvaluator({"fast_ema_period": 10})
 
+    def test_migrates_legacy_slow_sma_period_to_slow_ema(self):
+        config = UnifiedSwingEvaluatorConfig(slow_sma_period=40)
+
+        self.assertEqual(config.slow_ema_period, 40)
+        self.assertNotIn("slow_sma_period", config.model_dump())
+
+        with self.assertRaisesRegex(
+            ValidationError,
+            "cannot disagree",
+        ):
+            UnifiedSwingEvaluatorConfig(
+                slow_sma_period=40,
+                slow_ema_period=50,
+            )
+
     def test_configuration_is_immutable(self):
         config = UnifiedSwingEvaluatorConfig()
 
@@ -263,7 +282,7 @@ class UnifiedSwingEvaluatorTests(unittest.TestCase):
             self.market(54)
         )
 
-        self.assertEqual(result.analysis_version, "jarvis.unified_swing.v1")
+        self.assertEqual(result.analysis_version, "jarvis.unified_swing.v2")
         self.assertEqual(
             result.evaluator_name,
             "jarvis.agent_orchestrator.v1",

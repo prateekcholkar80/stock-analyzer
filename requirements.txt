@@ -10,3 +10,5 @@ TA-Lib
 logzero
 websocket-client
 litellm
+fastapi
+uvicorn[standard]

@@ -29,6 +29,7 @@ class SwingCommandHandler(Protocol):
         *,
         operation_id: str | None = None,
         event_emitter: WorkflowEventEmitter | None = None,
+        emit_terminal_event: bool = True,
     ) -> JarvisSwingAnalysisResponse:
         ...
 
@@ -71,12 +72,27 @@ class JarvisSwingResearchFacade:
         text: str,
         *,
         to_date: datetime | None = None,
+        operation_id: str | None = None,
+        event_emitter: WorkflowEventEmitter | None = None,
+        manage_terminal_events: bool = True,
     ) -> JarvisSwingAnalysisResponse:
-        with operation_context() as operation_id:
-            emitter = WorkflowEventEmitter(
-                operation_id,
-                self._event_sink,
+        if not isinstance(manage_terminal_events, bool):
+            raise ValueError("terminal-event policy must be a boolean")
+        with operation_context(operation_id) as active_operation_id:
+            emitter = (
+                event_emitter
+                if event_emitter is not None
+                else WorkflowEventEmitter(
+                    active_operation_id,
+                    self._event_sink,
+                )
             )
+            if not isinstance(emitter, WorkflowEventEmitter):
+                raise ValueError("research façade requires a workflow emitter")
+            if emitter.operation_id != active_operation_id:
+                raise ValueError(
+                    "research emitter operation ID does not match"
+                )
             emitter.emit(
                 WorkflowStage.REQUEST_RECEIVED,
                 WorkflowEventState.COMPLETED,
@@ -91,16 +107,18 @@ class JarvisSwingResearchFacade:
                     to_date=to_date,
                 )
             except Exception:
-                emitter.emit(
-                    WorkflowStage.FAILED,
-                    WorkflowEventState.FAILED,
-                )
+                if manage_terminal_events:
+                    emitter.emit(
+                        WorkflowStage.FAILED,
+                        WorkflowEventState.FAILED,
+                    )
                 raise
             if not isinstance(command, SwingAnalysisCommand):
-                emitter.emit(
-                    WorkflowStage.FAILED,
-                    WorkflowEventState.FAILED,
-                )
+                if manage_terminal_events:
+                    emitter.emit(
+                        WorkflowStage.FAILED,
+                        WorkflowEventState.FAILED,
+                    )
                 raise ValueError(
                     "swing request resolver returned an invalid command"
                 )
@@ -110,28 +128,32 @@ class JarvisSwingResearchFacade:
                 exchange=command.exchange,
                 symbol=command.symbol,
             )
-            response = self._command_handler.execute(
-                command,
-                operation_id=operation_id,
-                event_emitter=emitter,
-            )
+            command_kwargs = {
+                "operation_id": active_operation_id,
+                "event_emitter": emitter,
+            }
+            if not manage_terminal_events:
+                command_kwargs["emit_terminal_event"] = False
+            response = self._command_handler.execute(command, **command_kwargs)
             if not isinstance(response, JarvisSwingAnalysisResponse):
-                emitter.emit(
-                    WorkflowStage.FAILED,
-                    WorkflowEventState.FAILED,
-                    exchange=command.exchange,
-                    symbol=command.symbol,
-                )
+                if manage_terminal_events:
+                    emitter.emit(
+                        WorkflowStage.FAILED,
+                        WorkflowEventState.FAILED,
+                        exchange=command.exchange,
+                        symbol=command.symbol,
+                    )
                 raise ValueError(
                     "swing command handler returned an invalid response"
                 )
-            if response.operation_id != operation_id:
-                emitter.emit(
-                    WorkflowStage.FAILED,
-                    WorkflowEventState.FAILED,
-                    exchange=command.exchange,
-                    symbol=command.symbol,
-                )
+            if response.operation_id != active_operation_id:
+                if manage_terminal_events:
+                    emitter.emit(
+                        WorkflowStage.FAILED,
+                        WorkflowEventState.FAILED,
+                        exchange=command.exchange,
+                        symbol=command.symbol,
+                    )
                 raise ValueError(
                     "swing command response operation ID does not match"
                 )

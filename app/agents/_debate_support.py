@@ -64,6 +64,12 @@ def valid_multi_timeframe_evidence_ids(
         ):
             if zone is not None:
                 identifiers.add(zone.qualified_zone_id)
+        for accumulation_zone in context.accumulation.zones:
+            identifiers.add(accumulation_zone.zone_id)
+            identifiers.update(accumulation_zone.evidence_ids)
+            for sweep in accumulation_zone.liquidity_sweeps:
+                identifiers.add(sweep.sweep_id)
+                identifiers.update(sweep.evidence_ids)
     return frozenset(identifiers)
 
 
@@ -111,6 +117,7 @@ def _serialize_timeframe_context(
         _serialize_zone("Immediate resistance", context.nearest_resistance),
         _serialize_latest_pivot("Latest confirmed high", context.latest_confirmed_high),
         _serialize_latest_pivot("Latest confirmed low", context.latest_confirmed_low),
+        _serialize_accumulation(context),
         "Qualified deterministic signals:",
     ]
     lines.extend(
@@ -136,6 +143,53 @@ def _serialize_timeframe_context(
             )
             for item in context.recent_confirmed_pivots
         )
+    return "\n".join(lines)
+
+
+def _serialize_accumulation(
+    context: TimeframeTechnicalEvidenceContext,
+) -> str:
+    zones = context.accumulation.zones
+    if not zones:
+        return (
+            "Accumulation and liquidity sweeps: no deterministic zone "
+            "qualified at this evaluation; do not infer one."
+        )
+    lines = ["Qualified accumulation and liquidity-sweep evidence:"]
+    for zone in zones:
+        metrics = zone.metrics
+        lines.append(
+            f"- id={zone.zone_id} range={zone.lower_price}-{zone.upper_price} "
+            f"state={zone.current_state.value} active={zone.is_active} "
+            f"confidence_pct={metrics.confidence_score} "
+            f"base={zone.base_started_at.isoformat()}.."
+            f"{zone.base_last_observed_at.isoformat()} "
+            f"range_width_pct={metrics.range_width_percentage} "
+            f"atr_compression_pct={metrics.atr_compression_percentage} "
+            f"close_containment_pct={metrics.close_containment_percentage} "
+            f"bullish_volume_share_pct={metrics.bullish_volume_share_percentage} "
+            f"obv_slope={metrics.obv_slope} "
+            f"evidence_ids={list(zone.evidence_ids)}"
+        )
+        for event in zone.lifecycle:
+            lines.append(
+                f"  lifecycle state={event.state.value} "
+                f"available_at={event.available_at.isoformat()} "
+                f"evidence_ids={list(event.evidence_ids)} "
+                f"explanation={event.explanation}"
+            )
+        for sweep in zone.liquidity_sweeps:
+            lines.append(
+                f"  sweep id={sweep.sweep_id} "
+                f"side={sweep.liquidity_side.value} "
+                f"implication={sweep.implication.value} "
+                f"reference={sweep.reference_price} "
+                f"extreme={sweep.extreme_price} "
+                f"reclaim_close={sweep.reclaim_close_price} "
+                f"available_at={sweep.available_at.isoformat()} "
+                f"evidence_ids={list(sweep.evidence_ids)} "
+                f"explanation={sweep.explanation}"
+            )
     return "\n".join(lines)
 
 

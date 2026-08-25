@@ -23,7 +23,7 @@ class PatternSwingIntentInterpreter:
             r"(?:look|looking|doing|performing)(?:\s+today)?"
             r"(?:\s+for\s+(?:a\s+)?swing(?:\s+trade)?)?$",
             r"^(?:analy[sz]e|review|check)\s+(?P<instrument>.+?)"
-            r"(?:\s+for\s+(?:a\s+)?swing(?:\s+trade)?)$",
+            r"(?:\s+for\s+(?:(?:a\s+)?swing(?:\s+trade)?|me))?$",
             r"^(?:give\s+me\s+)?(?:a\s+)?swing(?:\s+trade)?\s+"
             r"analysis\s+(?:for|on)\s+(?P<instrument>.+)$",
         )

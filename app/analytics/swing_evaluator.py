@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Self
 
@@ -19,7 +20,6 @@ from app.analytics.indicators import (
     calculate_macd,
     calculate_obv,
     calculate_rsi,
-    calculate_sma,
     calculate_stochastic,
 )
 from app.analytics.momentum_signals import (
@@ -74,13 +74,13 @@ class UnifiedSwingEvaluatorConfig(TechnicalModel):
     )
 
     evaluator_id: str = Field(
-        default="jarvis.unified_swing.v1",
+        default="jarvis.unified_swing.v2",
         min_length=1,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
     )
 
     fast_ema_period: int = Field(default=20, ge=1)
-    slow_sma_period: int = Field(default=50, ge=1)
+    slow_ema_period: int = Field(default=50, ge=1)
     rsi_period: int = Field(default=14, ge=1)
     macd_fast_period: int = Field(default=12, ge=1)
     macd_slow_period: int = Field(default=26, ge=1)
@@ -133,11 +133,28 @@ class UnifiedSwingEvaluatorConfig(TechnicalModel):
     directional_threshold: float = Field(default=20.0, gt=0, le=100)
     strong_threshold: float = Field(default=60.0, gt=0, le=100)
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_slow_average_key(cls, value):
+        if not isinstance(value, Mapping):
+            return value
+        migrated = dict(value)
+        legacy = migrated.pop("slow_sma_period", None)
+        if legacy is None:
+            return migrated
+        configured = migrated.get("slow_ema_period")
+        if configured is not None and configured != legacy:
+            raise ValueError(
+                "slow_sma_period and slow_ema_period cannot disagree"
+            )
+        migrated["slow_ema_period"] = legacy
+        return migrated
+
     @model_validator(mode="after")
     def validate_period_relationships(self) -> Self:
-        if self.fast_ema_period >= self.slow_sma_period:
+        if self.fast_ema_period >= self.slow_ema_period:
             raise ValueError(
-                "unified swing fast EMA period must be below slow SMA "
+                "unified swing fast EMA period must be below slow EMA "
                 "period"
             )
         if self.macd_fast_period >= self.macd_slow_period:
@@ -165,7 +182,7 @@ class UnifiedSwingEvaluatorConfig(TechnicalModel):
         """Minimum prefix length needed by every configured indicator."""
         return max(
             self.fast_ema_period,
-            self.slow_sma_period,
+            self.slow_ema_period,
             self.rsi_period + 1,
             self.macd_slow_period + self.macd_signal_period - 1,
             self.bollinger_period,
@@ -228,9 +245,9 @@ class UnifiedSwingEvaluator:
             config.fast_ema_period,
             PriceField.CLOSE,
         )
-        slow_sma = calculate_sma(
+        slow_ema = calculate_ema(
             market_series,
-            config.slow_sma_period,
+            config.slow_ema_period,
             PriceField.CLOSE,
         )
         rsi = calculate_rsi(
@@ -296,7 +313,7 @@ class UnifiedSwingEvaluator:
         evidence = [
             generate_moving_average_alignment_signal(
                 fast_ema,
-                slow_sma,
+                slow_ema,
                 as_of=evaluated_at,
             ),
             generate_adx_trend_signal(adx, as_of=evaluated_at),

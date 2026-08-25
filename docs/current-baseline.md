@@ -6,7 +6,7 @@ natural-language routing, instrument resolution, workflow observability, and
 wake-activated conversation. It is the authoritative implementation baseline;
 `README.md` provides the shorter project-level view.
 
-Automated test count as of this writing: **1,295 tests** (`tests/unit` +
+Automated test count as of this writing: **1,344 tests** (`tests/unit` +
 `tests/integration`), all offline, no network access or real credentials
 required.
 
@@ -107,8 +107,13 @@ app/
 
   commands/swing_analysis.py    UI-safe command boundary and LLM failure envelope
   facades/swing_research.py     Natural language -> resolution -> complete workflow
-  composition/                  Lazy wiring for debate, research façade, and conversation
+  composition/                  Lazy wiring for debate, research, conversation, and browser runner
+  api/                          FastAPI DTOs, capability authorization, and HTTP routes
+  conversation/browser.py      Wake-aware asynchronous browser coordinator
+  conversation/follow_up.py    Shared conservative follow-up classifier
   workflow/events.py            Research progress events for UI/voice consumers
+  workflow/operations.py        Browser operation registry port and in-memory adapter
+  workflow/browser_runner.py    Bounded runner, result/context ports, and Jarvis operation handler
 
   models/                    Pydantic domain models (all frozen/validated)
     market.py                   Candle, HistoricalCandleSeries, MarketQuote
@@ -123,6 +128,8 @@ app/
     interaction.py               Intent, command, and success/failure response envelope
     llm.py                       Preflight and secret-safe LLM failure models
     workflow.py                  Research workflow event contract
+    browser_operations.py        Browser session/operation/cancellation/replay contracts
+    browser_conversation.py      Browser wake state, turns, and event replay contracts
     conversation.py              Input, state, outcome, turn, and transition models
     timeframes.py                Hourly/daily/weekly lineage and parallel technical results
     multi_timeframe_evidence.py  Judge-released, qualified daily/weekly evidence package
@@ -654,6 +661,105 @@ IST offset. Sink delivery failures are safely logged and cannot abort the
 analysis. A WebSocket/SSE dashboard adapter can therefore stream actual domain
 progress rather than scraping logs or simulating agent activity.
 
+Workflow events now use `jarvis.workflow_event.v2`. The stable `stage` remains
+the coarse lifecycle state, while `WorkflowActivityDescriptor` supplies a
+namespaced activity ID, participant ID, generic participant kind, display label,
+and optional timeframe. The UI can therefore specialize known participants
+such as `technical.daily_analyst` and `debate.bull`, while safely rendering an
+unknown future participant as a generic analyst/service/judge card. Adding
+`fundamentals.financial_statement_analyst` or `research.news_analyst` does not
+require a new event envelope.
+
+The live multi-timeframe path emits real events for hourly loading, completed
+daily and weekly aggregation, parallel daily/weekly analysis, Judge evidence
+release, Bull/Bear rounds, Judge verdict review, and deterministic trade
+planning. Start/completed/failed states surround the actual operation; failed
+validation cannot produce a false completed animation. The asynchronous browser
+handler now extends that same sequence through `PRESENTATION`, terminal
+completion, and later `FOLLOW_UP` operations.
+
+The transport-neutral browser lifecycle is represented by frozen models in
+`app/models/browser_operations.py` and the `BrowserOperationRegistry` port.
+`InMemoryBrowserOperationRegistry` provides the first local adapter. It enforces
+one active operation per open session, idempotent submission keys, immutable
+request identity, queued/running/cancellation/terminal transitions, monotonic
+IST timestamps, secret-safe failures, and cooperative cancellation. It also
+implements `WorkflowEventSink`, stores only contiguous events for known active
+operations, and serves bounded cursor pages for reconnect/replay. A completion
+may legitimately win a race with a cancellation request, but the cancellation
+timestamp remains in the terminal snapshot.
+
+`AsyncBrowserOperationRunner` in `app/workflow/browser_runner.py` is the
+application-service owner of execution. It submits validated requests to a
+bounded thread pool, drives the registry lifecycle, supports idempotent submit
+and cooperative cancellation, stores the immutable `BrowserOperationOutput`
+separately from progress events, and emits exactly one outer terminal event.
+The existing synchronous research façade accepts an externally owned operation
+ID and emitter, so all underlying analyst events remain in one contiguous
+sequence and existing synchronous callers remain compatible.
+
+`JarvisBrowserOperationHandler` invokes the existing swing-research workflow,
+then the evidence-locked CEO presenter. A presentation-provider failure keeps
+the validated raw analysis available and returns a separate safe presentation
+failure. Only approved multi-timeframe review/debate context is retained per
+browser session; a later `JUDGE_FOLLOW_UP` operation receives that exact context
+and cannot silently reuse a failed replacement analysis. Expected LLM and
+follow-up failures are converted to browser-safe codes/messages. Unexpected
+exceptions produce no unverified result and expose no provider detail.
+
+The registry, result store, context store, and capability-token authorizer
+currently have thread-safe in-memory adapters. The FastAPI adapter provides
+session create/close, idempotent operation submit, status/result polling,
+cancellation, and bounded cursor replay. It exposes results only after the
+registry is officially complete, closing the brief result-save/terminal-state
+race. Session routes require `X-Jarvis-Session-Token`; only SHA-256 token
+digests are retained. Cross-session operation access is not disclosed.
+
+The runner itself remains independent of FastAPI. `examples/browser_api.py`
+provides live composition with Angel One, DuckDB market archival, lazy LLM
+roles, bounded workers, a configurable exact-origin CORS allowlist, and orderly
+runner/database shutdown. A WebSocket alternative remains optional rather than
+required for the first browser client.
+
+Authenticated SSE is implemented for both operation progress and conversation
+state. Each stream replays durable in-memory cursor history before waiting for
+new events, supports qualified `Last-Event-ID`, sends bounded heartbeats, and
+ends with an authoritative terminal snapshot. The token stays in the request
+header, so browser clients must use `fetch()` streaming rather than native
+`EventSource` or a query-string credential.
+
+`BrowserConversationCoordinator` is deliberately separate from the original
+synchronous `JarvisConversationSession`. While dormant it ignores text lacking
+the configured wake phrase. Text and voice transcripts share one wake detector,
+and activation emits greeting/listening events plus the configured-name greeting.
+Commands are submitted to the bounded operation runner rather than executed in
+the HTTP request. Terminal operation state is reconciled into responding,
+failed, or cancelled language; an explicit sleep acknowledgement returns to
+dormant. Only completion carrying approved multi-timeframe review and debate
+sets follow-up context. New company research clears that flag before execution;
+qualified support/resistance/pivot/evidence questions can then route to the
+existing Judge follow-up operation without inventing or replacing evidence.
+
+`JarvisDashboardProjector` now converts a completed multi-timeframe operation
+into the stable `jarvis.dashboard.v1` browser contract. It exposes bounded
+daily/weekly candle windows while retaining source counts, analyst metrics,
+qualified evidence with decisive markers, confirmed pivots, nearest zone
+lifecycle, the unchanged Bull/Bear transcript and Judge verdict, exact 2R/3R
+trade fields, workflow activity cards, and the Jarvis presentation. No-trade
+results contain no invented entry, stop, or target. The authenticated endpoint
+is `GET /api/v1/sessions/{session_id}/operations/{operation_id}/dashboard` and
+returns `409` until a compatible swing analysis has completed.
+
+The first responsive browser client now lives in `frontend/`. It creates a
+capability-authenticated session, supports the text wake phrase, streams
+conversation and operation events with authenticated `fetch()`, renders the
+reactor and agent-state matrix from actual workflow events, and presents the
+completed daily/weekly evidence, price levels, debate, Judge verdict, and exact
+trade/no-trade result. Its charts are bounded client-side renderings of the
+dashboard contract; no indicator is recalculated in JavaScript. Audio capture,
+speech recognition, and speech synthesis are deliberately not part of this
+increment.
+
 ### 3.17 Verified Live Run (2026-08-22)
 
 The full wake-to-verdict path was exercised for the first time against real
@@ -896,7 +1002,7 @@ stored under the file system's access and retention controls.
 .venv/bin/python -m unittest discover -s tests/unit -v
 ```
 
-Current count: **1,295 tests**, fully offline. Conventions to preserve:
+Current count: **1,344 tests**, fully offline. Conventions to preserve:
 
 - Prefer injected stub classes and fake functions at gateway/clock/storage
   boundaries. Limited standard-library patching is used where the unit under
@@ -913,9 +1019,10 @@ Current count: **1,295 tests**, fully offline. Conventions to preserve:
 - **No microphone/audio adapters.** `handle_voice_transcript()` accepts an
   already-transcribed string. Continuous microphone capture, acoustic wake-word
   detection, speech-to-text, and text-to-speech are not implemented.
-- **No application transport or dashboard.** Conversation and research event
-  contracts exist, but there is no HTTP/WebSocket/SSE server, browser client,
-  or 3D Jarvis UI yet.
+- **The first browser client is implemented, but not yet a full 3D/audio
+  experience.** It has a code-rendered reactor, agent matrix, live authenticated
+  SSE, and result panels. There is no WebSocket alternative, microphone,
+  acoustic wake-word engine, STT, TTS, or Three.js scene yet.
 - **Prompt audit retention is local-only.** The JSONL audit is intentionally
   diagnostic and has no rotation, retention scheduler, encryption-at-rest,
   multi-process sequencing, or secure-deletion workflow yet.
@@ -994,6 +1101,49 @@ User-stated direction for where Jarvis is headed, not yet fully built:
 
 ## 8. Document History
 
+- **2026-08-23**: Added the first responsive Jarvis browser console under
+  `frontend/`, connected to authenticated session, conversation SSE, workflow
+  SSE, and `jarvis.dashboard.v1`. Added event-driven analyst/Bull/Bear/Judge
+  states, code-rendered reactor, daily/weekly candles and evidence, trade/no-trade
+  result panels, backend-offline handling, and a project social-preview asset.
+- **2026-08-23**: Added `jarvis.dashboard.v1` and an authenticated dashboard
+  endpoint for completed multi-timeframe operations. The bounded projection
+  preserves chart data, evidence IDs, pivots/zones, debate/Judge conclusions,
+  trade/no-trade semantics, UI activities, and presentation without domain
+  recalculation. Verified 1,344 tests.
+
+- **2026-08-23**: Connected wake, greeting, listening, processing, response,
+  failure, and sleep states to browser sessions without making HTTP requests
+  execute research synchronously. Added text/voice-transcript turns,
+  idempotent asynchronous dispatch, candid configured-name greeting,
+  conversation replay/SSE, terminal reconciliation, sleep acknowledgement, and
+  approved-context Judge follow-up routing. Verified 1,337 tests.
+- **2026-08-23**: Added authenticated SSE workflow streaming over persisted
+  cursor replay. Streams use qualified event IDs, honor `Last-Event-ID`, avoid
+  duplicates, drain backlogs in bounded pages, send periodic heartbeats, and
+  finish with the authoritative terminal snapshot. Verified 1,331 tests.
+- **2026-08-23**: Added the versioned FastAPI browser boundary, hashed
+  session-capability authorization, server-owned operation IDs, HTTP
+  submit/status/result/cancel/event-replay routes, OpenAPI, live composition,
+  and shutdown lifecycle. Validated pending/completed/cancelled semantics,
+  idempotency conflicts, cross-session isolation, and request validation.
+  Verified 1,329 tests.
+- **2026-08-23**: Added the bounded asynchronous browser runner and Jarvis
+  operation handler. Connected the existing research façade, presentation, and
+  Judge follow-ups under externally owned operation IDs; added immutable result
+  storage, approved per-session context, cooperative cancellation, safe partial
+  presentation outcomes, and contiguous terminal events. Verified 1,323 tests.
+- **2026-08-23**: Added transport-neutral browser session and asynchronous
+  operation contracts plus a thread-safe in-memory registry. Covered
+  idempotency, single active work, lifecycle transitions, cancellation races,
+  safe failure payloads, contiguous event capture, bounded replay, concurrency,
+  and typed conflicts/not-found errors. Verified 1,313 tests.
+- **2026-08-23**: Added the extensible UI workflow-event v2 foundation.
+  Namespaced activities and generic participant kinds allow future financial,
+  news, sentiment, or other analysts without redesigning the envelope. Wired
+  real daily/weekly aggregation, parallel analysis, evidence-release, debate,
+  Judge, and long-only trade-planning events with failure-safe sequencing.
+  Verified 1,301 tests.
 - **2026-08-23**: Connected the multi-timeframe result to the existing
   deterministic trade planner and Jarvis CEO presenter. Added a chain-validated
   long-only policy, exact 2R/3R price fields, structural feasibility, explicit

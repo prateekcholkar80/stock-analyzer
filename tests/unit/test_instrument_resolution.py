@@ -55,6 +55,7 @@ class PatternSwingIntentInterpreterTests(unittest.TestCase):
         scenarios = (
             ("Hey Jarvis, how's Reliance doing today?", "Reliance"),
             ("Analyze TCS for a swing trade", "TCS"),
+            ("Analyze TCS for me", "TCS"),
             ("Give me swing analysis for Infosys", "Infosys"),
         )
 

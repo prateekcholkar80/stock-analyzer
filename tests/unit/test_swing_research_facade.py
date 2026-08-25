@@ -65,9 +65,16 @@ class RecordingCommandHandler:
         *,
         operation_id=None,
         event_emitter=None,
+        emit_terminal_event=True,
     ):
         self.calls.append(
-            (command, operation_id, get_operation_id(), event_emitter)
+            (
+                command,
+                operation_id,
+                get_operation_id(),
+                event_emitter,
+                emit_terminal_event,
+            )
         )
         if self.response is not None:
             return self.response
@@ -159,6 +166,33 @@ class JarvisSwingResearchFacadeTests(unittest.TestCase):
                 event.operation_id == response.operation_id
                 for event in sink.events
             )
+        )
+
+    def test_external_lifecycle_uses_supplied_id_without_terminal_event(self):
+        sink = InMemoryWorkflowEventSink()
+        handler = RecordingCommandHandler()
+        facade = JarvisSwingResearchFacade(
+            RecordingRequestResolver(result=_command()),
+            handler,
+        )
+        from app.workflow.events import WorkflowEventEmitter
+
+        emitter = WorkflowEventEmitter("browser-operation-1", sink)
+        response = facade.execute(
+            "Analyze Reliance for a swing trade",
+            operation_id="browser-operation-1",
+            event_emitter=emitter,
+            manage_terminal_events=False,
+        )
+
+        self.assertEqual(response.operation_id, "browser-operation-1")
+        self.assertFalse(handler.calls[0][4])
+        self.assertEqual(
+            [event.stage for event in sink.events],
+            [
+                WorkflowStage.REQUEST_RECEIVED,
+                WorkflowStage.INSTRUMENT_RESOLVED,
+            ],
         )
 
     def test_rejects_invalid_dependencies_and_collaborator_results(self):

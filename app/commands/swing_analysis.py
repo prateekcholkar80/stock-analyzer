@@ -60,6 +60,7 @@ class JarvisSwingAnalysisCommandHandler:
         *,
         operation_id: str | None = None,
         event_emitter: WorkflowEventEmitter | None = None,
+        emit_terminal_event: bool = True,
     ) -> JarvisSwingAnalysisResponse:
         if not isinstance(command, SwingAnalysisCommand):
             raise ValueError(
@@ -69,6 +70,8 @@ class JarvisSwingAnalysisCommandHandler:
             not isinstance(operation_id, str) or not operation_id.strip()
         ):
             raise ValueError("command operation ID must be a non-blank string")
+        if not isinstance(emit_terminal_event, bool):
+            raise ValueError("terminal-event policy must be a boolean")
 
         with operation_context(operation_id) as active_operation_id:
             active_emitter = (
@@ -109,12 +112,13 @@ class JarvisSwingAnalysisCommandHandler:
                         "swing-analysis executor returned an invalid result"
                     )
             except LLMError as error:
-                active_emitter.emit(
-                    WorkflowStage.FAILED,
-                    WorkflowEventState.FAILED,
-                    exchange=command.exchange,
-                    symbol=command.symbol,
-                )
+                if emit_terminal_event:
+                    active_emitter.emit(
+                        WorkflowStage.FAILED,
+                        WorkflowEventState.FAILED,
+                        exchange=command.exchange,
+                        symbol=command.symbol,
+                    )
                 failure = present_llm_failure(
                     error,
                     operation_id=active_operation_id,
@@ -137,20 +141,22 @@ class JarvisSwingAnalysisCommandHandler:
                     failure=failure,
                 )
             except Exception:
+                if emit_terminal_event:
+                    active_emitter.emit(
+                        WorkflowStage.FAILED,
+                        WorkflowEventState.FAILED,
+                        exchange=command.exchange,
+                        symbol=command.symbol,
+                    )
+                raise
+
+            if emit_terminal_event:
                 active_emitter.emit(
-                    WorkflowStage.FAILED,
-                    WorkflowEventState.FAILED,
+                    WorkflowStage.COMPLETED,
+                    WorkflowEventState.COMPLETED,
                     exchange=command.exchange,
                     symbol=command.symbol,
                 )
-                raise
-
-            active_emitter.emit(
-                WorkflowStage.COMPLETED,
-                WorkflowEventState.COMPLETED,
-                exchange=command.exchange,
-                symbol=command.symbol,
-            )
             self._logger.info(
                 "Jarvis swing-analysis workflow completed",
                 extra={

@@ -19,6 +19,16 @@ _INTERVAL_RANK = {
 
 _VALID_TARGETS = frozenset({"ONE_DAY", "ONE_WEEK"})
 
+_INTERVAL_DURATION_MINUTES = {
+    "ONE_MINUTE": 1,
+    "THREE_MINUTE": 3,
+    "FIVE_MINUTE": 5,
+    "TEN_MINUTE": 10,
+    "FIFTEEN_MINUTE": 15,
+    "THIRTY_MINUTE": 30,
+    "ONE_HOUR": 60,
+}
+
 
 def aggregate_candles(
     series: HistoricalCandleSeries,
@@ -29,6 +39,7 @@ def aggregate_candles(
     session_close_minute: int = 30,
     week_end_weekday: int = 4,
     include_incomplete_final_bucket: bool = False,
+    as_of: datetime | None = None,
 ) -> HistoricalCandleSeries:
     """Aggregate a finer-grained candle series into coarser OHLCV bars.
 
@@ -40,14 +51,20 @@ def aggregate_candles(
     own data existed.
 
     The final bucket is dropped unless it is actually complete: for a
-    daily bucket, its last candle's local time must have reached
-    ``session_close_hour``/``session_close_minute``; for a weekly bucket,
-    its last candle's local weekday must additionally be at or after
+    daily bucket, its final source interval must cover
+    ``session_close_hour``/``session_close_minute`` and the analysis cutoff
+    must have reached that close. This matters for start-stamped broker
+    candles: Angel One's final ``ONE_HOUR`` candle starts at 15:15 IST but
+    covers the closing segment through 15:30 IST. For a weekly bucket, its
+    last candle's local weekday must additionally be at or after
     ``week_end_weekday`` (default Friday). This is a deliberate, documented
     simplification -- it does not know about exchange holidays, so a week
     that legitimately ends early (e.g. a Friday holiday) is conservatively
     treated as incomplete rather than risk fabricating a bar early.
     ``include_incomplete_final_bucket=True`` opts out of this check.
+
+    ``as_of`` is the requested market-data cutoff. It defaults to the
+    series retrieval time and must be timezone-aware when supplied.
     """
     if target_interval not in _VALID_TARGETS:
         raise ValueError(
@@ -63,6 +80,12 @@ def aggregate_candles(
         )
     if not series.candles:
         raise ValueError("cannot aggregate an empty candle series")
+    effective_as_of = as_of or series.retrieved_at
+    if (
+        effective_as_of.tzinfo is None
+        or effective_as_of.utcoffset() is None
+    ):
+        raise ValueError("aggregation as_of must include timezone information")
 
     tz = ZoneInfo(exchange_timezone)
     buckets: dict[date, list[Candle]] = {}
@@ -87,6 +110,8 @@ def aggregate_candles(
                 session_close_hour,
                 session_close_minute,
                 week_end_weekday,
+                series.interval,
+                effective_as_of,
             ):
                 continue
         aggregated.append(_aggregate_bucket(bucket_candles))
@@ -121,17 +146,35 @@ def _is_bucket_complete(
     session_close_hour: int,
     session_close_minute: int,
     week_end_weekday: int,
+    source_interval: str,
+    as_of: datetime,
 ) -> bool:
     last_local_time = bucket_candles[-1].timestamp.astimezone(tz)
-    session_closed = (last_local_time.hour, last_local_time.minute) >= (
-        session_close_hour,
-        session_close_minute,
+    session_close = last_local_time.replace(
+        hour=session_close_hour,
+        minute=session_close_minute,
+        second=0,
+        microsecond=0,
     )
-    if not session_closed:
+    if as_of.astimezone(tz) < session_close:
         return False
     if target_interval == "ONE_WEEK":
-        return last_local_time.weekday() >= week_end_weekday
-    return True
+        if last_local_time.weekday() < week_end_weekday:
+            return False
+        if source_interval == "ONE_DAY":
+            # Daily bars reaching this cascade were already accepted as
+            # completed sessions by the first aggregation pass.
+            return True
+
+    if last_local_time >= session_close:
+        return True
+    duration_minutes = _INTERVAL_DURATION_MINUTES.get(source_interval)
+    if duration_minutes is None:
+        return False
+    source_interval_end = last_local_time + timedelta(
+        minutes=duration_minutes
+    )
+    return source_interval_end >= session_close
 
 
 def _aggregate_bucket(candles: list[Candle]) -> Candle:

@@ -11,12 +11,18 @@ from app.agents.trade_planning_agent import (
 )
 from app.commands.swing_analysis import JarvisSwingAnalysisCommandHandler
 from app.models.interaction import SwingAnalysisCommand
-from app.models.market import Candle, HistoricalCandleSeries
+from app.models.market import Candle, HistoricalCandleSeries, MarketQuote
 from app.models.multi_timeframe_trade import (
     MultiTimeframeTradeDisposition,
     MultiTimeframeTradeReason,
 )
 from app.models.trade_setup import TradeDirection
+from app.models.trade_decision import (
+    MarketCondition,
+    NoTradeReason,
+    TradeDecision,
+)
+from app.models.workflow import WorkflowEventState
 from app.models.storage import (
     MultiTimeframeEndToEndSwingAnalysisResult,
     RollingFetchReceipt,
@@ -35,6 +41,7 @@ from app.use_cases.derive_swing_timeframes import DeriveSwingTimeframes
 from app.use_cases.build_multi_timeframe_long_trade_plan import (
     BuildMultiTimeframeLongTradePlan,
 )
+from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
 from tests.unit.test_build_multi_timeframe_evidence import (
     _cyclical_timeframes,
 )
@@ -45,13 +52,17 @@ from tests.unit.test_run_end_to_end_swing_analysis import (
 
 
 class _RollingFetch:
-    def __init__(self, receipt):
+    def __init__(self, receipt, quote=None):
         self.receipt = receipt
+        self.quote = quote
         self.calls = []
 
     def execute(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         return self.receipt
+
+    def get_latest_quote(self, *args):
+        return self.quote
 
 
 def _receipt(timeframes=None):
@@ -133,8 +144,21 @@ def _use_case(*, timeframes=None, winner="bullish"):
         judge_agent=judge,
         config=DebateOrchestratorConfig(max_rounds=1),
     )
+    latest = resolved_timeframes.hourly.candles[-1]
+    quote = MarketQuote(
+        exchange=resolved_timeframes.hourly.exchange,
+        symbol_token=resolved_timeframes.hourly.symbol_token,
+        symbol=resolved_timeframes.hourly.symbol,
+        price=latest.close,
+        open=latest.open,
+        high=latest.high,
+        low=latest.low,
+        previous_close=latest.open,
+        observed_at=resolved_timeframes.hourly.retrieved_at,
+        source="test_market",
+    )
     return RunEndToEndMultiTimeframeSwingAnalysis(
-        _RollingFetch(receipt),
+        _RollingFetch(receipt, quote),
         debate_orchestrator=debate,
         llm_preflight=_successful_llm_preflight(),
     )
@@ -202,6 +226,8 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
         )
         self.assertTrue(result.technical_review.decision.accepted)
         self.assertTrue(result.debate_result.decision.accepted)
+        self.assertIsNotNone(result.latest_quote)
+        self.assertEqual(result.latest_quote.symbol, "RELIANCE-EQ")
         self.assertEqual(
             result.technical_review.evidence_package.daily.interval,
             "ONE_DAY",
@@ -209,6 +235,50 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
         self.assertEqual(
             result.technical_review.evidence_package.weekly.interval,
             "ONE_WEEK",
+        )
+
+    def test_emits_truthful_ui_activities_for_the_complete_pipeline(self):
+        sink = InMemoryWorkflowEventSink()
+        emitter = WorkflowEventEmitter("operation", sink)
+
+        _use_case().execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+            event_emitter=emitter,
+        )
+
+        activities = [event.activity.activity_id for event in sink.events]
+        for activity_id in (
+            "market.hourly.load",
+            "market.aggregate.daily",
+            "market.aggregate.weekly",
+            "technical.daily.evaluate",
+            "technical.weekly.evaluate",
+            "evidence.release.review",
+            "debate.bull.argue",
+            "debate.bear.argue",
+            "debate.verdict.review",
+            "trade.long_only.evaluate",
+        ):
+            self.assertIn(activity_id, activities)
+        self.assertLess(
+            activities.index("evidence.release.review"),
+            activities.index("debate.bull.argue"),
+        )
+        self.assertGreater(
+            activities.index("trade.long_only.evaluate"),
+            activities.index("debate.verdict.review"),
+        )
+        trade_events = [
+            event
+            for event in sink.events
+            if event.activity.activity_id == "trade.long_only.evaluate"
+        ]
+        self.assertEqual(
+            [event.state for event in trade_events],
+            [WorkflowEventState.STARTED, WorkflowEventState.COMPLETED],
         )
 
     def test_command_response_automatically_carries_follow_up_context(self):
@@ -245,6 +315,19 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
             outcome.disposition,
             MultiTimeframeTradeDisposition.ACTIONABLE,
         )
+        self.assertEqual(
+            outcome.schema_version,
+            "jarvis.multi_timeframe_trade_plan.v2",
+        )
+        self.assertEqual(
+            outcome.policy_id,
+            "jarvis.buy_eligibility_2r_swing_policy.v2",
+        )
+        self.assertIs(
+            outcome.trade_decision.market_condition,
+            MarketCondition.BULLISH,
+        )
+        self.assertIs(outcome.trade_decision.decision, TradeDecision.BUY)
         self.assertIs(plan.evaluation.direction, TradeDirection.LONG)
         self.assertEqual(plan.evaluation.minimum_reward_to_risk, 2.0)
         self.assertAlmostEqual(
@@ -269,7 +352,35 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
             outcome.reason,
             MultiTimeframeTradeReason.JUDGE_NOT_BULLISH,
         )
+        self.assertIs(
+            outcome.trade_decision.market_condition,
+            MarketCondition.CONFLICTED,
+        )
+        self.assertIs(
+            outcome.trade_decision.decision,
+            TradeDecision.NO_TRADE,
+        )
+        self.assertEqual(
+            outcome.trade_decision.no_trade_reasons,
+            (NoTradeReason.TIMEFRAME_CONFLICT,),
+        )
         self.assertIsNone(outcome.daily_planning_result)
+
+    def test_neutral_judge_produces_explicit_no_trade_decision(self):
+        result = _use_case(winner="neutral").execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+        )
+
+        decision = result.trade_plan_result.trade_decision
+        self.assertIs(decision.market_condition, MarketCondition.CONFLICTED)
+        self.assertIs(decision.decision, TradeDecision.NO_TRADE)
+        self.assertEqual(
+            decision.no_trade_reasons,
+            (NoTradeReason.TIMEFRAME_CONFLICT,),
+        )
 
     def test_rejects_trade_chain_tampering_and_non_two_r_policy(self):
         result = _use_case().execute(
@@ -287,6 +398,28 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
                 technical_review=result.technical_review,
                 debate_result=result.debate_result,
                 trade_plan_result=tampered_trade,
+                interpretation=result.interpretation,
+            )
+
+        tampered_decision = result.trade_plan_result.trade_decision.model_copy(
+            update={"market_condition": MarketCondition.NEUTRAL}
+        )
+        tampered_trade = result.trade_plan_result.model_copy(
+            update={"trade_decision": tampered_decision}
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "market condition must match the deterministic daily/weekly profiles",
+        ):
+            MultiTimeframeEndToEndSwingAnalysisResult(
+                use_case_id=result.use_case_id,
+                market_dataset_id=result.market_dataset_id,
+                fetch=result.fetch,
+                latest_quote=result.latest_quote,
+                technical_review=result.technical_review,
+                debate_result=result.debate_result,
+                trade_plan_result=tampered_trade,
+                interpretation=result.interpretation,
             )
 
         non_two_r_agent = TradePlanningAgent(

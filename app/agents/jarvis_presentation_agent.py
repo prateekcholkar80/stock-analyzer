@@ -37,6 +37,26 @@ _ROLE = (
     "or uncertainty."
 )
 
+_EXECUTIVE_COMMUNICATION = (
+    "Write for a CEO who may be a beginner in stock-market terminology. "
+    "Use short, direct sentences and explain specialist terms in plain "
+    "English when first used. Keep executive_briefing to three to five "
+    "sentences: lead with the directional verdict, state whether the "
+    "application approved a trade, and name the main reason and risk. Keep "
+    "judge_conclusion_explanation focused and non-repetitive. In the Judge "
+    "explanation, say explicitly that confidence is confidence in the named "
+    "verdict -- bullish, bearish, or neutral -- and is not a probability of "
+    "future price movement. Do not write Markdown headings or raw evidence "
+    "IDs in prose; place citations only in the matching evidence-id fields. "
+    "The application owns headers, bullets, verdict labels, and colours."
+)
+
+_MULTI_TIMEFRAME_COMMUNICATION = (
+    "Keep weekly_analysis and daily_analysis focused and non-repetitive. "
+    "The executive briefing must explain the weekly-versus-daily picture: "
+    "weekly is the broader swing trend and daily is near-term entry timing."
+)
+
 _RULES = (
     "Explain the completed technical research, Bull case, Bear case, and "
     "Judge conclusion without changing, overruling, or embellishing any "
@@ -64,7 +84,8 @@ _RULES = (
 )
 
 JARVIS_PERSONA_SYSTEM_PROMPT = (
-    f"# Role\n{_ROLE}\n\n# Persona and evidence policy\n{_RULES}"
+    f"# Role\n{_ROLE}\n\n# Communication contract\n"
+    f"{_EXECUTIVE_COMMUNICATION}\n\n# Persona and evidence policy\n{_RULES}"
 )
 
 _MULTI_TIMEFRAME_RULES = (
@@ -83,7 +104,9 @@ _MULTI_TIMEFRAME_RULES = (
 )
 
 JARVIS_MULTI_TIMEFRAME_PERSONA_SYSTEM_PROMPT = (
-    f"# Role\n{_ROLE}\n\n# Persona and evidence policy\n"
+    f"# Role\n{_ROLE}\n\n# Communication contract\n"
+    f"{_EXECUTIVE_COMMUNICATION} {_MULTI_TIMEFRAME_COMMUNICATION}\n\n"
+    f"# Persona and evidence policy\n"
     f"{_MULTI_TIMEFRAME_RULES}"
 )
 
@@ -141,7 +164,7 @@ class JarvisPresentationAgentConfig(TechnicalModel):
     model_config = ConfigDict(frozen=True, strict=True)
 
     prompt_version: str = Field(
-        default="jarvis.chief_investment_research_assistant_prompt.v1",
+        default="jarvis.chief_investment_research_assistant_prompt.v2",
         min_length=1,
     )
 

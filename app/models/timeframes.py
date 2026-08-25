@@ -3,6 +3,8 @@ from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, model_validator
 
+from app.models.accumulation import TimeframeAccumulationAnalysis
+from app.models.analysis_timeframe import SwingAnalysisTimeframe
 from app.models.market import HistoricalCandleSeries
 from app.models.agentic import TechnicalSwingAgentSubmission
 from app.models.technical import TechnicalModel
@@ -131,6 +133,8 @@ class MultiTimeframeTechnicalAnalysis(TechnicalModel):
     timeframes: SwingTimeframeSeries
     daily_submission: TechnicalSwingAgentSubmission
     weekly_submission: TechnicalSwingAgentSubmission
+    daily_accumulation: TimeframeAccumulationAnalysis
+    weekly_accumulation: TimeframeAccumulationAnalysis
     daily_validation: TechnicalSubmissionValidationReceipt
     weekly_validation: TechnicalSubmissionValidationReceipt
     combined_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
@@ -141,6 +145,18 @@ class MultiTimeframeTechnicalAnalysis(TechnicalModel):
             raise ValueError("daily technical submission must be ONE_DAY")
         if self.weekly_submission.interval != "ONE_WEEK":
             raise ValueError("weekly technical submission must be ONE_WEEK")
+        _validate_accumulation_assignment(
+            self.daily_accumulation,
+            self.timeframes.daily,
+            self.daily_submission,
+            SwingAnalysisTimeframe.DAILY,
+        )
+        _validate_accumulation_assignment(
+            self.weekly_accumulation,
+            self.timeframes.weekly,
+            self.weekly_submission,
+            SwingAnalysisTimeframe.WEEKLY,
+        )
         if self.daily_submission.agent_id == self.weekly_submission.agent_id:
             raise ValueError("daily and weekly agents must have distinct ids")
         if (
@@ -164,6 +180,8 @@ class MultiTimeframeTechnicalAnalysis(TechnicalModel):
             self.timeframes,
             self.daily_submission,
             self.weekly_submission,
+            self.daily_accumulation,
+            self.weekly_accumulation,
         )
         if self.combined_fingerprint != expected:
             raise ValueError(
@@ -176,6 +194,8 @@ def multi_timeframe_technical_fingerprint(
     timeframes: SwingTimeframeSeries,
     daily: TechnicalSwingAgentSubmission,
     weekly: TechnicalSwingAgentSubmission,
+    daily_accumulation: TimeframeAccumulationAnalysis,
+    weekly_accumulation: TimeframeAccumulationAnalysis,
 ) -> str:
     payload = ":".join(
         (
@@ -184,6 +204,8 @@ def multi_timeframe_technical_fingerprint(
             timeframes.lineage.weekly_fingerprint,
             daily.model_dump_json(),
             weekly.model_dump_json(),
+            daily_accumulation.model_dump_json(),
+            weekly_accumulation.model_dump_json(),
         )
     )
     return sha256(payload.encode("utf-8")).hexdigest()
@@ -197,3 +219,35 @@ def _series_identity(series: HistoricalCandleSeries) -> tuple[object, ...]:
         series.source,
         series.retrieved_at,
     )
+
+
+def _validate_accumulation_assignment(
+    accumulation: TimeframeAccumulationAnalysis,
+    series: HistoricalCandleSeries,
+    submission: TechnicalSwingAgentSubmission,
+    timeframe: SwingAnalysisTimeframe,
+) -> None:
+    expected = (
+        series.exchange,
+        series.symbol_token,
+        series.symbol,
+        timeframe,
+        series.interval,
+        series.source,
+        series.retrieved_at,
+        submission.evaluated_at,
+    )
+    actual = (
+        accumulation.exchange,
+        accumulation.symbol_token,
+        accumulation.symbol,
+        accumulation.timeframe,
+        accumulation.interval,
+        accumulation.source,
+        accumulation.source_retrieved_at,
+        accumulation.evaluated_at,
+    )
+    if actual != expected:
+        raise ValueError(
+            f"{timeframe.value} accumulation must match its assigned series"
+        )

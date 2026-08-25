@@ -65,6 +65,10 @@ class MultiTimeframeDebateTests(unittest.TestCase):
         self.assertIn(self.weekly_support_id, serialized)
         self.assertIn("Immediate support", serialized)
         self.assertIn("Latest confirmed high", serialized)
+        self.assertIn(
+            "Qualified accumulation and liquidity-sweep evidence",
+            serialized,
+        )
         for identifier in valid_multi_timeframe_evidence_ids(self.package):
             self.assertIn(identifier, serialized)
 

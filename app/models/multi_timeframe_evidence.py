@@ -1,5 +1,4 @@
 from datetime import datetime
-from enum import StrEnum
 from hashlib import sha256
 from math import isclose, isfinite
 from typing import Literal, Self
@@ -9,6 +8,11 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 from app.models.agentic import (
     JarvisJudgeDecision,
     TechnicalSwingAgentSubmission,
+)
+from app.models.accumulation import TimeframeAccumulationAnalysis
+from app.models.analysis_timeframe import (
+    SwingAnalysisTimeframe,
+    timeframe_interval,
 )
 from app.models.market import HistoricalCandleSeries
 from app.models.price_action import (
@@ -31,6 +35,7 @@ MULTI_TIMEFRAME_RELEASE_CHECKS = frozenset(
         "parallel_timeframe_execution_complete",
         "daily_technical_submission_approved",
         "weekly_technical_submission_approved",
+        "daily_and_weekly_accumulation_verified",
         "complete_daily_and_weekly_evidence",
         "timeframe_evidence_ids_disjoint",
         "timeframe_lineage_verified",
@@ -39,17 +44,6 @@ MULTI_TIMEFRAME_RELEASE_CHECKS = frozenset(
         "evidence_preserved_without_reinterpretation",
     }
 )
-
-
-class SwingAnalysisTimeframe(StrEnum):
-    DAILY = "daily"
-    WEEKLY = "weekly"
-
-
-def timeframe_interval(timeframe: SwingAnalysisTimeframe) -> str:
-    if timeframe is SwingAnalysisTimeframe.DAILY:
-        return "ONE_DAY"
-    return "ONE_WEEK"
 
 
 class QualifiedTechnicalEvidence(TechnicalModel):
@@ -181,6 +175,7 @@ class TimeframeTechnicalEvidenceContext(TechnicalModel):
     interval: str = Field(min_length=1)
     evaluated_at: datetime
     current_close: float = Field(gt=0)
+    accumulation: TimeframeAccumulationAnalysis
     evidence: tuple[QualifiedTechnicalEvidence, ...] = Field(min_length=1)
     recent_confirmed_pivots: tuple[ConfirmedPivotSummary, ...] = ()
     latest_confirmed_high: ConfirmedPivotSummary | None = None
@@ -206,6 +201,14 @@ class TimeframeTechnicalEvidenceContext(TechnicalModel):
     def validate_context(self) -> Self:
         if self.interval != timeframe_interval(self.timeframe):
             raise ValueError("timeframe context interval is incorrect")
+        if (
+            self.accumulation.timeframe is not self.timeframe
+            or self.accumulation.interval != self.interval
+            or self.accumulation.evaluated_at != self.evaluated_at
+        ):
+            raise ValueError(
+                "accumulation analysis must match its timeframe context"
+            )
         evidence_ids = [item.qualified_evidence_id for item in self.evidence]
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("timeframe evidence ids must be unique")
@@ -296,6 +299,16 @@ class MultiTimeframeEvidencePackage(TechnicalModel):
             self.weekly,
             self.technical_analysis.weekly_submission.profile.snapshot.evidence,
         )
+        if (
+            self.daily.accumulation
+            != self.technical_analysis.daily_accumulation
+            or self.weekly.accumulation
+            != self.technical_analysis.weekly_accumulation
+        ):
+            raise ValueError(
+                "timeframe contexts must preserve the assigned accumulation "
+                "evidence"
+            )
         self._validate_context_identity(
             self.daily,
             self.technical_analysis.daily_submission,
@@ -343,6 +356,29 @@ class MultiTimeframeEvidencePackage(TechnicalModel):
         if context.evaluated_at != submission.evaluated_at:
             raise ValueError(
                 "context evaluation time must match its submission"
+            )
+        accumulation = context.accumulation
+        accumulation_identity = (
+            accumulation.exchange,
+            accumulation.symbol_token,
+            accumulation.symbol,
+            accumulation.interval,
+            accumulation.source,
+            accumulation.source_retrieved_at,
+            accumulation.evaluated_at,
+        )
+        expected_accumulation_identity = (
+            series.exchange,
+            series.symbol_token,
+            series.symbol,
+            series.interval,
+            series.source,
+            series.retrieved_at,
+            submission.evaluated_at,
+        )
+        if accumulation_identity != expected_accumulation_identity:
+            raise ValueError(
+                "context accumulation must match its assigned market series"
             )
         available = [
             candle

@@ -29,7 +29,7 @@ from app.models.storage import (
 from app.use_cases.pull_rolling_market_series import PullRollingMarketSeries
 
 
-class _LazyJarvisResearchPresenter:
+class LazyJarvisResearchPresenter:
     """Build the persona gateway only after validated research exists."""
 
     def __init__(
@@ -110,7 +110,7 @@ def compose_jarvis_conversation(
     presenter = (
         research_presenter
         if research_presenter is not None
-        else _LazyJarvisResearchPresenter(
+        else LazyJarvisResearchPresenter(
             settings=research_dependencies.get("settings"),
             gateway_builder=research_dependencies.get("gateway_builder"),
             prompt_audit_sink=resolved_audit_sink,

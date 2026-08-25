@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from tests.unit._debate_fixtures import build_approved_technical_result
 
 from app.agents.jarvis_presentation_agent import (
+    JARVIS_MULTI_TIMEFRAME_PERSONA_SYSTEM_PROMPT,
     JARVIS_PERSONA_SYSTEM_PROMPT,
     JarvisPresentationAgent,
 )
@@ -215,6 +216,21 @@ def _valid_multi_payload(result):
 
 
 class JarvisPresentationAgentTests(unittest.TestCase):
+    def test_persona_requires_beginner_friendly_structured_briefing(self):
+        for prompt in (
+            JARVIS_PERSONA_SYSTEM_PROMPT,
+            JARVIS_MULTI_TIMEFRAME_PERSONA_SYSTEM_PROMPT,
+        ):
+            self.assertIn("beginner", prompt)
+            self.assertIn("three to five sentences", prompt)
+            self.assertIn("not a probability", prompt)
+            self.assertIn("Do not write Markdown headings", prompt)
+
+        self.assertEqual(
+            JarvisPresentationAgent(_FakeGateway([])).config.prompt_version,
+            "jarvis.chief_investment_research_assistant_prompt.v2",
+        )
+
     def test_persona_explains_complete_result_without_changing_evidence(self):
         result = _result()
         gateway = _FakeGateway([_valid_payload(result)])

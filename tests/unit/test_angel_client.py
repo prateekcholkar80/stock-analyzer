@@ -1,6 +1,9 @@
 import unittest
 
-from app.angel.client import AngelOneClient
+from app.angel.client import (
+    AngelOneClient,
+    _disable_unsafe_sdk_request_logging,
+)
 from app.config import Settings
 from app.exceptions import (
     AuthenticationError,
@@ -107,6 +110,59 @@ class FailingHistoricalSmartConnect(FakeSmartConnect):
         )
 
 
+class ExpiringSmartConnect(FakeSmartConnect):
+    def __init__(self, api_key):
+        super().__init__(api_key)
+        self.login_count = 0
+        self.quote_count = 0
+        self.history_count = 0
+
+    def generateSession(self, client_code, pin, totp):
+        self.login_count += 1
+        return super().generateSession(client_code, pin, totp)
+
+    def ltpData(self, exchange, symbol, symbol_token):
+        self.quote_count += 1
+        if self.quote_count == 1:
+            return {
+                "status": False,
+                "message": "Invalid Token",
+                "errorCode": "AG8001",
+                "data": "",
+            }
+        return super().ltpData(exchange, symbol, symbol_token)
+
+    def getCandleData(self, params):
+        self.history_count += 1
+        if self.history_count == 1:
+            return {
+                "status": False,
+                "message": "Invalid Token",
+                "errorCode": "AG8001",
+                "data": "",
+            }
+        return super().getCandleData(params)
+
+
+class PersistentlyExpiredSmartConnect(ExpiringSmartConnect):
+    def getCandleData(self, params):
+        self.history_count += 1
+        return {
+            "status": False,
+            "message": "Invalid Token",
+            "errorCode": "AG8001",
+            "data": "",
+        }
+
+
+class _UnsafeSdkLogger:
+    disabled = False
+
+
+class _UnsafeSdkModule:
+    logger = _UnsafeSdkLogger()
+
+
 class AngelOneClientTests(unittest.TestCase):
     def setUp(self):
         self.settings = Settings.from_environment(
@@ -131,6 +187,68 @@ class AngelOneClientTests(unittest.TestCase):
             client.client.api_key,
             "test-api-key",
         )
+
+    def test_disables_third_party_sdk_request_logger(self):
+        _UnsafeSdkModule.logger.disabled = False
+
+        _disable_unsafe_sdk_request_logging(_UnsafeSdkModule)
+
+        self.assertTrue(_UnsafeSdkModule.logger.disabled)
+
+    def test_refreshes_expired_session_and_retries_quote_once(self):
+        client = AngelOneClient(
+            settings=self.settings,
+            client_factory=ExpiringSmartConnect,
+        )
+        client.initialize()
+
+        response = client.get_ltp(
+            exchange="NSE",
+            symbol_token="2885",
+            symbol="RELIANCE-EQ",
+        )
+
+        self.assertTrue(response["status"])
+        self.assertEqual(client.client.login_count, 2)
+        self.assertEqual(client.client.quote_count, 2)
+
+    def test_refreshes_expired_session_and_retries_history_once(self):
+        client = AngelOneClient(
+            settings=self.settings,
+            client_factory=ExpiringSmartConnect,
+        )
+        client.initialize()
+
+        response = client.get_historical_candles(
+            exchange="NSE",
+            symbol_token="2885",
+            interval="ONE_HOUR",
+            from_date="2026-08-01 09:15",
+            to_date="2026-08-20 15:30",
+        )
+
+        self.assertTrue(response["status"])
+        self.assertEqual(client.client.login_count, 2)
+        self.assertEqual(client.client.history_count, 2)
+
+    def test_stops_after_one_retry_when_refreshed_session_is_rejected(self):
+        client = AngelOneClient(
+            settings=self.settings,
+            client_factory=PersistentlyExpiredSmartConnect,
+        )
+        client.initialize()
+
+        with self.assertRaises(MarketDataError):
+            client.get_historical_candles(
+                exchange="NSE",
+                symbol_token="2885",
+                interval="ONE_HOUR",
+                from_date="2026-08-01 09:15",
+                to_date="2026-08-20 15:30",
+            )
+
+        self.assertEqual(client.client.login_count, 2)
+        self.assertEqual(client.client.history_count, 2)
 
     def test_rejects_market_request_before_login(self):
         client = AngelOneClient(

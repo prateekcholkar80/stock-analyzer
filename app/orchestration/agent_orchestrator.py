@@ -15,6 +15,7 @@ from app.agents.trade_planning_agent import (
     TradePlanningAgentConfig,
 )
 from app.analytics.trade_execution import simulate_historical_trade
+from app.analytics.accumulation import detect_accumulation_zones
 from app.exceptions import AgentSubmissionRejectedError
 from app.models.agentic import (
     AgenticHistoricalExecutionResult,
@@ -38,6 +39,8 @@ from app.models.signals import (
     SwingTradingSignalProfile,
 )
 from app.models.trade_setup import SwingTradePlan
+from app.models.workflow import WorkflowEventState, WorkflowStage
+from app.workflow.events import WorkflowEventEmitter
 
 
 UNIFIED_SWING_EVIDENCE_SOURCES = frozenset(
@@ -159,18 +162,21 @@ class JarvisSwingJudge:
             passed_checks.append("parallel_timeframe_execution_complete")
         else:
             reasons.append("daily and weekly execution was not parallel")
-        for label, submission, receipt, series in (
+        accumulation_verified = True
+        for label, submission, receipt, series, accumulation in (
             (
                 "daily",
                 analysis.daily_submission,
                 analysis.daily_validation,
                 analysis.timeframes.daily,
+                analysis.daily_accumulation,
             ),
             (
                 "weekly",
                 analysis.weekly_submission,
                 analysis.weekly_validation,
                 analysis.timeframes.weekly,
+                analysis.weekly_accumulation,
             ),
         ):
             _, recomputed_checks, submission_reasons = (
@@ -201,6 +207,21 @@ class JarvisSwingJudge:
                 reasons.append(
                     f"{label} technical validation receipt is invalid"
                 )
+            expected_accumulation = detect_accumulation_zones(
+                series,
+                as_of=submission.evaluated_at,
+            )
+            if accumulation != expected_accumulation:
+                accumulation_verified = False
+                reasons.append(
+                    f"{label} accumulation evidence does not match "
+                    "deterministic recalculation"
+                )
+
+        if accumulation_verified:
+            passed_checks.append(
+                "daily_and_weekly_accumulation_verified"
+            )
 
         daily_ids = {
             item.qualified_evidence_id
@@ -766,6 +787,7 @@ class AgentOrchestrator:
         *,
         timeframe_orchestrator: object | None = None,
         evidence_builder: object | None = None,
+        event_emitter: WorkflowEventEmitter | None = None,
     ) -> MultiTimeframeEvidenceReview:
         """Wait for both technical agents and ask the same Judge to release."""
         from app.models.timeframes import SwingTimeframeSeries
@@ -780,6 +802,11 @@ class AgentOrchestrator:
             raise ValueError(
                 "multi-timeframe analysis requires swing timeframe series"
             )
+        if event_emitter is not None and not isinstance(
+            event_emitter,
+            WorkflowEventEmitter,
+        ):
+            raise ValueError("multi-timeframe analysis requires a workflow emitter")
         technical_runner = (
             timeframe_orchestrator
             or ParallelTimeframeTechnicalOrchestrator()
@@ -799,9 +826,45 @@ class AgentOrchestrator:
                 "existing Jarvis Judge must provide review_multi_timeframe()"
             )
 
-        analysis = technical_runner.execute(timeframes)
-        evidence_package = builder.execute(analysis)
-        decision = review(evidence_package, analysis)
+        if event_emitter is None:
+            analysis = technical_runner.execute(timeframes)
+        else:
+            analysis = technical_runner.execute(
+                timeframes,
+                event_emitter=event_emitter,
+            )
+        identity = timeframes.hourly
+        event_common = {
+            "exchange": identity.exchange,
+            "symbol": identity.symbol,
+        }
+        if event_emitter is not None:
+            event_emitter.emit(
+                WorkflowStage.EVIDENCE_REVIEW,
+                WorkflowEventState.STARTED,
+                **event_common,
+            )
+        try:
+            evidence_package = builder.execute(analysis)
+            decision = review(evidence_package, analysis)
+        except Exception:
+            if event_emitter is not None:
+                event_emitter.emit(
+                    WorkflowStage.EVIDENCE_REVIEW,
+                    WorkflowEventState.FAILED,
+                    **event_common,
+                )
+            raise
+        if event_emitter is not None:
+            event_emitter.emit(
+                WorkflowStage.EVIDENCE_REVIEW,
+                (
+                    WorkflowEventState.COMPLETED
+                    if decision.accepted
+                    else WorkflowEventState.FAILED
+                ),
+                **event_common,
+            )
         return MultiTimeframeEvidenceReview(
             orchestrator_id=self.orchestrator_id,
             evidence_package=evidence_package,
@@ -814,12 +877,14 @@ class AgentOrchestrator:
         *,
         timeframe_orchestrator: object | None = None,
         evidence_builder: object | None = None,
+        event_emitter: WorkflowEventEmitter | None = None,
     ) -> MultiTimeframeEvidencePackage:
         """Return debate input only when both submissions pass Judge review."""
         result = self.run_multi_timeframe_analysis(
             timeframes,
             timeframe_orchestrator=timeframe_orchestrator,
             evidence_builder=evidence_builder,
+            event_emitter=event_emitter,
         )
         if result.released_evidence is None:
             reasons = "; ".join(result.decision.reasons)

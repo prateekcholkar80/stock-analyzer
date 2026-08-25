@@ -1,10 +1,35 @@
+from datetime import datetime
+
 from app.analytics.candle_aggregation import aggregate_candles
 from app.exceptions import InsufficientDataError
 from app.models.market import HistoricalCandleSeries
+from app.models.workflow import (
+    WorkflowActivityDescriptor,
+    WorkflowEventState,
+    WorkflowParticipantKind,
+    WorkflowStage,
+)
 from app.models.timeframes import (
     SwingTimeframeLineage,
     SwingTimeframeSeries,
     market_series_fingerprint,
+)
+from app.workflow.events import WorkflowEventEmitter
+
+
+_DAILY_AGGREGATION = WorkflowActivityDescriptor(
+    activity_id="market.aggregate.daily",
+    participant_id="research.market_data_service",
+    participant_kind=WorkflowParticipantKind.SERVICE,
+    participant_label="Daily Data Aggregator",
+    timeframe="ONE_DAY",
+)
+_WEEKLY_AGGREGATION = WorkflowActivityDescriptor(
+    activity_id="market.aggregate.weekly",
+    participant_id="research.market_data_service",
+    participant_kind=WorkflowParticipantKind.SERVICE,
+    participant_label="Weekly Data Aggregator",
+    timeframe="ONE_WEEK",
 )
 
 
@@ -16,6 +41,9 @@ class DeriveSwingTimeframes:
     def execute(
         self,
         hourly_series: HistoricalCandleSeries,
+        *,
+        as_of: datetime | None = None,
+        event_emitter: WorkflowEventEmitter | None = None,
     ) -> SwingTimeframeSeries:
         if not isinstance(hourly_series, HistoricalCandleSeries):
             raise ValueError(
@@ -25,15 +53,26 @@ class DeriveSwingTimeframes:
             raise ValueError(
                 "swing timeframe derivation requires ONE_HOUR candles"
             )
+        if event_emitter is not None and not isinstance(
+            event_emitter,
+            WorkflowEventEmitter,
+        ):
+            raise ValueError("timeframe derivation requires a workflow emitter")
 
         try:
-            daily = aggregate_candles(
+            daily = _aggregate_with_events(
                 hourly_series,
-                target_interval="ONE_DAY",
+                "ONE_DAY",
+                _DAILY_AGGREGATION,
+                event_emitter,
+                as_of,
             )
-            weekly = aggregate_candles(
+            weekly = _aggregate_with_events(
                 daily,
-                target_interval="ONE_WEEK",
+                "ONE_WEEK",
+                _WEEKLY_AGGREGATION,
+                event_emitter,
+                as_of,
             )
         except ValueError as exc:
             raise InsufficientDataError(
@@ -52,3 +91,44 @@ class DeriveSwingTimeframes:
             weekly=weekly,
             lineage=lineage,
         )
+
+
+def _aggregate_with_events(
+    series: HistoricalCandleSeries,
+    target_interval: str,
+    activity: WorkflowActivityDescriptor,
+    emitter: WorkflowEventEmitter | None,
+    as_of: datetime | None,
+) -> HistoricalCandleSeries:
+    common = {
+        "exchange": series.exchange,
+        "symbol": series.symbol,
+        "activity": activity,
+    }
+    if emitter is not None:
+        emitter.emit(
+            WorkflowStage.DATA_PREPARATION,
+            WorkflowEventState.STARTED,
+            **common,
+        )
+    try:
+        result = aggregate_candles(
+            series,
+            target_interval=target_interval,
+            as_of=as_of,
+        )
+    except Exception:
+        if emitter is not None:
+            emitter.emit(
+                WorkflowStage.DATA_PREPARATION,
+                WorkflowEventState.FAILED,
+                **common,
+            )
+        raise
+    if emitter is not None:
+        emitter.emit(
+            WorkflowStage.DATA_PREPARATION,
+            WorkflowEventState.COMPLETED,
+            **common,
+        )
+    return result

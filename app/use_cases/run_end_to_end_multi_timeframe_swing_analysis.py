@@ -10,6 +10,9 @@ from app.use_cases.derive_swing_timeframes import DeriveSwingTimeframes
 from app.use_cases.build_multi_timeframe_long_trade_plan import (
     BuildMultiTimeframeLongTradePlan,
 )
+from app.use_cases.build_multi_timeframe_swing_interpretation import (
+    BuildMultiTimeframeSwingInterpretation,
+)
 from app.use_cases.pull_rolling_market_series import PullRollingMarketSeries
 from app.workflow.events import WorkflowEventEmitter
 
@@ -27,6 +30,9 @@ class RunEndToEndMultiTimeframeSwingAnalysis:
         llm_preflight: LLMPreflightResult | None = None,
         timeframe_deriver: DeriveSwingTimeframes | None = None,
         trade_plan_builder: BuildMultiTimeframeLongTradePlan | None = None,
+        interpretation_builder: (
+            BuildMultiTimeframeSwingInterpretation | None
+        ) = None,
     ) -> None:
         self.rolling_fetch = rolling_fetch
         self.agent_orchestrator = agent_orchestrator or AgentOrchestrator()
@@ -50,6 +56,13 @@ class RunEndToEndMultiTimeframeSwingAnalysis:
         )
         if not callable(getattr(self.trade_plan_builder, "execute", None)):
             raise ValueError("trade-plan builder must provide execute()")
+        self.interpretation_builder = (
+            interpretation_builder or BuildMultiTimeframeSwingInterpretation()
+        )
+        if not callable(
+            getattr(self.interpretation_builder, "execute", None)
+        ):
+            raise ValueError("interpretation builder must provide execute()")
 
     def execute(
         self,
@@ -86,6 +99,16 @@ class RunEndToEndMultiTimeframeSwingAnalysis:
                 interval,
                 to_date=to_date,
             )
+            quote_loader = getattr(
+                self.rolling_fetch,
+                "get_latest_quote",
+                None,
+            )
+            latest_quote = (
+                quote_loader(exchange, symbol_token, symbol)
+                if callable(quote_loader)
+                else None
+            )
         except Exception:
             _emit(
                 event_emitter,
@@ -111,12 +134,21 @@ class RunEndToEndMultiTimeframeSwingAnalysis:
             symbol,
         )
         try:
-            timeframes = self.timeframe_deriver.execute(
-                fetch_receipt.stored.series
-            )
+            if event_emitter is None:
+                timeframes = self.timeframe_deriver.execute(
+                    fetch_receipt.stored.series,
+                    as_of=fetch_receipt.requested_to,
+                )
+            else:
+                timeframes = self.timeframe_deriver.execute(
+                    fetch_receipt.stored.series,
+                    as_of=fetch_receipt.requested_to,
+                    event_emitter=event_emitter,
+                )
             technical_review = (
                 self.agent_orchestrator.run_multi_timeframe_analysis(
-                    timeframes
+                    timeframes,
+                    event_emitter=event_emitter,
                 )
             )
             if technical_review.released_evidence is None:
@@ -150,17 +182,47 @@ class RunEndToEndMultiTimeframeSwingAnalysis:
             raise AgentSubmissionRejectedError(
                 "Jarvis rejected multi-timeframe debate: " + reasons
             )
-        trade_plan_result = self.trade_plan_builder.execute(
-            technical_review,
-            debate_result,
+        _emit(
+            event_emitter,
+            WorkflowStage.TRADE_PLANNING,
+            WorkflowEventState.STARTED,
+            exchange,
+            symbol,
+        )
+        try:
+            trade_plan_result = self.trade_plan_builder.execute(
+                technical_review,
+                debate_result,
+            )
+            interpretation = self.interpretation_builder.execute(
+                technical_review,
+                trade_plan_result,
+            )
+        except Exception:
+            _emit(
+                event_emitter,
+                WorkflowStage.TRADE_PLANNING,
+                WorkflowEventState.FAILED,
+                exchange,
+                symbol,
+            )
+            raise
+        _emit(
+            event_emitter,
+            WorkflowStage.TRADE_PLANNING,
+            WorkflowEventState.COMPLETED,
+            exchange,
+            symbol,
         )
         return MultiTimeframeEndToEndSwingAnalysisResult(
             use_case_id=self.use_case_id,
             market_dataset_id=fetch_receipt.dataset_id,
             fetch=fetch_receipt,
+            latest_quote=latest_quote,
             technical_review=technical_review,
             debate_result=debate_result,
             trade_plan_result=trade_plan_result,
+            interpretation=interpretation,
         )
 
 

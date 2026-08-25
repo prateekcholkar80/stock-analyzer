@@ -8,6 +8,7 @@ from app.analytics.support_resistance_lifecycle import (
 )
 from app.analytics.swing_pivots import detect_swing_pivots
 from app.models.agentic import TechnicalSwingAgentSubmission
+from app.models.accumulation import TimeframeAccumulationAnalysis
 from app.models.market import HistoricalCandleSeries
 from app.models.multi_timeframe_evidence import (
     ConfirmedPivotSummary,
@@ -61,11 +62,13 @@ class BuildMultiTimeframeEvidence:
             SwingAnalysisTimeframe.DAILY,
             analysis.timeframes.daily,
             analysis.daily_submission,
+            analysis.daily_accumulation,
         )
         weekly = self._build_context(
             SwingAnalysisTimeframe.WEEKLY,
             analysis.timeframes.weekly,
             analysis.weekly_submission,
+            analysis.weekly_accumulation,
         )
         return MultiTimeframeEvidencePackage(
             technical_analysis=analysis,
@@ -83,6 +86,7 @@ class BuildMultiTimeframeEvidence:
         timeframe: SwingAnalysisTimeframe,
         series: HistoricalCandleSeries,
         submission: TechnicalSwingAgentSubmission,
+        accumulation: TimeframeAccumulationAnalysis,
     ) -> TimeframeTechnicalEvidenceContext:
         evaluated_at = submission.evaluated_at
         available_candles = [
@@ -142,6 +146,7 @@ class BuildMultiTimeframeEvidence:
             interval=series.interval,
             evaluated_at=evaluated_at,
             current_close=current_close,
+            accumulation=accumulation,
             evidence=tuple(
                 QualifiedTechnicalEvidence(
                     timeframe=timeframe,

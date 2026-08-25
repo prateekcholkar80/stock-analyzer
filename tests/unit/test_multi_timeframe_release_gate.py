@@ -10,6 +10,7 @@ from app.models.multi_timeframe_evidence import (
     multi_timeframe_evidence_fingerprint,
 )
 from app.models.timeframes import MultiTimeframeTechnicalAnalysis
+from app.models.timeframes import multi_timeframe_technical_fingerprint
 from app.orchestration.agent_orchestrator import (
     AgentOrchestrator,
     JarvisSwingJudge,
@@ -82,6 +83,10 @@ class MultiTimeframeReleaseGateTests(unittest.TestCase):
         )
         self.assertIn(
             "weekly_technical_submission_approved",
+            result.decision.passed_checks,
+        )
+        self.assertIn(
+            "daily_and_weekly_accumulation_verified",
             result.decision.passed_checks,
         )
 
@@ -200,6 +205,41 @@ class MultiTimeframeReleaseGateTests(unittest.TestCase):
         self.assertFalse(decision.accepted)
         self.assertIn(
             "daily technical validation receipt is invalid",
+            decision.reasons,
+        )
+
+    def test_judge_recomputes_accumulation_before_debate_release(self):
+        forged_accumulation = self.analysis.weekly_accumulation.model_copy(
+            update={"zones": ()}
+        )
+        forged_analysis = MultiTimeframeTechnicalAnalysis(
+            **(
+                self.analysis.model_dump(exclude_computed_fields=True)
+                | {
+                    "weekly_accumulation": forged_accumulation,
+                    "combined_fingerprint": multi_timeframe_technical_fingerprint(
+                        self.analysis.timeframes,
+                        self.analysis.daily_submission,
+                        self.analysis.weekly_submission,
+                        self.analysis.daily_accumulation,
+                        forged_accumulation,
+                    ),
+                }
+            )
+        )
+        forged_package = BuildMultiTimeframeEvidence().execute(
+            forged_analysis
+        )
+
+        decision = AgentOrchestrator().judge.review_multi_timeframe(
+            forged_package,
+            forged_analysis,
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn(
+            "weekly accumulation evidence does not match deterministic "
+            "recalculation",
             decision.reasons,
         )
 

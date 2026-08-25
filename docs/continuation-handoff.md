@@ -9,7 +9,7 @@ evidence, local artifacts, known gaps, and recommended next work.
 
 ## 1. Current Verified State
 
-- Offline regression baseline: **1,295 passing unit and integration tests**.
+- Offline regression baseline: **1,337 passing unit and integration tests**.
 - Bytecode compilation completed successfully.
 - `pip check` reported no broken requirements.
 - `git diff --check` completed successfully.
@@ -78,6 +78,10 @@ typed text or transcribed voice
   -> BuildMultiTimeframeLongTradePlan
        actionable long only when Judge and daily profile are bullish
        otherwise NO_TRADE
+  -> JarvisBrowserOperationHandler
+       evidence-locked CEO presentation and immutable operation output
+  -> AsyncBrowserOperationRunner
+       terminal status/event, replay, result retrieval, or safe failure
   -> JarvisPresentationAgent renders CEO briefing
   -> approved review/debate retained for evidence-locked Judge follow-ups
 ```
@@ -253,13 +257,64 @@ git diff --check
 git status --short
 ```
 
-Expected full-suite baseline for this handoff: `Ran 1295 tests` and `OK`.
+Expected full-suite baseline for this handoff: `Ran 1344 tests` and `OK`.
 Do not treat a live provider call as part of the offline regression suite.
+
+### UI event foundation added after the original handoff
+
+`JarvisWorkflowEvent` is now schema v2. Each event has an extensible
+`WorkflowActivityDescriptor` containing a namespaced activity/participant,
+generic participant kind, display label, and optional timeframe. Current
+multi-timeframe execution emits real daily/weekly aggregation and analyst
+events, Judge evidence release, debate/verdict, and deterministic trade-plan
+events. Future financial-statement and news analysts can use the same envelope.
+Presentation and follow-up activities are now emitted by the asynchronous
+browser handler under the shared operation lifecycle, preventing duplicate
+sequence IDs.
+
+The first shared lifecycle layer is now implemented in
+`app/models/browser_operations.py` and `app/workflow/operations.py`. It defines
+browser sessions, idempotent operation requests, queued/running/cancellation/
+terminal snapshots, safe failures, reconnect cursors, event batches, a
+database-neutral registry protocol, and a thread-safe in-memory adapter.
+
+`app/workflow/browser_runner.py` now schedules that work through a bounded
+executor. It reuses the existing research façade with an external operation ID
+and emitter, runs CEO presentation before the outer completion, stores typed
+outputs separately from events, retains only approved multi-timeframe context
+for Judge follow-ups, and handles cooperative cancellation and safe failures.
+It deliberately remains transport neutral. `app/api/http.py` now adapts it to
+versioned FastAPI session, submit, status, result, cancel, and cursor-replay
+routes. Session capability tokens are required, only token digests are stored,
+and operation ownership is enforced. Authenticated SSE now replays persisted
+events, resumes through qualified `Last-Event-ID`, emits periodic heartbeats,
+and terminates with the authoritative operation snapshot.
+
+The first frontend read model is implemented in `app/models/dashboard.py` and
+`app/presentation/dashboard.py`. `jarvis.dashboard.v1` is available from the
+authenticated completed-operation dashboard endpoint. It contains bounded
+daily/weekly chart candles, analyst cards, exact evidence IDs and decisive
+markers, confirmed pivots, immediate support/resistance lifecycle, Bull/Bear
+rounds, Judge verdict, long-only 2R/3R or explicit no-trade values, workflow
+activities, and the existing Jarvis explanation. It performs no indicator or
+trade recalculation. It currently reads the operation result in memory, so it
+does not close the durable historical-dashboard gap.
+
+The first actual browser client is now under `frontend/`. It is a responsive,
+wake-aware Jarvis command center with a code-rendered reactor, extensible agent
+cards, authenticated conversation/workflow SSE consumption, event-derived
+progress matrix, bounded daily/weekly candlesticks, evidence and levels,
+Bull/Bear/Judge synthesis, and exact trade/no-trade presentation. It contains
+no microphone, STT, TTS, or ElevenLabs credential. The browser defaults to the
+Python API at `http://127.0.0.1:8000`; the live API example now allows local
+port 3000 as well as the former port 5173.
 
 ## 11. Known Gaps and Honest Boundaries
 
 - No microphone, acoustic wake-word engine, speech-to-text, or text-to-speech.
-- No HTTP API, WebSocket/SSE transport, browser client, or 3D Jarvis dashboard.
+- No WebSocket alternative, browser client, or 3D Jarvis dashboard. HTTP
+  polling/replay, authenticated SSE streaming, wake-aware conversation routes,
+  and a typed dashboard projection are implemented.
 - No document upload/parser/chunker/vector index/RAG or financial agent.
 - No news, sentiment, macro, portfolio construction, or order placement.
 - No live market ticker; the product is historical/swing research.
@@ -281,10 +336,10 @@ Do not treat a live provider call as part of the offline regression suite.
    `MultiTimeframeEndToEndSwingAnalysisResult`, then implement in-memory and
    DuckDB adapters with normalized daily/weekly evidence, verdict, trade plan,
    and presentation tables. This is the recommended immediate step.
-2. Add dashboard queries/read models for historical runs, daily/weekly charts,
-   evidence overlays, Bull/Bear/Judge reasoning, and actionable/no-trade plans.
-3. Wrap `JarvisConversationSession` in a transport-neutral HTTP application API
-   and expose typed workflow events over SSE or WebSocket.
+2. Persist the completed dashboard aggregate and add historical-run queries;
+   the live completed-operation read model is implemented.
+3. Add browser microphone capture, speech-to-text, a provider-neutral TTS port,
+   and a server-side ElevenLabs adapter to the implemented workflow-matrix UI.
 4. Build the interactive Jarvis UI against those result/event contracts; do not
    scrape text logs to infer state.
 5. Add microphone/wake-word/STT/TTS adapters while keeping transcript handling

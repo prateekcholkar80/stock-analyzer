@@ -12,6 +12,7 @@ from app.audit.prompt_audit import (
     prompt_audit_session_context,
 )
 from app.conversation.config import JarvisConversationConfig
+from app.conversation.follow_up import looks_like_analysis_follow_up
 from app.conversation.events import (
     ConversationEventEmitter,
     ConversationEventSink,
@@ -557,7 +558,7 @@ class JarvisConversationSession:
             self._judge_follow_up_executor is None
             or self._last_multi_timeframe_review is None
             or self._last_multi_timeframe_debate is None
-            or not _looks_like_analysis_follow_up(command)
+            or not looks_like_analysis_follow_up(command)
         ):
             return None
         return (
@@ -580,39 +581,3 @@ class JarvisConversationSession:
     def _clear_multi_timeframe_context(self) -> None:
         self._last_multi_timeframe_review = None
         self._last_multi_timeframe_debate = None
-
-
-_FOLLOW_UP_TERMS = frozenset(
-    {
-        "support",
-        "resistance",
-        "pivot",
-        "daily",
-        "weekly",
-        "evidence",
-        "judge",
-        "verdict",
-        "conclusion",
-        "explain",
-        "why",
-        "tell me more",
-    }
-)
-_NEW_ANALYSIS_TERMS = (
-    "analyze ",
-    "analyse ",
-    "analysis of ",
-    "research ",
-    "swing trade",
-    "how is ",
-    "how's ",
-    "how does ",
-    "look at ",
-)
-
-
-def _looks_like_analysis_follow_up(command: str) -> bool:
-    normalized = " ".join(command.casefold().split())
-    if any(term in normalized for term in _NEW_ANALYSIS_TERMS):
-        return False
-    return any(term in normalized for term in _FOLLOW_UP_TERMS)

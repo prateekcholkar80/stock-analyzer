@@ -5,6 +5,7 @@ from app.models.agentic import (
     AgenticSwingAnalysisResult,
     JarvisJudgeDecision,
     JarvisJudgeVerdict,
+    TradePlanningReason,
 )
 from app.models.debate import AgenticDebateResult
 from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
@@ -14,11 +15,18 @@ from app.models.multi_timeframe_trade import (
     MultiTimeframeTradeReason,
 )
 from app.models.signals import SignalDirection
+from app.models.trade_decision import (
+    MarketCondition,
+    NoTradeReason,
+    TradeDecision,
+    TradeDecisionOutcome,
+    combined_profile_market_condition,
+)
 from app.orchestration.agent_orchestrator import AgentOrchestrator
 
 
 class BuildMultiTimeframeLongTradePlan:
-    """Apply a long-only 2R policy after the multi-timeframe Judge verdict."""
+    """Build a 2R BUY/NO_TRADE outcome after the Judge verdict."""
 
     use_case_id = "jarvis.build_multi_timeframe_long_trade_plan.v1"
 
@@ -37,37 +45,64 @@ class BuildMultiTimeframeLongTradePlan:
     ) -> MultiTimeframeLongTradePlanResult:
         package = _validated_chain(technical_review, debate_result)
         verdict = debate_result.submission.verdict
+        analysis = package.technical_analysis
+        market_condition = combined_profile_market_condition(
+            analysis.daily_submission.profile,
+            analysis.weekly_submission.profile,
+        )
         common = {
+            "schema_version": "jarvis.multi_timeframe_trade_plan.v2",
+            "policy_id": "jarvis.buy_eligibility_2r_swing_policy.v2",
             "technical_package_fingerprint": package.package_fingerprint,
             "technical_decision_id": technical_review.decision.decision_id,
             "debate_verdict_id": verdict.verdict_id,
         }
 
         if verdict.winner is not SignalDirection.BULLISH:
+            no_trade_reason = _condition_no_trade_reason(
+                market_condition,
+                judge_rejected=True,
+            )
+            rationale = (
+                "No BUY decision was issued because the final Judge "
+                f"verdict is {verdict.winner.value}; the deterministic "
+                "daily/weekly market condition remains "
+                f"{market_condition.value}."
+            )
             return MultiTimeframeLongTradePlanResult(
                 **common,
                 disposition=MultiTimeframeTradeDisposition.NO_TRADE,
                 reason=MultiTimeframeTradeReason.JUDGE_NOT_BULLISH,
-                rationale=(
-                    "No long trade was proposed because the final Judge "
-                    f"verdict is {verdict.winner.value}."
+                trade_decision=TradeDecisionOutcome(
+                    market_condition=market_condition,
+                    decision=TradeDecision.NO_TRADE,
+                    no_trade_reasons=(no_trade_reason,),
+                    rationale=rationale,
                 ),
+                rationale=rationale,
             )
 
-        analysis = package.technical_analysis
-        daily_submission = analysis.daily_submission
-        if daily_submission.profile.direction is not SignalDirection.BULLISH:
+        if market_condition is not MarketCondition.BULLISH:
+            no_trade_reason = _condition_no_trade_reason(market_condition)
+            rationale = (
+                "No BUY decision was issued because the deterministic "
+                "daily and weekly profiles are not aligned bullish; the "
+                f"combined market condition is {market_condition.value}."
+            )
             return MultiTimeframeLongTradePlanResult(
                 **common,
                 disposition=MultiTimeframeTradeDisposition.NO_TRADE,
-                reason=MultiTimeframeTradeReason.DAILY_PROFILE_NOT_BULLISH,
-                rationale=(
-                    "No long trade was proposed because the Judge is bullish "
-                    "but the daily technical profile is not bullish enough "
-                    "to define a long entry."
+                reason=MultiTimeframeTradeReason.TIMEFRAME_SETUP_NOT_ALIGNED,
+                trade_decision=TradeDecisionOutcome(
+                    market_condition=market_condition,
+                    decision=TradeDecision.NO_TRADE,
+                    no_trade_reasons=(no_trade_reason,),
+                    rationale=rationale,
                 ),
+                rationale=rationale,
             )
 
+        daily_submission = analysis.daily_submission
         daily_result = AgenticSwingAnalysisResult(
             orchestrator_id=self._orchestrator.orchestrator_id,
             submission=daily_submission,
@@ -95,6 +130,9 @@ class BuildMultiTimeframeLongTradePlan:
             )
         plan = planning.approved_trade_intent
         if plan is None:
+            no_trade_reason = _planner_no_trade_reason(
+                planning.submission.reason
+            )
             return MultiTimeframeLongTradePlanResult(
                 **common,
                 disposition=MultiTimeframeTradeDisposition.NO_TRADE,
@@ -102,8 +140,19 @@ class BuildMultiTimeframeLongTradePlan:
                     MultiTimeframeTradeReason.DETERMINISTIC_PLANNER_NO_TRADE
                 ),
                 daily_planning_result=planning,
+                trade_decision=TradeDecisionOutcome(
+                    market_condition=MarketCondition.BULLISH,
+                    decision=TradeDecision.NO_TRADE,
+                    no_trade_reasons=(no_trade_reason,),
+                    rationale=planning.submission.rationale,
+                ),
                 rationale=planning.submission.rationale,
             )
+        rationale = (
+            "The final Judge and daily profile are bullish, and the "
+            "deterministic planner found a structure-aware buy setup "
+            "with a feasible 1:2 minimum target."
+        )
         return MultiTimeframeLongTradePlanResult(
             **common,
             disposition=MultiTimeframeTradeDisposition.ACTIONABLE,
@@ -111,11 +160,12 @@ class BuildMultiTimeframeLongTradePlan:
                 MultiTimeframeTradeReason.BULLISH_VERDICT_AND_DAILY_SETUP
             ),
             daily_planning_result=planning,
-            rationale=(
-                "The final Judge and daily profile are bullish, and the "
-                "deterministic planner found a structure-aware long setup "
-                "with a feasible 1:2 minimum target."
+            trade_decision=TradeDecisionOutcome(
+                market_condition=MarketCondition.BULLISH,
+                decision=TradeDecision.BUY,
+                rationale=rationale,
             ),
+            rationale=rationale,
         )
 
 
@@ -145,3 +195,46 @@ def _daily_projection_decision_id(
     technical_review: MultiTimeframeEvidenceReview,
 ) -> str:
     return f"{technical_review.decision.decision_id}:daily_trade_projection"
+
+
+def _condition_no_trade_reason(
+    condition: MarketCondition,
+    *,
+    judge_rejected: bool = False,
+) -> NoTradeReason:
+    mapping = {
+        MarketCondition.BEARISH: NoTradeReason.BEARISH_CONDITION,
+        MarketCondition.NEUTRAL: NoTradeReason.NEUTRAL_CONDITION,
+        MarketCondition.CONFLICTED: NoTradeReason.TIMEFRAME_CONFLICT,
+        MarketCondition.INSUFFICIENT: NoTradeReason.INSUFFICIENT_DATA,
+    }
+    if condition is MarketCondition.BULLISH and judge_rejected:
+        return NoTradeReason.JUDGE_REJECTED_BULLISH_CASE
+    try:
+        return mapping[condition]
+    except KeyError as error:
+        raise ValueError(
+            "bullish market condition requires a bullish Judge verdict"
+        ) from error
+
+
+def _planner_no_trade_reason(
+    reason: TradePlanningReason,
+) -> NoTradeReason:
+    mapping = {
+        TradePlanningReason.MINIMUM_TARGET_BLOCKED: (
+            NoTradeReason.MINIMUM_TARGET_BLOCKED
+        ),
+        TradePlanningReason.INSUFFICIENT_STOP_EVIDENCE: (
+            NoTradeReason.STRUCTURAL_STOP_UNAVAILABLE
+        ),
+        TradePlanningReason.NON_DIRECTIONAL_PROFILE: (
+            NoTradeReason.DAILY_TRIGGER_INCOMPLETE
+        ),
+    }
+    try:
+        return mapping[reason]
+    except KeyError as error:
+        raise ValueError(
+            "planner no-trade outcome has an unsupported reason"
+        ) from error

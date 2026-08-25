@@ -13,16 +13,26 @@ from pydantic import (
 from app.models.agentic import AgenticSwingAnalysisResult
 from app.models.backtest import WalkForwardBacktestResult
 from app.models.debate import AgenticDebateResult, DebateTerminationReason
-from app.models.market import HistoricalCandleSeries
+from app.models.market import HistoricalCandleSeries, MarketQuote
+from app.models.market_refresh import IntradayCandleGap
 from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
 from app.models.multi_timeframe_trade import (
     MultiTimeframeLongTradePlanResult,
+    MultiTimeframeTradeDisposition,
     MultiTimeframeTradeReason,
 )
 from app.models.signals import (
     SignalDirection,
     SignalStrength,
     SwingTradingSignalProfile,
+)
+from app.models.trade_decision import (
+    MarketCondition,
+    TradeDecision,
+    combined_profile_market_condition,
+)
+from app.models.timeframe_interpretation import (
+    MultiTimeframeSwingInterpretation,
 )
 
 
@@ -236,8 +246,56 @@ class RollingFetchReceipt(StorageModel):
     )
     stored: StoredMarketSeries
     new_candle_count: int = Field(ge=0)
+    corrected_candle_count: int = Field(default=0, ge=0)
+    deduplicated_fetched_candle_count: int = Field(default=0, ge=0)
     chunk_request_count: int = Field(ge=0)
     resumed_from: datetime | None = None
+    requested_from: datetime | None = None
+    requested_to: datetime | None = None
+    checked_at: datetime | None = None
+    reused_existing_dataset: bool = False
+    intraday_gaps: tuple[IntradayCandleGap, ...] = ()
+
+    @field_validator(
+        "resumed_from",
+        "requested_from",
+        "requested_to",
+        "checked_at",
+    )
+    @classmethod
+    def require_timezone(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() is None
+        ):
+            raise ValueError("rolling-fetch timestamps must include timezone")
+        return value
+
+    @model_validator(mode="after")
+    def validate_refresh_outcome(self) -> Self:
+        if (
+            self.requested_from is not None
+            and self.requested_to is not None
+            and self.requested_from > self.requested_to
+        ):
+            raise ValueError(
+                "rolling-fetch requested start cannot follow requested end"
+            )
+        if self.reused_existing_dataset and (
+            self.new_candle_count > 0 or self.corrected_candle_count > 0
+        ):
+            raise ValueError(
+                "reused market dataset cannot contain new or corrected candles"
+            )
+        gap_keys = [
+            (gap.interval, gap.gap_after, gap.resumes_at)
+            for gap in self.intraday_gaps
+        ]
+        if len(gap_keys) != len(set(gap_keys)):
+            raise ValueError("rolling-fetch candle gaps must be unique")
+        return self
 
     @property
     def dataset_id(self) -> str:
@@ -280,9 +338,11 @@ class MultiTimeframeEndToEndSwingAnalysisResult(StorageModel):
         pattern=_IDENTIFIER_PATTERN,
     )
     fetch: RollingFetchReceipt
+    latest_quote: MarketQuote | None = None
     technical_review: MultiTimeframeEvidenceReview
     debate_result: AgenticDebateResult
     trade_plan_result: MultiTimeframeLongTradePlanResult
+    interpretation: MultiTimeframeSwingInterpretation | None = None
 
     @model_validator(mode="after")
     def validate_review_chain(self) -> Self:
@@ -290,6 +350,16 @@ class MultiTimeframeEndToEndSwingAnalysisResult(StorageModel):
             raise ValueError(
                 "multi-timeframe result must reference its fetched dataset"
             )
+        if self.latest_quote is not None:
+            series = self.fetch.stored.series
+            if (
+                self.latest_quote.exchange != series.exchange
+                or self.latest_quote.symbol_token != series.symbol_token
+                or self.latest_quote.symbol != series.symbol
+            ):
+                raise ValueError(
+                    "multi-timeframe quote must match its fetched instrument"
+                )
         package = self.technical_review.released_evidence
         if package is None:
             raise ValueError(
@@ -343,6 +413,105 @@ class MultiTimeframeEndToEndSwingAnalysisResult(StorageModel):
             raise ValueError(
                 "non-bullish Judge verdict cannot produce a long trade plan"
             )
+        decision = trade.trade_decision
+        interpretation = self.interpretation
+        if decision is not None:
+            if interpretation is None:
+                expected_condition = {
+                    SignalDirection.BULLISH: MarketCondition.BULLISH,
+                    SignalDirection.BEARISH: MarketCondition.BEARISH,
+                    SignalDirection.NEUTRAL: MarketCondition.NEUTRAL,
+                }[verdict.winner]
+                condition_source = "legacy Judge verdict"
+            else:
+                analysis = package.technical_analysis
+                expected_condition = combined_profile_market_condition(
+                    analysis.daily_submission.profile,
+                    analysis.weekly_submission.profile,
+                )
+                condition_source = "deterministic daily/weekly profiles"
+            if decision.market_condition is not expected_condition:
+                raise ValueError(
+                    "trade decision market condition must match the "
+                    f"{condition_source}"
+                )
+            expected_decision = (
+                TradeDecision.BUY
+                if trade.disposition
+                is MultiTimeframeTradeDisposition.ACTIONABLE
+                else TradeDecision.NO_TRADE
+            )
+            if decision.decision is not expected_decision:
+                raise ValueError(
+                    "trade decision must match the planning disposition"
+                )
+        if interpretation is not None:
+            if decision is None or interpretation.trade_decision != decision:
+                raise ValueError(
+                    "multi-timeframe interpretation decision must match the "
+                    "trade-planning decision"
+                )
+            if (
+                interpretation.daily.evaluated_at
+                != package.daily.evaluated_at
+                or interpretation.weekly.evaluated_at
+                != package.weekly.evaluated_at
+            ):
+                raise ValueError(
+                    "multi-timeframe interpretation must use the released "
+                    "timeframe evaluations"
+                )
+            available_evidence = {
+                item.qualified_evidence_id
+                for context in (package.daily, package.weekly)
+                for item in context.evidence
+            }
+            available_evidence.update(
+                summary.qualified_zone_id
+                for context in (package.daily, package.weekly)
+                for summary in (
+                    context.nearest_support,
+                    context.nearest_resistance,
+                )
+                if summary is not None
+            )
+            available_evidence.update(
+                pivot.qualified_pivot_id
+                for context in (package.daily, package.weekly)
+                for pivot in context.recent_confirmed_pivots
+            )
+            for context in (package.daily, package.weekly):
+                for zone in context.accumulation.zones:
+                    available_evidence.add(zone.zone_id)
+                    available_evidence.update(zone.evidence_ids)
+                    for sweep in zone.liquidity_sweeps:
+                        available_evidence.add(sweep.sweep_id)
+                        available_evidence.update(sweep.evidence_ids)
+            cited_evidence = set(interpretation.decisive_evidence_ids)
+            cited_evidence.update(
+                interpretation.daily.decisive_evidence_ids
+            )
+            cited_evidence.update(
+                interpretation.weekly.decisive_evidence_ids
+            )
+            for target in (
+                interpretation.risk_reward.target_2r,
+                interpretation.risk_reward.target_3r,
+            ):
+                cited_evidence.update(target.blocking_evidence_ids)
+            for setup in (
+                interpretation.daily.bullish_setup,
+                interpretation.daily.bearish_setup,
+                interpretation.weekly.bullish_setup,
+                interpretation.weekly.bearish_setup,
+            ):
+                for step in setup.steps:
+                    cited_evidence.update(step.evidence_ids)
+            if not cited_evidence <= available_evidence:
+                raise ValueError(
+                    "multi-timeframe interpretation cites evidence outside "
+                    "the released technical package"
+                )
         return self
 
 

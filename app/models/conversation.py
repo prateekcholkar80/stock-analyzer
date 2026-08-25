@@ -37,6 +37,7 @@ class ConversationOutcome(StrEnum):
     FAILED = "failed"
     CLARIFICATION_REQUIRED = "clarification_required"
     BUSY = "busy"
+    DISPATCHED = "dispatched"
 
 
 class JarvisUtterance(TechnicalModel):

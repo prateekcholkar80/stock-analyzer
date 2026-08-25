@@ -16,7 +16,7 @@ safe failure instead of silently substituting a deterministic recommendation.
 The market-data, Phase 2 technical-analysis/backtesting, storage, full debate,
 natural-language routing, and conversation-foundation layers are implemented.
 
-Automated baseline: **1,295 passing tests** (unit and integration), executed
+Automated baseline: **1,337 passing tests** (unit and integration), executed
 offline without live credentials.
 
 Implemented:
@@ -48,13 +48,25 @@ Implemented:
 - Retained approved analysis context for grounded follow-up questions routed
   back to the same Judge abstraction
 - Typed conversation and workflow events suitable for a future dynamic UI
+- Extensible workflow-event v2 activities with namespaced participants, generic
+  analyst categories, and timeframe metadata for current and future agents
+- Transport-neutral asynchronous browser-operation contracts with idempotency,
+  cooperative cancellation, one-active-operation sessions, and event replay
+- Bounded background runner that executes research, CEO presentation, and
+  grounded Judge follow-ups under one operation sequence with separate,
+  immutable result storage
+- Versioned FastAPI boundary for browser sessions, idempotent submission,
+  status/result polling, cancellation, and reconnect-safe event replay
+- Wake-aware browser conversation coordinator for typed text and voice
+  transcripts, asynchronous dispatch, response acknowledgement, sleep, and
+  grounded Judge follow-ups
 - Opt-in, redacted JSONL review trail for Jarvis and LLM agent exchanges
 - Structured JSON logging, correlation IDs, and secret-safe failures
 
 Intentionally not implemented yet:
 
 - Microphone capture, speech-to-text, text-to-speech, or always-listening audio
-- HTTP/WebSocket API and the 3D Jarvis dashboard
+- WebSocket alternative transport and the 3D Jarvis dashboard
 - Financial-statement and earnings-call document ingestion/RAG
 - Fundamental-analysis agent and document-grounded financial conclusions
 - News discovery, sentiment, and macro-analysis agents
@@ -159,13 +171,78 @@ Research workflow events separately expose:
 
 ```text
 request received -> instrument resolved -> market data loading
--> technical analysis -> Bull debating -> Bear debating
--> Judge reviewing -> completed/failed
+-> daily/weekly preparation -> parallel daily/weekly analysis
+-> evidence review -> Bull debating -> Bear debating -> Judge reviewing
+-> long-only trade planning -> CEO presentation -> completed/failed
 ```
 
 Events are typed, ordered per session/operation, timestamped in IST, and contain
 fixed secret-safe messages. Event-sink failures are logged but do not terminate
 the research operation.
+
+## Browser HTTP API
+
+The versioned FastAPI adapter exposes:
+
+```text
+POST   /api/v1/sessions
+DELETE /api/v1/sessions/{session_id}
+POST   /api/v1/sessions/{session_id}/operations
+GET    /api/v1/sessions/{session_id}/operations/{operation_id}
+GET    /api/v1/sessions/{session_id}/operations/{operation_id}/result
+POST   /api/v1/sessions/{session_id}/operations/{operation_id}/cancel
+GET    /api/v1/sessions/{session_id}/operations/{operation_id}/events
+GET    /api/v1/sessions/{session_id}/operations/{operation_id}/events/stream
+GET    /api/v1/sessions/{session_id}/operations/{operation_id}/dashboard
+GET    /api/v1/sessions/{session_id}/conversation
+POST   /api/v1/sessions/{session_id}/conversation/turns
+POST   /api/v1/sessions/{session_id}/conversation/sleep
+GET    /api/v1/sessions/{session_id}/conversation/events
+GET    /api/v1/sessions/{session_id}/conversation/events/stream
+```
+
+The session-creation response supplies a capability token. Send it on all
+session-scoped requests as `X-Jarvis-Session-Token`. Only token digests are
+stored by the in-memory authorization adapter. Operation IDs are server-owned;
+the browser supplies an idempotency key. Result polling returns `202` while
+work is pending, `200` only after official completion, and `409` for failed or
+cancelled operations. OpenAPI is available at `/api/docs`.
+
+The completed-analysis dashboard route returns `jarvis.dashboard.v1`: bounded
+daily/weekly OHLCV series, analyst stance and score, qualified evidence,
+confirmed pivots, immediate support/resistance, Bull/Bear rounds, the Judge
+verdict, an exact long-only 2R/3R plan or explicit no-trade fields, workflow
+activities, and the Jarvis presentation. It is a projection only and never
+recalculates or rewrites domain evidence.
+
+The first browser client lives in `frontend/`. It creates an authenticated
+session, accepts the text wake phrase and commands, consumes conversation and
+operation SSE with the capability header, animates the real workflow activity
+matrix, and renders the completed dashboard projection. Configure its API URL
+with `NEXT_PUBLIC_JARVIS_API_URL`; the local default is
+`http://127.0.0.1:8000`.
+
+The SSE route first replays persisted events, then streams new progress with
+periodic heartbeats and finishes with an authoritative `terminal` event. Its
+event IDs use `{operation_id}:{sequence}` and support browser reconnection via
+`Last-Event-ID` or `after_sequence`. Because native `EventSource` cannot attach
+the required capability header, the first UI should consume this endpoint with
+authenticated `fetch()` streaming rather than putting the token in a URL.
+
+Browser conversation state follows:
+
+```text
+dormant -> greeting -> listening -> processing -> responding -> dormant
+                                      |
+                                      +-> failed -> dormant
+```
+
+While dormant, input is ignored unless it begins with the configured wake
+phrase. Both typed text and already-transcribed voice use the same detector.
+Jarvis greets the configured user, dispatches research through the asynchronous
+runner, and exposes conversation transitions through replay and SSE. A later
+support/resistance/pivot/evidence question is sent to the Judge only when the
+session retains an approved multi-timeframe analysis.
 
 ## Requirements
 
@@ -334,10 +411,11 @@ not a substitute for access control, retention, rotation, or secure deletion.
 
 1. Persist the complete multi-timeframe result through new database-neutral
    repository ports and normalized DuckDB tables.
-2. Add dashboard read models for daily/weekly charts, evidence, debate, and the
-   long-only plan/no-trade outcome.
-3. Add a transport-neutral application API around the conversation session.
-4. Stream conversation and research workflow events over WebSocket/SSE.
+2. Persist dashboard history; the live completed-operation read model is built,
+   but it currently projects the in-memory operation result.
+3. Extend the implemented workflow-matrix UI with microphone, speech-to-text,
+   provider-neutral speech synthesis, and the ElevenLabs adapter.
+4. Add microphone/STT/TTS adapters to the same transcript/response contracts.
 5. Add speech-to-text and text-to-speech adapters without coupling the domain
    session to an audio vendor.
 6. Build the interactive Jarvis dashboard against the typed event and result

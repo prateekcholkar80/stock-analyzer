@@ -170,3 +170,19 @@ class StorageError(ApplicationError):
 
 class StorageConflictError(StorageError):
     """Raised when an immutable stored identifier has conflicting data."""
+
+
+class WorkflowOperationError(ApplicationError):
+    """Base failure for browser-session and asynchronous-operation state."""
+
+
+class BrowserSessionNotFoundError(WorkflowOperationError):
+    """Raised when a browser session does not exist."""
+
+
+class BrowserOperationNotFoundError(WorkflowOperationError):
+    """Raised when a browser operation does not exist."""
+
+
+class BrowserOperationConflictError(WorkflowOperationError):
+    """Raised when an operation violates identity or lifecycle constraints."""

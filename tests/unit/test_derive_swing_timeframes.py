@@ -10,7 +10,9 @@ from app.models.timeframes import (
     SwingTimeframeSeries,
     market_series_fingerprint,
 )
+from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.use_cases.derive_swing_timeframes import DeriveSwingTimeframes
+from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -88,6 +90,36 @@ class DeriveSwingTimeframesTests(unittest.TestCase):
             1,
         )
 
+    def test_uses_requested_cutoff_for_angel_start_stamped_close(self):
+        hourly = _hourly_series(complete_days=10)
+        final_day = hourly.candles[-1].timestamp
+        angel_hourly = hourly.model_copy(
+            update={
+                "candles": [
+                    candle.model_copy(
+                        update={
+                            "timestamp": candle.timestamp.replace(minute=15)
+                        }
+                    )
+                    for candle in hourly.candles
+                ]
+            }
+        )
+
+        before_close = self.use_case.execute(
+            angel_hourly,
+            as_of=final_day.replace(hour=15, minute=29),
+        )
+        after_close = self.use_case.execute(
+            angel_hourly,
+            as_of=final_day.replace(hour=15, minute=30),
+        )
+
+        self.assertEqual(len(before_close.daily.candles), 9)
+        self.assertEqual(len(after_close.daily.candles), 10)
+        self.assertEqual(len(before_close.weekly.candles), 1)
+        self.assertEqual(len(after_close.weekly.candles), 2)
+
     def test_records_exact_immutable_lineage_fingerprints(self):
         result = self.use_case.execute(_hourly_series())
 
@@ -155,6 +187,69 @@ class DeriveSwingTimeframesTests(unittest.TestCase):
         second = self.use_case.execute(hourly)
 
         self.assertEqual(first, second)
+
+    def test_emits_daily_then_weekly_preparation_from_real_work(self):
+        sink = InMemoryWorkflowEventSink()
+        emitter = WorkflowEventEmitter("operation", sink)
+
+        self.use_case.execute(
+            _hourly_series(),
+            event_emitter=emitter,
+        )
+
+        self.assertEqual(
+            [
+                (
+                    event.stage,
+                    event.state,
+                    event.activity.activity_id,
+                    event.activity.timeframe,
+                )
+                for event in sink.events
+            ],
+            [
+                (
+                    WorkflowStage.DATA_PREPARATION,
+                    WorkflowEventState.STARTED,
+                    "market.aggregate.daily",
+                    "ONE_DAY",
+                ),
+                (
+                    WorkflowStage.DATA_PREPARATION,
+                    WorkflowEventState.COMPLETED,
+                    "market.aggregate.daily",
+                    "ONE_DAY",
+                ),
+                (
+                    WorkflowStage.DATA_PREPARATION,
+                    WorkflowEventState.STARTED,
+                    "market.aggregate.weekly",
+                    "ONE_WEEK",
+                ),
+                (
+                    WorkflowStage.DATA_PREPARATION,
+                    WorkflowEventState.COMPLETED,
+                    "market.aggregate.weekly",
+                    "ONE_WEEK",
+                ),
+            ],
+        )
+
+    def test_emits_failed_weekly_preparation_for_insufficient_history(self):
+        sink = InMemoryWorkflowEventSink()
+        emitter = WorkflowEventEmitter("operation", sink)
+
+        with self.assertRaises(InsufficientDataError):
+            self.use_case.execute(
+                _hourly_series(complete_days=2),
+                event_emitter=emitter,
+            )
+
+        self.assertEqual(
+            sink.events[-1].activity.activity_id,
+            "market.aggregate.weekly",
+        )
+        self.assertIs(sink.events[-1].state, WorkflowEventState.FAILED)
 
 
 if __name__ == "__main__":

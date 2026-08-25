@@ -98,7 +98,33 @@ For the complete offline regression baseline:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Expected baseline at this handoff: **1,295 tests, OK**. The last live Reliance
+Expected backend baseline at this handoff: **1,344 tests, OK**. The last live Reliance
 run produced a bearish verdict at 62% confidence and the deterministic
 long-only result `NO_TRADE`. It did not validate a naturally bullish live
 actionable plan; that path is covered by offline tests.
+
+## Browser API
+
+With valid Angel One, Jarvis user, and LLM configuration, start the live API:
+
+```bash
+.venv/bin/uvicorn examples.browser_api:create_app --factory --reload
+```
+
+The factory authenticates with Angel One and stores downloaded research in
+`data/jarvis_browser.duckdb` by default. Override that path with
+`JARVIS_DATABASE_PATH` and the bounded worker count with
+`JARVIS_BROWSER_WORKERS`. `JARVIS_BROWSER_ORIGINS` is a comma-separated CORS
+allowlist and defaults to local frontend origins on ports 3000 and 5173.
+Interactive OpenAPI documentation is served at
+`http://127.0.0.1:8000/api/docs`. The API supports polling, bounded event
+replay, and authenticated SSE streaming. The browser must use `fetch()`
+streaming so it can attach `X-Jarvis-Session-Token`; do not place the token in
+the stream URL. The same API now accepts typed or already-transcribed voice
+turns, enforces the wake phrase while dormant, greets `JARVIS_USER_NAME`,
+dispatches analysis asynchronously, retains approved context for Judge
+follow-ups, and exposes conversation-state SSE.
+
+The implemented browser console runs separately from `frontend/` on port 3000
+and calls this API on port 8000 by default. Override its target with
+`NEXT_PUBLIC_JARVIS_API_URL`. Microphone/STT/TTS adapters remain next.

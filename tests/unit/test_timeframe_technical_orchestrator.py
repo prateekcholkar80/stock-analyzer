@@ -10,12 +10,15 @@ from app.agents.technical_swing_agent import (
     WeeklyTechnicalSwingAgent,
 )
 from app.exceptions import AgentSubmissionRejectedError
+from app.analytics.accumulation import detect_accumulation_zones
 from app.models.market import Candle, HistoricalCandleSeries
 from app.models.timeframes import MultiTimeframeTechnicalAnalysis
+from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.orchestration.timeframe_technical_orchestrator import (
     ParallelTimeframeTechnicalOrchestrator,
 )
 from app.use_cases.derive_swing_timeframes import DeriveSwingTimeframes
+from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -112,6 +115,28 @@ class ParallelTimeframeTechnicalOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.weekly_submission.evidence_count, 12)
         self.assertTrue(result.daily_validation.accepted)
         self.assertTrue(result.weekly_validation.accepted)
+        self.assertEqual(
+            result.daily_accumulation,
+            detect_accumulation_zones(
+                self.timeframes.daily,
+                as_of=result.daily_submission.evaluated_at,
+            ),
+        )
+        self.assertEqual(
+            result.weekly_accumulation,
+            detect_accumulation_zones(
+                self.timeframes.weekly,
+                as_of=result.weekly_submission.evaluated_at,
+            ),
+        )
+        self.assertEqual(
+            result.daily_accumulation.timeframe.value,
+            "daily",
+        )
+        self.assertEqual(
+            result.weekly_accumulation.timeframe.value,
+            "weekly",
+        )
 
     def test_execution_is_concurrent_not_sequential(self):
         barrier = threading.Barrier(2)
@@ -132,8 +157,53 @@ class ParallelTimeframeTechnicalOrchestratorTests(unittest.TestCase):
         self.assertTrue(result.daily_validation.accepted)
         self.assertTrue(result.weekly_validation.accepted)
 
+    def test_parallel_events_identify_each_extensible_analyst(self):
+        barrier = threading.Barrier(2)
+        sink = InMemoryWorkflowEventSink()
+        emitter = WorkflowEventEmitter("operation", sink)
+        orchestrator = ParallelTimeframeTechnicalOrchestrator(
+            daily_agent=_BarrierAgent(
+                DailyTechnicalSwingAgent(),
+                barrier,
+            ),
+            weekly_agent=_BarrierAgent(
+                WeeklyTechnicalSwingAgent(),
+                barrier,
+            ),
+        )
+
+        orchestrator.execute(
+            self.timeframes,
+            event_emitter=emitter,
+        )
+
+        events = sink.events
+        self.assertEqual(len(events), 4)
+        self.assertTrue(
+            all(event.stage is WorkflowStage.ANALYSIS for event in events)
+        )
+        first_completion = next(
+            index
+            for index, event in enumerate(events)
+            if event.state is WorkflowEventState.COMPLETED
+        )
+        self.assertEqual(first_completion, 2)
+        self.assertEqual(
+            {event.activity.participant_id for event in events},
+            {"technical.daily_analyst", "technical.weekly_analyst"},
+        )
+        self.assertEqual(
+            {
+                event.activity.timeframe
+                for event in events
+                if event.state is WorkflowEventState.STARTED
+            },
+            {"ONE_DAY", "ONE_WEEK"},
+        )
+
     def test_rejects_tampered_submission_before_release(self):
         barrier = threading.Barrier(2)
+        sink = InMemoryWorkflowEventSink()
         orchestrator = ParallelTimeframeTechnicalOrchestrator(
             daily_agent=_BarrierAgent(
                 DailyTechnicalSwingAgent(),
@@ -149,7 +219,35 @@ class ParallelTimeframeTechnicalOrchestratorTests(unittest.TestCase):
             AgentSubmissionRejectedError,
             "weekly technical submission failed validation",
         ):
-            orchestrator.execute(self.timeframes)
+            orchestrator.execute(
+                self.timeframes,
+                event_emitter=WorkflowEventEmitter("operation", sink),
+            )
+
+        weekly_events = [
+            event
+            for event in sink.events
+            if event.activity.participant_id == "technical.weekly_analyst"
+        ]
+        self.assertEqual(
+            [event.state for event in weekly_events],
+            [WorkflowEventState.STARTED, WorkflowEventState.FAILED],
+        )
+
+    def test_rejects_accumulation_for_another_assignment(self):
+        def tampering_detector(series, *, as_of):
+            result = detect_accumulation_zones(series, as_of=as_of)
+            if series.interval == "ONE_WEEK":
+                return result.model_copy(update={"symbol": "OTHER-EQ"})
+            return result
+
+        with self.assertRaisesRegex(
+            AgentSubmissionRejectedError,
+            "weekly accumulation analysis failed assignment validation",
+        ):
+            ParallelTimeframeTechnicalOrchestrator(
+                accumulation_detector=tampering_detector,
+            ).execute(self.timeframes)
 
     def test_combined_model_rejects_fingerprint_tampering(self):
         result = ParallelTimeframeTechnicalOrchestrator().execute(

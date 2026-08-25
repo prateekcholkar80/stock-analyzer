@@ -7,7 +7,9 @@ from pydantic import ValidationError
 
 from app.models.workflow import (
     JarvisWorkflowEvent,
+    WorkflowActivityDescriptor,
     WorkflowEventState,
+    WorkflowParticipantKind,
     WorkflowStage,
 )
 from app.workflow.events import (
@@ -18,6 +20,12 @@ from app.workflow.events import (
 
 IST = ZoneInfo("Asia/Kolkata")
 FIXED_TIME = datetime(2026, 8, 21, 15, 30, tzinfo=IST)
+TEST_ACTIVITY = WorkflowActivityDescriptor(
+    activity_id="workflow.test.complete",
+    participant_id="test.workflow_agent",
+    participant_kind=WorkflowParticipantKind.SYSTEM,
+    participant_label="Test Agent",
+)
 
 
 class FailingEventSink:
@@ -49,7 +57,51 @@ class WorkflowEventEmitterTests(unittest.TestCase):
         self.assertEqual(second.sequence, 2)
         self.assertEqual(second.event_id, "operation-123:2")
         self.assertEqual(second.occurred_at.utcoffset(), FIXED_TIME.utcoffset())
+        self.assertEqual(first.schema_version, "jarvis.workflow_event.v2")
+        self.assertEqual(first.activity.participant_id, "jarvis.orchestrator")
+        self.assertEqual(
+            second.activity.participant_id,
+            "research.instrument_service",
+        )
         self.assertEqual(sink.events, (first, second))
+
+    def test_accepts_future_namespaced_analyst_without_schema_change(self):
+        activity = WorkflowActivityDescriptor(
+            activity_id="fundamentals.financial_statements.evaluate",
+            participant_id="fundamentals.financial_statement_analyst",
+            participant_kind=WorkflowParticipantKind.ANALYST,
+            participant_label="Financial Statement Analyst",
+        )
+        emitter = WorkflowEventEmitter(
+            "operation",
+            InMemoryWorkflowEventSink(),
+            clock=lambda: FIXED_TIME,
+        )
+
+        event = emitter.emit(
+            WorkflowStage.ANALYSIS,
+            WorkflowEventState.STARTED,
+            activity=activity,
+        )
+
+        self.assertEqual(event.activity, activity)
+        self.assertEqual(event.stage, WorkflowStage.ANALYSIS)
+
+    def test_rejects_unqualified_or_untyped_activity_descriptor(self):
+        with self.assertRaisesRegex(ValidationError, "activity_id"):
+            WorkflowActivityDescriptor(
+                activity_id="analysis",
+                participant_id="research.news_analyst",
+                participant_kind=WorkflowParticipantKind.ANALYST,
+                participant_label="News Analyst",
+            )
+        emitter = WorkflowEventEmitter("operation", clock=lambda: FIXED_TIME)
+        with self.assertRaisesRegex(ValueError, "activity descriptor"):
+            emitter.emit(
+                WorkflowStage.ANALYSIS,
+                WorkflowEventState.STARTED,
+                activity=object(),
+            )
 
     def test_bull_and_bear_events_require_round_number(self):
         emitter = WorkflowEventEmitter(
@@ -100,6 +152,7 @@ class WorkflowEventEmitterTests(unittest.TestCase):
             "operation_id": "operation",
             "sequence": 1,
             "message": "message",
+            "activity": TEST_ACTIVITY,
         }
         with self.assertRaisesRegex(ValidationError, "must be in IST"):
             JarvisWorkflowEvent(

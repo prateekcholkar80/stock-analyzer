@@ -11,13 +11,18 @@ _SESSION_HOURS = (9, 10, 11, 12, 13, 14, 15)
 
 
 def _series(candles, interval):
+    retrieved_at = (
+        candles[-1].timestamp + timedelta(days=1)
+        if candles
+        else datetime(2026, 1, 1, tzinfo=IST)
+    )
     return HistoricalCandleSeries(
         exchange="NSE",
         symbol_token="2885",
         symbol="RELIANCE-EQ",
         interval=interval,
         candles=candles,
-        retrieved_at=datetime(2026, 1, 1, tzinfo=IST),
+        retrieved_at=retrieved_at,
         source="test_market",
     )
 
@@ -49,6 +54,29 @@ def _hourly_series(day_count: int, start_day: datetime, hours=_SESSION_HOURS):
         day = start_day + timedelta(days=day_index)
         candles.extend(_hourly_day(day, base_price=100 + day_index, hours=hours))
     return _series(candles, "ONE_HOUR")
+
+
+def _angel_hourly_day(day: datetime, base_price: float):
+    """Angel ONE_HOUR bars are stamped at their interval start."""
+    candles = []
+    for offset, hour in enumerate(_SESSION_HOURS):
+        close = base_price + offset
+        candles.append(
+            Candle(
+                timestamp=day.replace(
+                    hour=hour,
+                    minute=15,
+                    second=0,
+                    microsecond=0,
+                ),
+                open=close - 0.5,
+                high=close + 1.0,
+                low=close - 1.0,
+                close=close,
+                volume=1_000 + offset * 10,
+            )
+        )
+    return candles
 
 
 class AggregateCandlesTests(unittest.TestCase):
@@ -105,6 +133,76 @@ class AggregateCandlesTests(unittest.TestCase):
         expected_last_candle = _hourly_day(partial_day, base_price=200, hours=(9, 10))[-1]
         self.assertEqual(last_bar.timestamp, expected_last_candle.timestamp)
         self.assertEqual(last_bar.close, expected_last_candle.close)
+
+    def test_accepts_angel_1515_bar_only_after_nse_session_close(self):
+        tuesday = self.monday + timedelta(days=1)
+        series = _series(
+            _angel_hourly_day(self.monday, 100)
+            + _angel_hourly_day(tuesday, 200),
+            "ONE_HOUR",
+        )
+
+        before_close = aggregate_candles(
+            series,
+            target_interval="ONE_DAY",
+            as_of=tuesday.replace(hour=15, minute=29),
+        )
+        after_close = aggregate_candles(
+            series,
+            target_interval="ONE_DAY",
+            as_of=tuesday.replace(hour=15, minute=30),
+        )
+
+        self.assertEqual(len(before_close.candles), 1)
+        self.assertEqual(len(after_close.candles), 2)
+        self.assertEqual(
+            after_close.candles[-1].timestamp,
+            tuesday.replace(hour=15, minute=15),
+        )
+        self.assertEqual(after_close.candles[-1].open, 199.5)
+        self.assertEqual(after_close.candles[-1].high, 207.0)
+        self.assertEqual(after_close.candles[-1].low, 199.0)
+        self.assertEqual(after_close.candles[-1].close, 206.0)
+
+    def test_angel_start_stamped_friday_completes_weekly_cascade(self):
+        hourly = _series(
+            [
+                candle
+                for day_offset in range(5)
+                for candle in _angel_hourly_day(
+                    self.monday + timedelta(days=day_offset),
+                    100 + day_offset,
+                )
+            ],
+            "ONE_HOUR",
+        )
+        friday_close = (self.monday + timedelta(days=4)).replace(
+            hour=15,
+            minute=30,
+        )
+
+        daily = aggregate_candles(
+            hourly,
+            target_interval="ONE_DAY",
+            as_of=friday_close,
+        )
+        weekly = aggregate_candles(
+            daily,
+            target_interval="ONE_WEEK",
+            as_of=friday_close,
+        )
+
+        self.assertEqual(len(daily.candles), 5)
+        self.assertEqual(len(weekly.candles), 1)
+        self.assertEqual(weekly.candles[-1].timestamp.weekday(), 4)
+
+    def test_rejects_naive_analysis_cutoff(self):
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            aggregate_candles(
+                _hourly_series(day_count=1, start_day=self.monday),
+                target_interval="ONE_DAY",
+                as_of=datetime(2026, 1, 5, 15, 30),
+            )
 
     def test_aggregates_daily_into_weekly_bars(self):
         # Two full Mon-Fri weeks plus a partial third week (Mon-Wed only).

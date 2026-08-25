@@ -15,9 +15,15 @@ class WorkflowStage(StrEnum):
     INSTRUMENT_RESOLVED = "instrument_resolved"
     MARKET_DATA_LOADING = "market_data_loading"
     TECHNICAL_ANALYSIS = "technical_analysis"
+    DATA_PREPARATION = "data_preparation"
+    ANALYSIS = "analysis"
+    EVIDENCE_REVIEW = "evidence_review"
     BULL_DEBATING = "bull_debating"
     BEAR_DEBATING = "bear_debating"
     JUDGE_REVIEWING = "judge_reviewing"
+    TRADE_PLANNING = "trade_planning"
+    PRESENTATION = "presentation"
+    FOLLOW_UP = "follow_up"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -28,13 +34,63 @@ class WorkflowEventState(StrEnum):
     FAILED = "failed"
 
 
+class WorkflowParticipantKind(StrEnum):
+    """Stable visual category for current and future workflow participants."""
+
+    SYSTEM = "system"
+    ORCHESTRATOR = "orchestrator"
+    SERVICE = "service"
+    ANALYST = "analyst"
+    ADVOCATE = "advocate"
+    JUDGE = "judge"
+    PRESENTER = "presenter"
+
+
+class WorkflowActivityDescriptor(TechnicalModel):
+    """Extensible identity used by a UI without hard-coding every agent."""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    activity_id: str = Field(
+        min_length=3,
+        max_length=160,
+        pattern=r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$",
+    )
+    participant_id: str = Field(
+        min_length=3,
+        max_length=160,
+        pattern=r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$",
+    )
+    participant_kind: WorkflowParticipantKind
+    participant_label: str = Field(min_length=1, max_length=80)
+    timeframe: str | None = Field(default=None, min_length=1, max_length=50)
+
+    @field_validator("activity_id", "participant_id")
+    @classmethod
+    def normalize_identifier(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized != value:
+            raise ValueError("workflow identifiers must already be normalized")
+        return normalized
+
+    @field_validator("participant_label", "timeframe")
+    @classmethod
+    def normalize_descriptor_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("workflow descriptor text must not be blank")
+        return normalized
+
+
 class JarvisWorkflowEvent(TechnicalModel):
     """Secret-safe progress evidence delivered to voice and UI clients."""
 
     model_config = ConfigDict(frozen=True, strict=True)
 
-    schema_version: Literal["jarvis.workflow_event.v1"] = (
-        "jarvis.workflow_event.v1"
+    schema_version: Literal["jarvis.workflow_event.v2"] = (
+        "jarvis.workflow_event.v2"
     )
     event_id: str = Field(min_length=1, max_length=200)
     operation_id: str = Field(min_length=1, max_length=128)
@@ -43,6 +99,7 @@ class JarvisWorkflowEvent(TechnicalModel):
     state: WorkflowEventState
     occurred_at: datetime
     message: str = Field(min_length=1, max_length=300)
+    activity: WorkflowActivityDescriptor
     exchange: str | None = Field(default=None, min_length=1, max_length=32)
     symbol: str | None = Field(default=None, min_length=1, max_length=100)
     round_number: int | None = Field(default=None, ge=1)

@@ -76,7 +76,7 @@ class AgentOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(
             submission.evaluator_id,
-            "jarvis.unified_swing.v1",
+            "jarvis.unified_swing.v2",
         )
         self.assertEqual(submission.input_candle_count, 60)
         self.assertEqual(

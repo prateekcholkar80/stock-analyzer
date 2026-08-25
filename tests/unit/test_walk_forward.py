@@ -563,7 +563,8 @@ class WalkForwardBacktestTests(unittest.TestCase):
             strategy.walk_forward_configuration_fingerprint,
             result.configuration_fingerprint,
         )
-        self.assertIn("slow_sma_period", strategy.technical_parameters)
+        self.assertIn("slow_ema_period", strategy.technical_parameters)
+        self.assertNotIn("slow_sma_period", strategy.technical_parameters)
         self.assertIn(
             "minimum_reward_to_risk",
             strategy.trade_planning_parameters,

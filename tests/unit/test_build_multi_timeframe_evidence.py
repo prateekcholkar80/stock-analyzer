@@ -126,6 +126,23 @@ class BuildMultiTimeframeEvidenceTests(unittest.TestCase):
             for item in context.evidence
         }
         self.assertEqual(len(qualified_ids), 24)
+        self.assertEqual(
+            package.daily.accumulation,
+            self.analysis.daily_accumulation,
+        )
+        self.assertEqual(
+            package.weekly.accumulation,
+            self.analysis.weekly_accumulation,
+        )
+        for context in (package.daily, package.weekly):
+            self.assertEqual(
+                context.accumulation.evaluated_at,
+                context.evaluated_at,
+            )
+            self.assertEqual(
+                context.accumulation.interval,
+                context.interval,
+            )
 
     def test_exposes_confirmed_pivots_and_immediate_levels(self):
         for context in (self.package.daily, self.package.weekly):
@@ -189,6 +206,23 @@ class BuildMultiTimeframeEvidenceTests(unittest.TestCase):
                     self.package.model_dump(exclude_computed_fields=True)
                     | {"package_fingerprint": "0" * 64}
                 )
+            )
+
+        tampered_accumulation = self.package.weekly.accumulation.model_copy(
+            update={"zones": ()}
+        )
+        tampered_weekly = self.package.weekly.model_copy(
+            update={"accumulation": tampered_accumulation}
+        )
+        with self.assertRaisesRegex(
+            ValidationError,
+            "preserve the assigned accumulation evidence",
+        ):
+            MultiTimeframeEvidencePackage(
+                technical_analysis=self.analysis,
+                daily=self.package.daily,
+                weekly=tampered_weekly,
+                package_fingerprint=self.package.package_fingerprint,
             )
 
     def test_rejects_future_confirmed_pivot_in_context(self):
