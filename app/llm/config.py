@@ -21,6 +21,7 @@ class LLMRole(StrEnum):
     BEAR = "bear"
     JUDGE = "judge"
     JARVIS = "jarvis"
+    TICKER_RESOLVER = "ticker_resolver"
 
 
 DEBATE_LLM_ROLES = (
@@ -88,6 +89,10 @@ class LLMSettings(BaseModel):
         default=None,
         alias="JARVIS_PERSONA_LLM_MODEL",
     )
+    ticker_resolver_model: str | None = Field(
+        default=None,
+        alias="JARVIS_TICKER_RESOLVER_LLM_MODEL",
+    )
 
     bull_temperature: float = Field(
         default=0.4,
@@ -113,6 +118,12 @@ class LLMSettings(BaseModel):
         le=2,
         alias="JARVIS_PERSONA_LLM_TEMPERATURE",
     )
+    ticker_resolver_temperature: float = Field(
+        default=0.0,
+        ge=0,
+        le=2,
+        alias="JARVIS_TICKER_RESOLVER_LLM_TEMPERATURE",
+    )
 
     bull_max_tokens: int = Field(
         default=800,
@@ -134,6 +145,11 @@ class LLMSettings(BaseModel):
         gt=0,
         alias="JARVIS_PERSONA_LLM_MAX_TOKENS",
     )
+    ticker_resolver_max_tokens: int = Field(
+        default=300,
+        gt=0,
+        alias="JARVIS_TICKER_RESOLVER_LLM_MAX_TOKENS",
+    )
 
     @field_validator(
         "shared_model",
@@ -141,6 +157,7 @@ class LLMSettings(BaseModel):
         "bear_model",
         "judge_model",
         "jarvis_model",
+        "ticker_resolver_model",
         mode="before",
     )
     @classmethod
@@ -172,6 +189,7 @@ class LLMSettings(BaseModel):
             LLMRole.BEAR: self.bear_model,
             LLMRole.JUDGE: self.judge_model,
             LLMRole.JARVIS: self.jarvis_model or self.judge_model,
+            LLMRole.TICKER_RESOLVER: self.ticker_resolver_model,
         }[role]
         return override or self.shared_model
 
@@ -188,12 +206,14 @@ class LLMSettings(BaseModel):
             LLMRole.BEAR: self.bear_temperature,
             LLMRole.JUDGE: self.judge_temperature,
             LLMRole.JARVIS: self.jarvis_temperature,
+            LLMRole.TICKER_RESOLVER: self.ticker_resolver_temperature,
         }[role]
         max_tokens = {
             LLMRole.BULL: self.bull_max_tokens,
             LLMRole.BEAR: self.bear_max_tokens,
             LLMRole.JUDGE: self.judge_max_tokens,
             LLMRole.JARVIS: self.jarvis_max_tokens,
+            LLMRole.TICKER_RESOLVER: self.ticker_resolver_max_tokens,
         }[role]
         return LLMRoleSettings(
             role=role,

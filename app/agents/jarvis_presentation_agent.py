@@ -48,7 +48,13 @@ _EXECUTIVE_COMMUNICATION = (
     "verdict -- bullish, bearish, or neutral -- and is not a probability of "
     "future price movement. Do not write Markdown headings or raw evidence "
     "IDs in prose; place citations only in the matching evidence-id fields. "
-    "The application owns headers, bullets, verdict labels, and colours."
+    "The application owns headers, bullets, verdict labels, and colours. "
+    "executive_briefing is also read aloud by a text-to-speech engine, so "
+    "punctuate it as natural spoken prose: complete sentences separated by "
+    "periods, with commas where a speaker would naturally pause. Never use "
+    "bullet points, numbered lists, Markdown, emojis, or asterisks in "
+    "executive_briefing, since those either get read aloud literally or "
+    "are silently dropped by speech synthesis."
 )
 
 _MULTI_TIMEFRAME_COMMUNICATION = (

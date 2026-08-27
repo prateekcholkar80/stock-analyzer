@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from datetime import datetime
 from threading import RLock
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
 from app.audit.prompt_audit import (
@@ -16,6 +16,10 @@ from app.conversation.follow_up import looks_like_analysis_follow_up
 from app.conversation.events import (
     ConversationEventEmitter,
     ConversationEventSink,
+)
+from app.conversation.pending_confirmation import (
+    PendingConfirmation,
+    classify_yes_no,
 )
 from app.conversation.wake_word import (
     NormalizedWakePhraseDetector,
@@ -50,6 +54,9 @@ from app.models.presentation import (
 from app.models.storage import (
     EndToEndSwingAnalysisResult,
     MultiTimeframeEndToEndSwingAnalysisResult,
+)
+from app.use_cases.resolve_ticker_conversationally import (
+    TickerConversationalResolutionResult,
 )
 
 
@@ -93,6 +100,20 @@ class JudgeFollowUpExecutor(Protocol):
         ...
 
 
+@runtime_checkable
+class TickerResolutionExecutor(Protocol):
+    """Deterministic-shortlist + constrained-LLM ticker resolution, with
+    catalog refresh. Optional: when not configured, an unresolved
+    instrument falls back to the plain clarification message unchanged.
+    """
+
+    def attempt(self, command: str) -> TickerConversationalResolutionResult:
+        ...
+
+    def refresh_catalog(self) -> int:
+        ...
+
+
 _ALLOWED_TRANSITIONS = {
     (ConversationState.DORMANT, ConversationState.GREETING),
     (ConversationState.GREETING, ConversationState.LISTENING),
@@ -100,10 +121,12 @@ _ALLOWED_TRANSITIONS = {
     (ConversationState.PROCESSING, ConversationState.RESPONDING),
     (ConversationState.PROCESSING, ConversationState.LISTENING),
     (ConversationState.PROCESSING, ConversationState.FAILED),
+    (ConversationState.PROCESSING, ConversationState.AWAITING_CONFIRMATION),
+    (ConversationState.AWAITING_CONFIRMATION, ConversationState.PROCESSING),
+    (ConversationState.AWAITING_CONFIRMATION, ConversationState.LISTENING),
     (ConversationState.RESPONDING, ConversationState.DORMANT),
     (ConversationState.FAILED, ConversationState.DORMANT),
 }
-
 
 class JarvisConversationSession:
     """Coordinate wake activation and one natural-language research session."""
@@ -118,6 +141,7 @@ class JarvisConversationSession:
         prompt_audit_sink: PromptAuditSink | None = None,
         research_presenter: ResearchPresentationExecutor | None = None,
         judge_follow_up_executor: JudgeFollowUpExecutor | None = None,
+        ticker_resolution_executor: TickerResolutionExecutor | None = None,
         session_id_factory: Callable[[], str] | None = None,
     ) -> None:
         if not isinstance(research_executor, SwingResearchExecutor):
@@ -136,6 +160,13 @@ class JarvisConversationSession:
             raise ValueError(
                 "conversation requires a Judge follow-up executor"
             )
+        if ticker_resolution_executor is not None and not isinstance(
+            ticker_resolution_executor,
+            TickerResolutionExecutor,
+        ):
+            raise ValueError(
+                "conversation requires a ticker resolution executor"
+            )
         detector = wake_detector or NormalizedWakePhraseDetector(
             config.wake_phrase
         )
@@ -153,6 +184,7 @@ class JarvisConversationSession:
         self._research_executor = research_executor
         self._research_presenter = research_presenter
         self._judge_follow_up_executor = judge_follow_up_executor
+        self._ticker_resolution_executor = ticker_resolution_executor
         self._config = config
         self._wake_detector = detector
         self._event_sink = event_sink
@@ -166,6 +198,8 @@ class JarvisConversationSession:
             MultiTimeframeEvidenceReview | None
         ) = None
         self._last_multi_timeframe_debate: AgenticDebateResult | None = None
+        self._pending_confirmation: PendingConfirmation | None = None
+        self._consecutive_resolution_failures = 0
 
     @property
     def state(self) -> ConversationState:
@@ -203,58 +237,143 @@ class JarvisConversationSession:
         if not isinstance(utterance, JarvisUtterance):
             raise ValueError("conversation input must be a validated utterance")
 
+        refresh_catalog_first = False
         with self._lock:
             state_before = self._state
-            if self._state in {
-                ConversationState.PROCESSING,
-                ConversationState.RESPONDING,
-            }:
-                self._record_input(utterance, state_before)
-                return self._turn(
-                    utterance,
-                    state_before=state_before,
-                    outcome=ConversationOutcome.BUSY,
-                    display_message="Jarvis is already working on a request.",
-                    spoken_message="One moment. I'm still working on that.",
-                )
 
-            command = utterance.text
-            detected_command = self._wake_detector.command_after_wake_phrase(
-                utterance.text
-            )
-            if self._state is ConversationState.DORMANT:
-                if detected_command is None:
+            if self._state is ConversationState.AWAITING_CONFIRMATION:
+                early_turn = self._begin_confirmation_reply(
+                    utterance,
+                    state_before,
+                )
+                if early_turn is not None:
+                    return early_turn
+                pending = self._pending_confirmation
+                assert pending is not None
+                self._pending_confirmation = None
+                if pending.kind == "catalog_refresh":
+                    command = pending.original_command
+                    refresh_catalog_first = True
+                else:
+                    command = (
+                        f"Analyze {pending.chosen_symbol} for a swing trade"
+                    )
+                to_date = pending.to_date
+                self._transition(
+                    ConversationState.PROCESSING,
+                    utterance.channel,
+                )
+                active_session_id = self._session_id
+            else:
+                if self._state in {
+                    ConversationState.PROCESSING,
+                    ConversationState.RESPONDING,
+                }:
+                    self._record_input(utterance, state_before)
                     return self._turn(
                         utterance,
                         state_before=state_before,
-                        outcome=ConversationOutcome.IGNORED,
+                        outcome=ConversationOutcome.BUSY,
+                        display_message=(
+                            "Jarvis is already working on a request."
+                        ),
+                        spoken_message="One moment. I'm still working on that.",
                     )
-                command = detected_command
-                self._activate(utterance.channel)
-            elif detected_command is not None:
-                command = detected_command
 
-            self._record_input(utterance, state_before)
-
-            if not command:
-                greeting = (
-                    f"Hello {self._config.user_name}. "
-                    "How can I help you today?"
+                command = utterance.text
+                detected_command = (
+                    self._wake_detector.command_after_wake_phrase(
+                        utterance.text
+                    )
                 )
-                return self._turn(
-                    utterance,
-                    state_before=state_before,
-                    outcome=ConversationOutcome.ACTIVATED,
-                    display_message=greeting,
-                    spoken_message=greeting,
+                if self._state is ConversationState.DORMANT:
+                    if detected_command is None:
+                        return self._turn(
+                            utterance,
+                            state_before=state_before,
+                            outcome=ConversationOutcome.IGNORED,
+                        )
+                    command = detected_command
+                    self._activate(utterance.channel)
+                elif detected_command is not None:
+                    command = detected_command
+
+                self._record_input(utterance, state_before)
+
+                if not command:
+                    greeting = (
+                        f"Hello {self._config.user_name}. "
+                        "How can I help you today?"
+                    )
+                    return self._turn(
+                        utterance,
+                        state_before=state_before,
+                        outcome=ConversationOutcome.ACTIVATED,
+                        display_message=greeting,
+                        spoken_message=greeting,
+                    )
+
+                self._transition(
+                    ConversationState.PROCESSING,
+                    utterance.channel,
                 )
+                active_session_id = self._session_id
 
-            self._transition(
-                ConversationState.PROCESSING,
-                utterance.channel,
-            )
-            active_session_id = self._session_id
+        if refresh_catalog_first and self._ticker_resolution_executor is not None:
+            try:
+                self._ticker_resolution_executor.refresh_catalog()
+            except ApplicationError:
+                # Resolution below will simply fail again and route through
+                # the normal failure handling; a refresh failure must not
+                # crash the turn.
+                pass
 
+        return self._execute_command(
+            command,
+            to_date,
+            utterance,
+            state_before,
+            active_session_id,
+        )
+
+    def _begin_confirmation_reply(
+        self,
+        utterance: JarvisUtterance,
+        state_before: ConversationState,
+    ) -> JarvisConversationTurn | None:
+        """Handle a "yes"/"no" reply while AWAITING_CONFIRMATION. Called
+        while holding self._lock. Returns a final turn for "no" (or
+        anything not recognized as "yes"); returns None to signal the
+        caller should proceed to resume the pending request (with
+        self._pending_confirmation left set for the caller to consume).
+        """
+        self._record_input(utterance, state_before)
+        if classify_yes_no(utterance.text) == "yes":
+            return None
+
+        self._pending_confirmation = None
+        self._consecutive_resolution_failures += 1
+        self._transition(ConversationState.LISTENING, utterance.channel)
+        message = (
+            "No problem. Let me know the company or NSE symbol you'd "
+            "like to analyze."
+        )
+        return self._turn(
+            utterance,
+            state_before=state_before,
+            outcome=ConversationOutcome.CLARIFICATION_REQUIRED,
+            display_message=message,
+            spoken_message=message,
+        )
+
+    def _execute_command(
+        self,
+        command: str,
+        to_date: datetime | None,
+        utterance: JarvisUtterance,
+        state_before: ConversationState,
+        active_session_id: str | None,
+    ) -> JarvisConversationTurn:
         try:
             assert active_session_id is not None
             explanation = None
@@ -290,6 +409,8 @@ class JarvisConversationSession:
                         raise ValueError(
                             "research executor returned an invalid response"
                         )
+                    with self._lock:
+                        self._consecutive_resolution_failures = 0
                     if response.status is JarvisCommandStatus.COMPLETED:
                         self._remember_multi_timeframe_context(response)
                         if (
@@ -315,7 +436,9 @@ class JarvisConversationSession:
             InstrumentNotFoundError,
             AmbiguousInstrumentError,
         ) as exc:
-            return self._clarification_turn(
+            return self._handle_resolution_failure(
+                command,
+                to_date,
                 utterance,
                 state_before,
                 exc,
@@ -335,6 +458,7 @@ class JarvisConversationSession:
                 )
                 self._transition(ConversationState.FAILED, utterance.channel)
                 self._transition(ConversationState.DORMANT, utterance.channel)
+                self._pending_confirmation = None
                 self._clear_session()
             raise
 
@@ -385,6 +509,92 @@ class JarvisConversationSession:
             )
             self._clear_session()
             return turn
+
+    def _handle_resolution_failure(
+        self,
+        command: str,
+        to_date: datetime | None,
+        utterance: JarvisUtterance,
+        state_before: ConversationState,
+        error: ApplicationError,
+    ) -> JarvisConversationTurn:
+        if self._ticker_resolution_executor is None or isinstance(
+            error,
+            IntentRecognitionError,
+        ):
+            return self._clarification_turn(utterance, state_before, error)
+
+        try:
+            result = self._ticker_resolution_executor.attempt(command)
+        except ApplicationError:
+            return self._clarification_turn(utterance, state_before, error)
+
+        if result.outcome == "resolved_needs_confirmation":
+            return self._resolver_confirmation_turn(
+                utterance,
+                state_before,
+                kind="ticker_guess",
+                original_command=command,
+                to_date=to_date,
+                chosen_symbol=result.chosen_symbol,
+                exchange=result.exchange,
+            )
+
+        with self._lock:
+            self._consecutive_resolution_failures += 1
+            failures = self._consecutive_resolution_failures
+        threshold = (
+            self._config.consecutive_resolution_failures_before_refresh_prompt
+        )
+        if failures >= threshold:
+            return self._resolver_confirmation_turn(
+                utterance,
+                state_before,
+                kind="catalog_refresh",
+                original_command=command,
+                to_date=to_date,
+            )
+        return self._clarification_turn(utterance, state_before, error)
+
+    def _resolver_confirmation_turn(
+        self,
+        utterance: JarvisUtterance,
+        state_before: ConversationState,
+        *,
+        kind: Literal["ticker_guess", "catalog_refresh"],
+        original_command: str,
+        to_date: datetime | None,
+        chosen_symbol: str | None = None,
+        exchange: str | None = None,
+    ) -> JarvisConversationTurn:
+        pending = PendingConfirmation(
+            kind=kind,
+            original_command=original_command,
+            to_date=to_date,
+            chosen_symbol=chosen_symbol,
+            exchange=exchange,
+        )
+        if kind == "ticker_guess":
+            message = f'Did you mean "{chosen_symbol}"? Reply yes or no.'
+        else:
+            message = (
+                "I'm having trouble matching that company against my "
+                "current list. Should I refresh it and try again? Reply "
+                "yes or no."
+            )
+        with self._lock:
+            self._pending_confirmation = pending
+            self._transition(
+                ConversationState.AWAITING_CONFIRMATION,
+                utterance.channel,
+            )
+            return self._turn(
+                utterance,
+                state_before=state_before,
+                outcome=ConversationOutcome.CONFIRMATION_REQUESTED,
+                display_message=message,
+                spoken_message=message,
+            )
 
     def _activate(self, channel: InputChannel) -> None:
         session_id = self._session_id_factory()
@@ -549,6 +759,7 @@ class JarvisConversationSession:
     def _clear_session(self) -> None:
         self._session_id = None
         self._emitter = None
+        self._pending_confirmation = None
 
     def _follow_up_context(
         self,

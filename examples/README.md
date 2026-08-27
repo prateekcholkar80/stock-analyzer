@@ -50,10 +50,13 @@ How is Reliance looking for a swing trade?
 ```
 
 The request resolves to `NSE`, `RELIANCE-EQ`, token `2885`, and an hourly
-source interval. Jarvis pulls/resumes hourly candles, aggregates completed
-daily and weekly candles, runs the two technical agents in parallel, releases
-their paired evidence through the existing Judge, completes the full
-Bull/Bear/Judge debate, applies the long-only 2R policy, and asks the Jarvis
+source interval. Jarvis pulls/resumes hourly candles with a recent correction
+overlap, records whether the dataset was initial/incremental/unchanged, fetches
+a separately timestamped Broker LTP, aggregates completed daily and weekly
+candles, runs the two technical and accumulation assignments in
+parallel, releases their paired evidence through the existing Judge, completes
+the full Bull/Bear/Judge debate, applies the BUY/NO_TRADE minimum-2R policy,
+builds the deterministic setup/timeframe interpretation, and asks the Jarvis
 persona to render the CEO briefing. Change the text in
 `examples/conversation_demo.py` when manually exercising another supported
 single-instrument swing request; instrument identity is resolved rather than
@@ -98,9 +101,10 @@ For the complete offline regression baseline:
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Expected backend baseline at this handoff: **1,344 tests, OK**. The last live Reliance
-run produced a bearish verdict at 62% confidence and the deterministic
-long-only result `NO_TRADE`. It did not validate a naturally bullish live
+Expected backend baseline at this handoff: **1,685 Python tests, OK**. The
+frontend production build and **36 browser tests** also pass. The last live
+Reliance run produced a bearish verdict at 62% confidence and the deterministic
+result `NO_TRADE`. It did not validate a naturally bullish live
 actionable plan; that path is covered by offline tests.
 
 ## Browser API
@@ -116,6 +120,17 @@ The factory authenticates with Angel One and stores downloaded research in
 `JARVIS_DATABASE_PATH` and the bounded worker count with
 `JARVIS_BROWSER_WORKERS`. `JARVIS_BROWSER_ORIGINS` is a comma-separated CORS
 allowlist and defaults to local frontend origins on ports 3000 and 5173.
+
+`examples/browser_api.py` also composes the optional extras:
+`compose_jarvis_browser_operations` now returns
+`JarvisBrowserApplication(runner, conversation)` and is passed an
+`AmfiMarketCapCatalog` and `NseSectorMasterCatalog` (both lazily downloaded on
+first use) so the conversational ticker-resolution fallback is wired into the
+coordinator. `compose_jarvis_speech_synthesis()` and
+`compose_jarvis_speech_transcription()` are composed independently and passed as
+`speech=` / `transcription=` to `create_jarvis_http_app`, which mounts the
+`/speech` and `/transcribe` routes only then. Neither speech capability fires or
+needs a credential until its route is first called.
 Interactive OpenAPI documentation is served at
 `http://127.0.0.1:8000/api/docs`. The API supports polling, bounded event
 replay, and authenticated SSE streaming. The browser must use `fetch()`
@@ -127,4 +142,12 @@ follow-ups, and exposes conversation-state SSE.
 
 The implemented browser console runs separately from `frontend/` on port 3000
 and calls this API on port 8000 by default. Override its target with
-`NEXT_PUBLIC_JARVIS_API_URL`. Microphone/STT/TTS adapters remain next.
+`NEXT_PUBLIC_JARVIS_API_URL`. It renders daily/weekly Plotly charts, Broker LTP
+versus completed analysis close, confirmed immediate S/R, optional technical
+overlays, setup matrices, Judge confidence semantics, and the executive
+briefing. Refreshing or leaving the page performs a best-effort close of the old
+browser session before the next page creates a fresh one. It also has opt-in
+"voice replies" (plays `/speech` audio for each spoken message) and "voice
+input" (microphone capture with a local VAD, uploading finished utterances to
+`/transcribe`) toggles. An acoustic wake-word engine and hands-free session
+remain pending.

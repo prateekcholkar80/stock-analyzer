@@ -1,6 +1,5 @@
 import json
 import os
-import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -34,7 +33,6 @@ DEFAULT_ANGEL_INSTRUMENT_CACHE_PATH = Path(
 )
 
 InstrumentMasterDownloader = Callable[[str, float, int], bytes]
-Clock = Callable[[], float]
 logger = get_logger(__name__)
 
 
@@ -48,7 +46,6 @@ class AngelInstrumentMasterConfig(BaseModel):
         min_length=1,
     )
     cache_path: Path = DEFAULT_ANGEL_INSTRUMENT_CACHE_PATH
-    cache_ttl_seconds: int = Field(default=86_400, ge=0)
     download_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     max_payload_bytes: int = Field(
         default=100 * 1024 * 1024,
@@ -91,7 +88,6 @@ class AngelInstrumentMasterConfig(BaseModel):
         mappings = {
             "ANGEL_INSTRUMENT_MASTER_URL": "endpoint_url",
             "ANGEL_INSTRUMENT_CACHE_PATH": "cache_path",
-            "ANGEL_INSTRUMENT_CACHE_TTL_SECONDS": "cache_ttl_seconds",
             "ANGEL_INSTRUMENT_DOWNLOAD_TIMEOUT_SECONDS": (
                 "download_timeout_seconds"
             ),
@@ -103,7 +99,7 @@ class AngelInstrumentMasterConfig(BaseModel):
                 values[field_name] = value
         if "cache_path" in values:
             values["cache_path"] = Path(values["cache_path"])
-        for field_name in ("cache_ttl_seconds", "max_payload_bytes"):
+        for field_name in ("max_payload_bytes",):
             if field_name in values:
                 try:
                     values[field_name] = int(values[field_name])
@@ -134,7 +130,6 @@ class AngelInstrumentMasterResolver:
         config: AngelInstrumentMasterConfig | None = None,
         *,
         downloader: InstrumentMasterDownloader | None = None,
-        clock: Clock = time.time,
     ) -> None:
         resolved_config = config or AngelInstrumentMasterConfig()
         if not isinstance(resolved_config, AngelInstrumentMasterConfig):
@@ -143,11 +138,8 @@ class AngelInstrumentMasterResolver:
             )
         if downloader is not None and not callable(downloader):
             raise ValueError("Angel instrument downloader must be callable")
-        if not callable(clock):
-            raise ValueError("Angel instrument cache clock must be callable")
         self.config = resolved_config
         self._downloader = downloader or _download_instrument_master
-        self._clock = clock
         self._resolver: InMemoryInstrumentResolver | None = None
         self._lock = RLock()
 
@@ -158,6 +150,10 @@ class AngelInstrumentMasterResolver:
         exchange: str | None = None,
     ) -> ResolvedInstrument:
         return self._catalog_resolver().resolve(query, exchange=exchange)
+
+    def list_instruments(self) -> tuple[ResolvedInstrument, ...]:
+        """Return the full cached/downloaded cash-equity catalog."""
+        return self._catalog_resolver().list_instruments()
 
     def refresh(self) -> int:
         """Force a validated download and atomically replace the cache."""
@@ -181,9 +177,9 @@ class AngelInstrumentMasterResolver:
             if self._resolver is not None:
                 return self._resolver
 
-            cached_payload = _read_cache_if_fresh(
-                self.config,
-                now=self._clock(),
+            cached_payload = _read_cache(
+                self.config.cache_path,
+                self.config.max_payload_bytes,
             )
             if cached_payload is not None:
                 try:
@@ -193,7 +189,7 @@ class AngelInstrumentMasterResolver:
                     )
                 except InstrumentMasterDataError:
                     logger.warning(
-                        "Fresh Angel instrument cache was invalid",
+                        "Cached Angel instrument master was invalid",
                         extra={
                             "event": "angel.instrument_master.cache_invalid",
                             "cache_path": str(self.config.cache_path),
@@ -384,21 +380,6 @@ def _is_cash_equity(exchange: str, symbol: str) -> bool:
     if exchange == "NSE":
         return symbol.upper().endswith("-EQ")
     return exchange == "BSE"
-
-
-def _read_cache_if_fresh(
-    config: AngelInstrumentMasterConfig,
-    *,
-    now: float,
-) -> bytes | None:
-    try:
-        modified_at = config.cache_path.stat().st_mtime
-    except OSError:
-        return None
-    age = now - modified_at
-    if age < 0 or age > config.cache_ttl_seconds:
-        return None
-    return _read_cache(config.cache_path, config.max_payload_bytes)
 
 
 def _read_cache(path: Path, max_payload_bytes: int) -> bytes | None:

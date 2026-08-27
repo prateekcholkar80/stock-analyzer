@@ -17,6 +17,19 @@ import {
   timeframeSetupSummary,
 } from "@/lib/setup-view";
 import { judgeDecisionView } from "@/lib/executive-briefing";
+import {
+  VOICE_PREFERENCE_STORAGE_KEY,
+  readVoicePreference,
+  shouldPlaySpokenMessage,
+} from "@/lib/voice";
+import {
+  DEFAULT_VOICE_ACTIVITY_CONFIG,
+  VOICE_INPUT_PREFERENCE_STORAGE_KEY,
+  isSpeechSegment,
+  readVoiceInputPreference,
+  shouldSubmitVoiceTranscript,
+  type VoiceCaptureState,
+} from "@/lib/voice-capture";
 
 import {
   MATRIX_STEPS,
@@ -34,7 +47,7 @@ import {
   type WorkflowMatcher,
 } from "@/lib/workflow-progress";
 
-type ConversationState = "dormant" | "greeting" | "listening" | "processing" | "responding" | "failed";
+type ConversationState = "dormant" | "greeting" | "listening" | "processing" | "responding" | "failed" | "awaiting_confirmation";
 type Session = { session_id: string };
 type ConversationSnapshot = {
   session_id: string;
@@ -44,7 +57,7 @@ type ConversationSnapshot = {
   spoken_message: string | null;
 };
 type ConversationTurn = {
-  outcome: "ignored" | "activated" | "completed" | "failed" | "clarification_required" | "busy" | "dispatched";
+  outcome: "ignored" | "activated" | "completed" | "failed" | "clarification_required" | "busy" | "dispatched" | "confirmation_requested";
   conversation: ConversationSnapshot;
   operation?: { request: { operation_id: string } };
 };
@@ -293,8 +306,22 @@ export default function Home() {
   const [notice, setNotice] = useState("Establishing secure research link…");
   const [error, setError] = useState<string | null>(null);
   const [istClock, setIstClock] = useState("--:--");
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voicePreferencesLoaded, setVoicePreferencesLoaded] = useState(false);
+  const [voiceInputEnabled, setVoiceInputEnabled] = useState(false);
+  const [voiceInputPreferencesLoaded, setVoiceInputPreferencesLoaded] = useState(false);
   const conversationAbort = useRef<AbortController | null>(null);
   const workflowAbort = useRef<AbortController | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recorderChunksRef = useRef<Blob[]>([]);
+  const captureIntervalRef = useRef<number | null>(null);
+  const captureSuspendedRef = useRef(false);
+  const captureStateRef = useRef<VoiceCaptureState>("idle");
+  const silenceElapsedRef = useRef(0);
+  const conversationRef = useRef<ConversationSnapshot | null>(null);
   const authHeaders = useMemo(() => ({ "X-Jarvis-Session-Token": token }), [token]);
 
   useEffect(() => {
@@ -308,6 +335,62 @@ export default function Home() {
     const timer = window.setInterval(updateClock, 30_000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      try {
+        setVoiceEnabled(
+          readVoicePreference(window.localStorage.getItem(VOICE_PREFERENCE_STORAGE_KEY)),
+        );
+      } catch {
+        // Corrupt device-local preferences must not block conversation rendering.
+      } finally {
+        setVoicePreferencesLoaded(true);
+      }
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!voicePreferencesLoaded) return;
+    try {
+      window.localStorage.setItem(VOICE_PREFERENCE_STORAGE_KEY, JSON.stringify(voiceEnabled));
+    } catch {
+      // Storage can be unavailable in privacy mode; the toggle still works.
+    }
+  }, [voiceEnabled, voicePreferencesLoaded]);
+
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      try {
+        setVoiceInputEnabled(
+          readVoiceInputPreference(window.localStorage.getItem(VOICE_INPUT_PREFERENCE_STORAGE_KEY)),
+        );
+      } catch {
+        // Corrupt device-local preferences must not block conversation rendering.
+      } finally {
+        setVoiceInputPreferencesLoaded(true);
+      }
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!voiceInputPreferencesLoaded) return;
+    try {
+      window.localStorage.setItem(VOICE_INPUT_PREFERENCE_STORAGE_KEY, JSON.stringify(voiceInputEnabled));
+    } catch {
+      // Storage can be unavailable in privacy mode; the toggle still works.
+    }
+  }, [voiceInputEnabled, voiceInputPreferencesLoaded]);
+
+  useEffect(() => {
+    conversationRef.current = conversation;
+  }, [conversation]);
 
   useEffect(() => {
     let disposed = false;
@@ -427,6 +510,42 @@ export default function Home() {
       });
   }, [authHeaders, fetchDashboard, session, token]);
 
+  const playSpokenMessage = useCallback(async (message: string | null | undefined) => {
+    if (!shouldPlaySpokenMessage(voiceEnabled, message) || !session || !token) return;
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/sessions/${session.session_id}/speech`, {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ text: message }),
+      });
+      // TTS not configured, or synthesis failed -- never block conversation
+      // text, which has already rendered by the time this runs.
+      if (!response.ok) return;
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      const resumeCapture = () => {
+        URL.revokeObjectURL(url);
+        captureSuspendedRef.current = false;
+        recorderChunksRef.current = [];
+        captureStateRef.current = "idle";
+        silenceElapsedRef.current = 0;
+      };
+      audio.onended = resumeCapture;
+      audio.onerror = resumeCapture;
+      // Mute VAD/mic capture for the duration of playback so Jarvis's own
+      // spoken reply can never be picked up by the mic and mistaken for a
+      // user utterance.
+      captureSuspendedRef.current = true;
+      recorderChunksRef.current = [];
+      captureStateRef.current = "idle";
+      silenceElapsedRef.current = 0;
+      void audio.play();
+    } catch {
+      // Voice playback failure must never block conversation rendering.
+    }
+  }, [authHeaders, session, token, voiceEnabled]);
+
   useEffect(() => {
     if (!session || !token) return;
     conversationAbort.current?.abort();
@@ -447,15 +566,19 @@ export default function Home() {
             setNotice(item.message);
           }
         }
-        if (event === "conversation-terminal") setConversation(data as ConversationSnapshot);
+        if (event === "conversation-terminal") {
+          const snapshot = data as ConversationSnapshot;
+          setConversation(snapshot);
+          void playSpokenMessage(snapshot.spoken_message);
+        }
       }))
       .catch((reason) => {
         if (reason.name !== "AbortError") setError(reason.message);
       });
     return () => controller.abort();
-  }, [authHeaders, session, token]);
+  }, [authHeaders, playSpokenMessage, session, token]);
 
-  const sendText = useCallback(async (text: string) => {
+  const sendUtterance = useCallback(async (text: string, channel: "text" | "voice" = "text") => {
     const normalized = text.trim();
     if (!session || !token || !normalized) return;
     setError(null);
@@ -463,13 +586,14 @@ export default function Home() {
       const response = await fetch(`${API_BASE}/api/v1/sessions/${session.session_id}/conversation/turns`, {
         method: "POST",
         headers: { ...authHeaders, "Content-Type": "application/json" },
-        body: JSON.stringify({ idempotency_key: requestId(), input_channel: "text", text: normalized }),
+        body: JSON.stringify({ idempotency_key: requestId(), input_channel: channel, text: normalized }),
       });
       if (!response.ok) throw new Error(`Jarvis rejected the request (${response.status}).`);
       const turn = await response.json() as ConversationTurn;
       setConversation(turn.conversation);
+      void playSpokenMessage(turn.conversation.spoken_message);
       setNotice(messageForTurn(turn));
-      setCommand("");
+      if (channel === "text") setCommand("");
       const operationId = turn.operation?.request.operation_id;
       if (operationId) {
         setDashboard(null);
@@ -482,7 +606,114 @@ export default function Home() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Request failed.");
     }
-  }, [authHeaders, session, streamWorkflow, token]);
+  }, [authHeaders, playSpokenMessage, session, streamWorkflow, token]);
+
+  const sendText = useCallback((text: string) => sendUtterance(text, "text"), [sendUtterance]);
+
+  const sendUtteranceRef = useRef(sendUtterance);
+  useEffect(() => {
+    sendUtteranceRef.current = sendUtterance;
+  }, [sendUtterance]);
+
+  const uploadVoiceSegment = useCallback(async () => {
+    const chunks = recorderChunksRef.current;
+    recorderChunksRef.current = [];
+    if (!session || !token || chunks.length === 0) return;
+    const mimeType = recorderRef.current?.mimeType || "audio/webm";
+    const blob = new Blob(chunks, { type: mimeType });
+    if (blob.size === 0) return;
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/sessions/${session.session_id}/transcribe`, {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": mimeType },
+        body: blob,
+      });
+      // A failed or unconfigured transcription must never surface as a
+      // conversation error -- it silently discards this utterance and the
+      // VAD loop keeps listening for the next one.
+      if (!response.ok) return;
+      const result = await response.json() as { transcript: string | null; confidence: number | null };
+      const state = conversationRef.current?.state ?? "dormant";
+      if (shouldSubmitVoiceTranscript(result.transcript, result.confidence, state)) {
+        void sendUtteranceRef.current(result.transcript as string, "voice");
+      }
+    } catch {
+      // Voice transcription failure must never block conversation rendering.
+    }
+  }, [authHeaders, session, token]);
+
+  const stopVoiceCapture = useCallback(() => {
+    if (captureIntervalRef.current !== null) {
+      window.clearInterval(captureIntervalRef.current);
+      captureIntervalRef.current = null;
+    }
+    recorderRef.current?.stop();
+    recorderRef.current = null;
+    recorderChunksRef.current = [];
+    analyserRef.current = null;
+    audioContextRef.current?.close().catch(() => undefined);
+    audioContextRef.current = null;
+    micStreamRef.current?.getTracks().forEach((track) => track.stop());
+    micStreamRef.current = null;
+    captureStateRef.current = "idle";
+    silenceElapsedRef.current = 0;
+    captureSuspendedRef.current = false;
+  }, []);
+
+  const startVoiceCapture = useCallback(async () => {
+    if (micStreamRef.current) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = stream;
+      const audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+
+      const recorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+      recorderRef.current = recorder;
+      recorderChunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) recorderChunksRef.current.push(event.data);
+      };
+      recorder.start(250);
+
+      captureStateRef.current = "idle";
+      silenceElapsedRef.current = 0;
+      const sampleBuffer = new Uint8Array(analyser.fftSize);
+      const tickIntervalMs = 100;
+      captureIntervalRef.current = window.setInterval(() => {
+        if (captureSuspendedRef.current) return;
+        analyser.getByteTimeDomainData(sampleBuffer);
+        let sumSquares = 0;
+        for (let i = 0; i < sampleBuffer.length; i += 1) {
+          const centered = (sampleBuffer[i] - 128) / 128;
+          sumSquares += centered * centered;
+        }
+        const amplitude = Math.sqrt(sumSquares / sampleBuffer.length);
+        const wasLoud = amplitude >= DEFAULT_VOICE_ACTIVITY_CONFIG.speechThreshold;
+        silenceElapsedRef.current = wasLoud ? 0 : silenceElapsedRef.current + tickIntervalMs;
+        const result = isSpeechSegment(captureStateRef.current, amplitude, silenceElapsedRef.current);
+        captureStateRef.current = result.nextState;
+        if (result.utteranceComplete) void uploadVoiceSegment();
+      }, tickIntervalMs);
+    } catch {
+      setVoiceInputEnabled(false);
+      setError("Microphone access was denied or unavailable.");
+    }
+  }, [uploadVoiceSegment]);
+
+  useEffect(() => {
+    if (!voiceInputEnabled || !session || !token) {
+      stopVoiceCapture();
+      return;
+    }
+    void startVoiceCapture();
+    return () => stopVoiceCapture();
+  }, [voiceInputEnabled, session, token, startVoiceCapture, stopVoiceCapture]);
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -557,6 +788,24 @@ export default function Home() {
             />
             <button type="submit" disabled={!command.trim() || !session}>Transmit</button>
           </form>
+          <div className="voice-toggles">
+            <label className="voice-toggle">
+              <input
+                type="checkbox"
+                checked={voiceInputEnabled}
+                onChange={(event) => setVoiceInputEnabled(event.target.checked)}
+              />
+              Voice input
+            </label>
+            <label className="voice-toggle">
+              <input
+                type="checkbox"
+                checked={voiceEnabled}
+                onChange={(event) => setVoiceEnabled(event.target.checked)}
+              />
+              Voice replies
+            </label>
+          </div>
         </section>
 
         <aside className="agent-column right-agents">

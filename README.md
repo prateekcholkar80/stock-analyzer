@@ -16,21 +16,41 @@ safe failure instead of silently substituting a deterministic recommendation.
 The market-data, Phase 2 technical-analysis/backtesting, storage, full debate,
 natural-language routing, and conversation-foundation layers are implemented.
 
-Automated baseline: **1,337 passing tests** (unit and integration), executed
-offline without live credentials.
+Automated baseline: **1,685 passing Python tests** (unit and integration) and
+**36 passing browser tests**. The browser command also completes a production
+build. These checks run without live broker or LLM credentials.
 
 Implemented:
 
 - Angel One SmartAPI behind an injectable market-data gateway
+- One-shot Angel session re-authentication and request replay when a quote or
+  history request reports an expired session
 - Validated quotes, OHLCV candles, historical series, and IST-aware workflow
   events
-- Resumable, chunked historical pulls and local daily/weekly aggregation
+- Broker LTP retained as an independently timestamped observation rather than
+  being presented as the latest completed analysis candle
+- Resumable, chunked historical pulls with a configurable correction overlap,
+  duplicate removal, corrected-candle accounting, immutable dataset reuse, and
+  definite same-session intraday-gap reporting
+- Local hourly-to-daily-to-weekly aggregation that accepts Angel's start-stamped
+  15:15 closing candle only after the 15:30 IST session boundary and excludes
+  incomplete final periods by default
 - Parallel daily and weekly technical agents with a Judge-controlled evidence
   release gate
 - TA-Lib indicators plus deterministic price-action analysis
 - SMA, EMA, RSI, MACD, Bollinger Bands, ATR, ADX, Stochastic, and OBV
 - Swing pivots, HH/HL/LH/LL structure, BOS, CHOCH, fair value gaps, and
   support/resistance lifecycle evidence
+- Timeframe-aware accumulation zones with forming, confirmed, breakout,
+  retest/holding, failed-break, invalidated, and expired lifecycle states
+- Close-confirmed buy-side and sell-side liquidity sweeps; a wick breach without
+  a reclaim is never promoted to a sweep
+- Complete deterministic bullish and bearish setup matrices for daily and
+  weekly analysis, including structure, BOS/CHOCH, volume, FVG/support,
+  EMA alignment, RSI, swing progression, exhaustion, and liquidity-sweep steps
+- Deterministic multi-timeframe interpretation separating weekly structural
+  direction, daily tactical readiness, 2R/3R feasibility, and the final
+  `BUY`/`NO_TRADE` decision
 - Unified weighted swing evaluation and structurally validated trade planning
 - Directional swing backtesting with next-eligible-open execution and
   configurable 1:2 through 1:3 reward/risk targets
@@ -43,7 +63,26 @@ Implemented:
 - Bull/Bear prompts grounded in separately qualified `daily:` and `weekly:`
   evidence, including explicit timeframe agreement or conflict
 - Conservative natural-language swing-intent recognition
-- Cached Angel instrument-master resolution by company name or symbol
+- Cached Angel instrument-master resolution by company name or symbol; the
+  downloaded cache is now sticky (no time-based expiry) and only replaced by an
+  explicit `.refresh()`
+- Conversational ticker-resolution fallback for partial or fuzzy company names:
+  a deterministic, ranked shortlist of real NSE entries, a constrained
+  `TICKER_RESOLVER` LLM proposal that structurally cannot invent a symbol, and a
+  mandatory yes/no user confirmation before the guessed symbol is used
+- A composed NSE cash-equity catalog joining Angel identity with AMFI
+  SEBI large/mid/small-cap classification and NSE sector/industry, each carrying
+  its snapshot provenance
+- After a configurable number of consecutive failed resolutions, Jarvis offers
+  (again with a yes/no confirmation) to refresh its company list and retry
+- Provider-neutral speech synthesis (text-to-speech) and speech-to-text ports
+  with `google` and `elevenlabs` adapters selected purely by configuration,
+  metadata-only prompt-audit records that never store audio or transcript text,
+  and optional `/speech` and `/transcribe` HTTP routes that only exist when the
+  capability is composed
+- Browser voice toggles: spoken Jarvis replies via the `/speech` route and
+  microphone capture with a local amplitude-threshold VAD that uploads a
+  finished utterance to `/transcribe`, muting capture while Jarvis is speaking
 - Text and voice-transcript activation using the same configurable wake phrase
 - Retained approved analysis context for grounded follow-up questions routed
   back to the same Judge abstraction
@@ -60,17 +99,32 @@ Implemented:
 - Wake-aware browser conversation coordinator for typed text and voice
   transcripts, asynchronous dispatch, response acknowledgement, sleep, and
   grounded Judge follow-ups
+- Refresh-scoped browser sessions: leaving or refreshing the page closes the
+  old backend session, and a browser back/forward-cache restoration forces a
+  fresh session instead of reviving stale operation state
+- Plotly daily and weekly candlestick charts with compressed non-trading gaps,
+  separate Broker LTP and analysis-close lines, visible immediate
+  support/resistance when confirmed, EMA 20/50 defaults, and user-selectable
+  indicator, pattern, CPR, accumulation, liquidity-sweep, and price-action
+  overlays
+- A collapsed technical-evidence ledger and indicator drawer keep the default
+  decision view readable while every deterministic calculation remains in the
+  backend result
 - Opt-in, redacted JSONL review trail for Jarvis and LLM agent exchanges
 - Structured JSON logging, correlation IDs, and secret-safe failures
 
 Intentionally not implemented yet:
 
-- Microphone capture, speech-to-text, text-to-speech, or always-listening audio
-- WebSocket alternative transport and the 3D Jarvis dashboard
+- Acoustic/always-listening wake-word detection; speech synthesis and
+  transcription now exist as server-side capabilities and an opt-in browser
+  push-to-listen toggle, but there is no hotword engine and no audio persistence
+- WebSocket alternative transport and a full 3D/audio Jarvis experience
 - Financial-statement and earnings-call document ingestion/RAG
 - Fundamental-analysis agent and document-grounded financial conclusions
 - News discovery, sentiment, and macro-analysis agents
 - Portfolio construction or live order placement
+- Genuine order-flow ingestion or analysis; current OHLCV/OBV/volume evidence
+  is price-volume context, not bid/ask aggressor flow
 
 News and document processing remain parked while the market-analysis and
 interaction foundations are completed.
@@ -199,7 +253,20 @@ POST   /api/v1/sessions/{session_id}/conversation/turns
 POST   /api/v1/sessions/{session_id}/conversation/sleep
 GET    /api/v1/sessions/{session_id}/conversation/events
 GET    /api/v1/sessions/{session_id}/conversation/events/stream
+POST   /api/v1/sessions/{session_id}/speech       (optional; when TTS is composed)
+POST   /api/v1/sessions/{session_id}/transcribe   (optional; when STT is composed)
 ```
+
+`/speech` takes a JSON `{ "text": ... }` body (≤2000 chars) and returns binary
+audio in the configured encoding. `/transcribe` takes a raw audio body (≤10 MiB;
+empty bodies are `400`, oversized are `413`) and returns
+`jarvis.http_transcription.v1` with a `transcript` that is `null`, and still
+`200`, when no speech was detected. Both routes require the session capability
+token, run inside the prompt-audit session context, and only exist when a
+speech synthesis / transcription application is passed to
+`create_jarvis_http_app`. A `TTSError`/`STTError` maps to `503` for a
+configuration problem and `502` for a provider/auth/synthesis failure, with a
+generic client-safe message.
 
 The session-creation response supplies a capability token. Send it on all
 session-scoped requests as `X-Jarvis-Session-Token`. Only token digests are
@@ -212,15 +279,24 @@ The completed-analysis dashboard route returns `jarvis.dashboard.v1`: bounded
 daily/weekly OHLCV series, analyst stance and score, qualified evidence,
 confirmed pivots, immediate support/resistance, Bull/Bear rounds, the Judge
 verdict, an exact long-only 2R/3R plan or explicit no-trade fields, workflow
-activities, and the Jarvis presentation. It is a projection only and never
-recalculates or rewrites domain evidence.
+activities, Jarvis presentation, broker-quote provenance, and historical
+refresh provenance. Refresh provenance identifies an initial, incremental, or
+unchanged refresh; reports the requested and stored ranges, resumed timestamp,
+new/corrected/deduplicated candle counts, chunk count, dataset reuse, and only
+definite same-session gaps. It is a projection only and never recalculates or
+rewrites domain evidence.
 
 The first browser client lives in `frontend/`. It creates an authenticated
 session, accepts the text wake phrase and commands, consumes conversation and
 operation SSE with the capability header, animates the real workflow activity
-matrix, and renders the completed dashboard projection. Configure its API URL
-with `NEXT_PUBLIC_JARVIS_API_URL`; the local default is
-`http://127.0.0.1:8000`.
+matrix, and renders the completed dashboard projection. Daily and weekly
+Plotly charts are separate, scroll naturally with the result, and never
+recalculate financial evidence in JavaScript. Immediate support and resistance
+remain visible; optional overlays live in a collapsed drawer and selections are
+stored per timeframe in device-local storage. Missing or legacy chart fields
+are normalized to empty arrays so an older result degrades safely instead of
+crashing. Configure the API URL with `NEXT_PUBLIC_JARVIS_API_URL`; the local
+default is `http://127.0.0.1:8000`.
 
 The SSE route first replays persisted events, then streams new progress with
 periodic heartbeats and finishes with an authoritative `terminal` event. Its
@@ -233,7 +309,9 @@ Browser conversation state follows:
 
 ```text
 dormant -> greeting -> listening -> processing -> responding -> dormant
-                                      |
+                                      |    |
+                                      |    +-> awaiting_confirmation -> processing
+                                      |                              -> listening
                                       +-> failed -> dormant
 ```
 
@@ -244,9 +322,20 @@ runner, and exposes conversation transitions through replay and SSE. A later
 support/resistance/pivot/evidence question is sent to the Judge only when the
 session retains an approved multi-timeframe analysis.
 
+When exact instrument resolution fails and the conversational ticker-resolution
+fallback is composed, Jarvis enters `awaiting_confirmation`: it either proposes
+a single guessed symbol ("Did you mean …?") or, after the configured number of
+consecutive failures, offers to refresh its company list. A deterministic,
+non-LLM yes/no classifier reads the reply; anything not clearly affirmative is
+treated as "no" and returns to `listening`. Both the HTTP conversation
+coordinator and the wake session share this state machine and the
+`PendingConfirmation` carrier that lets the original request resume after a
+"yes".
+
 ## Requirements
 
 - Python 3.11 or newer
+- Node.js 22.13 or newer for the browser client
 - Angel One credentials for live authentication and market-data operations
 - An LLM model/provider credential for the mandatory full debate
 - Network access for live Angel One and remote LLM operations
@@ -303,9 +392,19 @@ the shared model. A blank persona override inherits the Judge override and then
 the shared model. Provider credentials remain provider-specific environment
 variables and are never stored in Jarvis domain settings.
 
-The Angel instrument-master URL, cache path, TTL, payload limit, timeout, and
-exchange list are configurable. `.env.example` documents the common overrides;
+The Angel instrument-master URL, cache path, payload limit, timeout, and
+exchange list are configurable. The former `ANGEL_INSTRUMENT_CACHE_TTL_SECONDS`
+was removed: the downloaded cache is now sticky and refreshed only by an
+explicit `.refresh()` call. `.env.example` documents the common overrides;
 the validated configuration model defines all defaults.
+
+Optional speech and ticker-resolver settings are also in `.env.example`:
+`JARVIS_TTS_*` / `JARVIS_STT_*` (provider is `google` or `elevenlabs`; voice,
+language, encoding and provider model are configurable; Google uses Application
+Default Credentials, ElevenLabs uses `ELEVENLABS_API_KEY`),
+`JARVIS_TICKER_RESOLVER_LLM_MODEL` / `_TEMPERATURE` / `_MAX_TOKENS` (falls back
+to `JARVIS_LLM_MODEL`), and `JARVIS_RESOLUTION_FAILURE_THRESHOLD` (consecutive
+failed resolutions before Jarvis offers to refresh its company list).
 
 Never commit `.env`, downloaded instrument-master data, logs, provider
 credentials, or generated DuckDB files.
@@ -317,6 +416,18 @@ Full offline suite:
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
+
+Browser production build and tests:
+
+```bash
+cd frontend
+npm test
+```
+
+Verified baseline on 2026-08-27: **1,685 Python tests** and **36 browser
+tests**, all passing. The frontend build succeeds with a non-fatal warning that
+the dynamically loaded Plotly client chunk exceeds the default 500 kB advisory
+threshold.
 
 Conversation and wake-word tests:
 
@@ -413,16 +524,18 @@ not a substitute for access control, retention, rotation, or secure deletion.
    repository ports and normalized DuckDB tables.
 2. Persist dashboard history; the live completed-operation read model is built,
    but it currently projects the in-memory operation result.
-3. Extend the implemented workflow-matrix UI with microphone, speech-to-text,
-   provider-neutral speech synthesis, and the ElevenLabs adapter.
-4. Add microphone/STT/TTS adapters to the same transcript/response contracts.
-5. Add speech-to-text and text-to-speech adapters without coupling the domain
-   session to an audio vendor.
-6. Build the interactive Jarvis dashboard against the typed event and result
-   contracts.
-7. Add user-supplied document ingestion, citation-preserving RAG, and a
+3. Add a database-neutral market-microstructure/order-flow port only after a
+   valid source is selected. Existing candles cannot reconstruct genuine
+   order flow; Angel best-five streaming would require prospective capture,
+   while historical order/trade replay requires a separate dataset.
+4. Speech synthesis, transcription, the Google/ElevenLabs adapters, the
+   optional `/speech` and `/transcribe` routes, and the browser voice toggles
+   are implemented. Remaining audio work is an acoustic wake-word engine and
+   any hands-free/streaming capture, without changing the existing text and
+   transcript wake contract.
+6. Add user-supplied document ingestion, citation-preserving RAG, and a
    financial-analysis agent.
-8. Combine strictly document-grounded fundamentals with existing technical and
+7. Combine strictly document-grounded fundamentals with existing technical and
    price-action evidence before expanding the Judge's final report.
 
 ## Disclaimer

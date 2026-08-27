@@ -19,6 +19,7 @@ from app.models.conversation import (
     InputChannel,
     JarvisUtterance,
 )
+from tests.unit.test_jarvis_conversation import FakeTickerResolutionExecutor
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -72,7 +73,14 @@ class _Operations:
             presentation_failure=None,
         )
 
-    def fail(self, operation_id, *, at):
+    def fail(
+        self,
+        operation_id,
+        *,
+        at,
+        code="llm.unavailable",
+        message="The debate panel is temporarily unavailable.",
+    ):
         current = self.operations[operation_id]
         from app.models.browser_operations import BrowserOperationFailure
 
@@ -81,8 +89,8 @@ class _Operations:
             status=BrowserOperationStatus.FAILED,
             updated_at=at,
             failure=BrowserOperationFailure(
-                code="llm.unavailable",
-                message="The debate panel is temporarily unavailable.",
+                code=code,
+                message=message,
                 retryable=True,
             ),
         )
@@ -269,6 +277,194 @@ class BrowserConversationCoordinatorTests(unittest.TestCase):
                 )
             )
         self.assertIsNotNone(active.operation)
+
+
+class BrowserConversationCoordinatorTickerResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.operations = _Operations()
+
+    def _coordinator(self, *, ticker_resolution_executor, threshold=3):
+        return BrowserConversationCoordinator(
+            self.operations,
+            JarvisConversationConfig(
+                user_name="Prateek",
+                consecutive_resolution_failures_before_refresh_prompt=threshold,
+            ),
+            ticker_resolution_executor=ticker_resolution_executor,
+        )
+
+    def _turn(self, conversation, text, key, *, channel=InputChannel.TEXT, at=T0):
+        return conversation.handle(
+            "session-1",
+            JarvisUtterance(text=text, channel=channel),
+            idempotency_key=key,
+            operation_id_factory=lambda: f"operation-{key}",
+            at=at,
+        )
+
+    def test_resolved_guess_awaits_confirmation_then_dispatches_resolved_symbol(
+        self,
+    ):
+        from app.use_cases.resolve_ticker_conversationally import (
+            TickerConversationalResolutionResult,
+        )
+
+        executor = FakeTickerResolutionExecutor(
+            results=[
+                TickerConversationalResolutionResult(
+                    outcome="resolved_needs_confirmation",
+                    chosen_symbol="INFY-EQ",
+                    exchange="NSE",
+                    candidate_display_names=("Infosys Limited",),
+                )
+            ]
+        )
+        conversation = self._coordinator(ticker_resolution_executor=executor)
+        conversation.open_session("session-1", at=T0)
+
+        dispatched = self._turn(
+            conversation, "Hey Jarvis analyze Infosys", "request-1"
+        )
+        self.operations.fail(
+            dispatched.operation.request.operation_id,
+            at=T0 + timedelta(seconds=1),
+            code="instrument.not_found",
+            message=(
+                "I could not match that company to one NSE cash-market "
+                "instrument."
+            ),
+        )
+
+        awaiting = conversation.get_snapshot(
+            "session-1", at=T0 + timedelta(seconds=2)
+        )
+        self.assertIs(awaiting.state, ConversationState.AWAITING_CONFIRMATION)
+        self.assertIn('Did you mean "INFY-EQ"', awaiting.display_message)
+        self.assertEqual(executor.attempt_calls, ["analyze Infosys"])
+
+        confirmed = self._turn(
+            conversation, "yes", "request-2", at=T0 + timedelta(seconds=3)
+        )
+        self.assertIs(confirmed.outcome, ConversationOutcome.DISPATCHED)
+        self.assertIs(confirmed.conversation.state, ConversationState.PROCESSING)
+        self.assertEqual(
+            confirmed.operation.request.message,
+            "Analyze INFY-EQ for a swing trade",
+        )
+
+    def test_declining_the_guess_returns_to_listening(self):
+        from app.use_cases.resolve_ticker_conversationally import (
+            TickerConversationalResolutionResult,
+        )
+
+        executor = FakeTickerResolutionExecutor(
+            results=[
+                TickerConversationalResolutionResult(
+                    outcome="resolved_needs_confirmation",
+                    chosen_symbol="INFY-EQ",
+                    exchange="NSE",
+                )
+            ]
+        )
+        conversation = self._coordinator(ticker_resolution_executor=executor)
+        conversation.open_session("session-1", at=T0)
+
+        dispatched = self._turn(
+            conversation, "Hey Jarvis analyze Infosys", "request-1"
+        )
+        self.operations.fail(
+            dispatched.operation.request.operation_id,
+            at=T0 + timedelta(seconds=1),
+            code="instrument.not_found",
+        )
+        conversation.get_snapshot("session-1", at=T0 + timedelta(seconds=2))
+
+        declined = self._turn(
+            conversation, "no", "request-2", at=T0 + timedelta(seconds=3)
+        )
+
+        self.assertIs(
+            declined.outcome, ConversationOutcome.CLARIFICATION_REQUIRED
+        )
+        self.assertIs(declined.conversation.state, ConversationState.LISTENING)
+        self.assertIsNone(declined.operation)
+
+    def test_repeated_failures_reach_threshold_and_confirm_catalog_refresh(self):
+        from app.use_cases.resolve_ticker_conversationally import (
+            TickerConversationalResolutionResult,
+        )
+
+        not_found = TickerConversationalResolutionResult(outcome="not_found")
+        executor = FakeTickerResolutionExecutor(
+            results=[not_found, not_found],
+            refresh_count=42,
+        )
+        conversation = self._coordinator(
+            ticker_resolution_executor=executor, threshold=2
+        )
+        conversation.open_session("session-1", at=T0)
+
+        first = self._turn(
+            conversation, "Hey Jarvis analyze Zzz Corp", "request-1"
+        )
+        self.operations.fail(
+            first.operation.request.operation_id,
+            at=T0 + timedelta(seconds=1),
+            code="instrument.not_found",
+        )
+        after_first = conversation.get_snapshot(
+            "session-1", at=T0 + timedelta(seconds=2)
+        )
+        self.assertIs(after_first.state, ConversationState.FAILED)
+
+        second = self._turn(
+            conversation,
+            "Hey Jarvis analyze Zzz Corp",
+            "request-2",
+            at=T0 + timedelta(seconds=3),
+        )
+        self.operations.fail(
+            second.operation.request.operation_id,
+            at=T0 + timedelta(seconds=4),
+            code="instrument.not_found",
+        )
+        awaiting = conversation.get_snapshot(
+            "session-1", at=T0 + timedelta(seconds=5)
+        )
+        self.assertIs(awaiting.state, ConversationState.AWAITING_CONFIRMATION)
+        self.assertIn("refresh", awaiting.display_message.lower())
+
+        confirmed = self._turn(
+            conversation, "yes", "request-3", at=T0 + timedelta(seconds=6)
+        )
+        self.assertEqual(executor.refresh_calls, 1)
+        self.assertIs(confirmed.outcome, ConversationOutcome.DISPATCHED)
+        self.assertEqual(
+            confirmed.operation.request.message, "analyze Zzz Corp"
+        )
+
+    def test_without_executor_configured_falls_back_to_flat_failure(self):
+        conversation = self._coordinator(ticker_resolution_executor=None)
+        conversation.open_session("session-1", at=T0)
+
+        dispatched = self._turn(
+            conversation, "Hey Jarvis analyze Zzz Corp", "request-1"
+        )
+        self.operations.fail(
+            dispatched.operation.request.operation_id,
+            at=T0 + timedelta(seconds=1),
+            code="instrument.not_found",
+            message="I could not match that company to one NSE instrument.",
+        )
+
+        failed = conversation.get_snapshot(
+            "session-1", at=T0 + timedelta(seconds=2)
+        )
+        self.assertIs(failed.state, ConversationState.FAILED)
+        self.assertEqual(
+            failed.display_message,
+            "I could not match that company to one NSE instrument.",
+        )
 
 
 if __name__ == "__main__":

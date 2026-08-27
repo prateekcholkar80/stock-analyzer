@@ -18,6 +18,14 @@ from app.api.http import create_jarvis_http_app
 from app.api.session_auth import InMemoryBrowserSessionAuthorizer
 from app.conversation.browser import BrowserConversationCoordinator
 from app.conversation.config import JarvisConversationConfig
+from app.exceptions import (
+    STTAuthenticationError,
+    STTConfigurationError,
+    STTProviderUnavailableError,
+    TTSAuthenticationError,
+    TTSConfigurationError,
+    TTSProviderUnavailableError,
+)
 from app.models.browser_operations import (
     BrowserOperationOutput,
     BrowserOperationStatus,
@@ -25,6 +33,8 @@ from app.models.browser_operations import (
 from app.models.interaction import JarvisSwingAnalysisResponse
 from app.models.debate import JudgeFollowUpAnswer
 from app.models.workflow import WorkflowEventState, WorkflowStage
+from app.stt.gateway import Transcription
+from app.tts.gateway import SpeechSynthesis
 from app.workflow.browser_runner import (
     AsyncBrowserOperationRunner,
     InMemoryBrowserOperationResultStore,
@@ -610,6 +620,385 @@ class JarvisHttpCancellationTests(unittest.TestCase):
         self.assertIn("event: workflow", streamed["response"].text)
         self.assertIn("event: terminal", streamed["response"].text)
         self.assertIn('"status":"cancelled"', streamed["response"].text)
+
+
+class _NullOperationHandler:
+    """Minimal operation handler for tests that only exercise /speech."""
+
+    def execute(self, request, *, event_emitter, cancellation_token):
+        raise AssertionError("operation execution is not used by speech tests")
+
+
+class FakeSpeechSynthesisApplication:
+    def __init__(self, synthesis=None, failure=None):
+        self.synthesis = synthesis
+        self.failure = failure
+        self.calls = []
+
+    def synthesize(self, *, text):
+        self.calls.append(text)
+        if self.failure is not None:
+            raise self.failure
+        return self.synthesis
+
+
+def _speech_synthesis():
+    return SpeechSynthesis(
+        audio=b"fake-mp3-audio-bytes",
+        provider="google",
+        voice="en-GB-Neural2-B",
+        audio_encoding="MP3",
+        media_type="audio/mpeg",
+        generated_at=datetime.now(IST),
+    )
+
+
+class SpeechHttpApiTests(unittest.TestCase):
+    def _build_client(self, *, speech):
+        registry = InMemoryBrowserOperationRegistry()
+        results = InMemoryBrowserOperationResultStore()
+        runner = AsyncBrowserOperationRunner(
+            registry, _NullOperationHandler(), results, max_workers=1
+        )
+        self.addCleanup(runner.shutdown)
+        client = TestClient(
+            create_jarvis_http_app(
+                runner,
+                speech=speech,
+                authorizer=InMemoryBrowserSessionAuthorizer(),
+            )
+        )
+        response = client.post("/api/v1/sessions")
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        return client, body["session"]["session_id"], body["access_token"]
+
+    def test_returns_binary_audio_with_correct_media_type(self):
+        speech = FakeSpeechSynthesisApplication(synthesis=_speech_synthesis())
+        client, session_id, token = self._build_client(speech=speech)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/speech",
+            json={"text": "Analysis complete."},
+            headers={"X-Jarvis-Session-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "audio/mpeg")
+        self.assertEqual(response.content, b"fake-mp3-audio-bytes")
+        self.assertEqual(speech.calls, ["Analysis complete."])
+
+    def test_route_does_not_exist_when_speech_not_configured(self):
+        registry = InMemoryBrowserOperationRegistry()
+        results = InMemoryBrowserOperationResultStore()
+        runner = AsyncBrowserOperationRunner(
+            registry, _NullOperationHandler(), results, max_workers=1
+        )
+        self.addCleanup(runner.shutdown)
+        client = TestClient(
+            create_jarvis_http_app(
+                runner,
+                authorizer=InMemoryBrowserSessionAuthorizer(),
+            )
+        )
+        session_response = client.post("/api/v1/sessions")
+        session_id = session_response.json()["session"]["session_id"]
+        token = session_response.json()["access_token"]
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/speech",
+            json={"text": "Analysis complete."},
+            headers={"X-Jarvis-Session-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_rejects_request_without_valid_token(self):
+        speech = FakeSpeechSynthesisApplication(synthesis=_speech_synthesis())
+        client, session_id, _token = self._build_client(speech=speech)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/speech",
+            json={"text": "Analysis complete."},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(speech.calls, [])
+
+    def test_configuration_error_maps_to_503(self):
+        speech = FakeSpeechSynthesisApplication(
+            failure=TTSConfigurationError("not configured", provider="google")
+        )
+        client, session_id, token = self._build_client(speech=speech)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/speech",
+            json={"text": "Analysis complete."},
+            headers={"X-Jarvis-Session-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_provider_unavailable_maps_to_502(self):
+        speech = FakeSpeechSynthesisApplication(
+            failure=TTSProviderUnavailableError("down", provider="google")
+        )
+        client, session_id, token = self._build_client(speech=speech)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/speech",
+            json={"text": "Analysis complete."},
+            headers={"X-Jarvis-Session-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 502)
+
+    def test_authentication_error_maps_to_502(self):
+        speech = FakeSpeechSynthesisApplication(
+            failure=TTSAuthenticationError("bad credential", provider="google")
+        )
+        client, session_id, token = self._build_client(speech=speech)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/speech",
+            json={"text": "Analysis complete."},
+            headers={"X-Jarvis-Session-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 502)
+
+    def test_rejects_blank_text(self):
+        speech = FakeSpeechSynthesisApplication(synthesis=_speech_synthesis())
+        client, session_id, token = self._build_client(speech=speech)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/speech",
+            json={"text": "   "},
+            headers={"X-Jarvis-Session-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(speech.calls, [])
+
+
+class FakeTranscriptionApplication:
+    def __init__(self, transcription=None, failure=None):
+        self.transcription = transcription
+        self.failure = failure
+        self.calls = []
+
+    def transcribe(self, *, audio, media_type):
+        self.calls.append((audio, media_type))
+        if self.failure is not None:
+            raise self.failure
+        return self.transcription
+
+
+def _transcription(**overrides):
+    values = {
+        "transcript": "Analyze Reliance for a swing trade",
+        "provider": "google",
+        "language_code": "en-IN",
+        "confidence": 0.92,
+        "generated_at": datetime.now(IST),
+    }
+    values.update(overrides)
+    return Transcription(**values)
+
+
+class TranscriptionHttpApiTests(unittest.TestCase):
+    def _build_client(self, *, transcription):
+        registry = InMemoryBrowserOperationRegistry()
+        results = InMemoryBrowserOperationResultStore()
+        runner = AsyncBrowserOperationRunner(
+            registry, _NullOperationHandler(), results, max_workers=1
+        )
+        self.addCleanup(runner.shutdown)
+        client = TestClient(
+            create_jarvis_http_app(
+                runner,
+                transcription=transcription,
+                authorizer=InMemoryBrowserSessionAuthorizer(),
+            )
+        )
+        response = client.post("/api/v1/sessions")
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        return client, body["session"]["session_id"], body["access_token"]
+
+    def test_returns_transcript_and_confidence(self):
+        transcription = FakeTranscriptionApplication(
+            transcription=_transcription()
+        )
+        client, session_id, token = self._build_client(transcription=transcription)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/transcribe",
+            content=b"fake-webm-audio-bytes",
+            headers={
+                "X-Jarvis-Session-Token": token,
+                "Content-Type": "audio/webm",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["transcript"], "Analyze Reliance for a swing trade")
+        self.assertEqual(body["confidence"], 0.92)
+        self.assertEqual(
+            transcription.calls, [(b"fake-webm-audio-bytes", "audio/webm")]
+        )
+
+    def test_no_speech_detected_returns_200_with_null_transcript(self):
+        transcription = FakeTranscriptionApplication(
+            transcription=_transcription(transcript="", confidence=None)
+        )
+        client, session_id, token = self._build_client(transcription=transcription)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/transcribe",
+            content=b"fake-silence-audio-bytes",
+            headers={
+                "X-Jarvis-Session-Token": token,
+                "Content-Type": "audio/webm",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIsNone(body["transcript"])
+        self.assertIsNone(body["confidence"])
+
+    def test_route_does_not_exist_when_transcription_not_configured(self):
+        registry = InMemoryBrowserOperationRegistry()
+        results = InMemoryBrowserOperationResultStore()
+        runner = AsyncBrowserOperationRunner(
+            registry, _NullOperationHandler(), results, max_workers=1
+        )
+        self.addCleanup(runner.shutdown)
+        client = TestClient(
+            create_jarvis_http_app(
+                runner,
+                authorizer=InMemoryBrowserSessionAuthorizer(),
+            )
+        )
+        session_response = client.post("/api/v1/sessions")
+        session_id = session_response.json()["session"]["session_id"]
+        token = session_response.json()["access_token"]
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/transcribe",
+            content=b"fake-webm-audio-bytes",
+            headers={
+                "X-Jarvis-Session-Token": token,
+                "Content-Type": "audio/webm",
+            },
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_rejects_request_without_valid_token(self):
+        transcription = FakeTranscriptionApplication(
+            transcription=_transcription()
+        )
+        client, session_id, _token = self._build_client(transcription=transcription)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/transcribe",
+            content=b"fake-webm-audio-bytes",
+            headers={"Content-Type": "audio/webm"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(transcription.calls, [])
+
+    def test_rejects_empty_body(self):
+        transcription = FakeTranscriptionApplication(
+            transcription=_transcription()
+        )
+        client, session_id, token = self._build_client(transcription=transcription)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/transcribe",
+            content=b"",
+            headers={
+                "X-Jarvis-Session-Token": token,
+                "Content-Type": "audio/webm",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(transcription.calls, [])
+
+    def test_rejects_oversized_body(self):
+        transcription = FakeTranscriptionApplication(
+            transcription=_transcription()
+        )
+        client, session_id, token = self._build_client(transcription=transcription)
+
+        oversized = b"x" * (10 * 1024 * 1024 + 1)
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/transcribe",
+            content=oversized,
+            headers={
+                "X-Jarvis-Session-Token": token,
+                "Content-Type": "audio/webm",
+            },
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(transcription.calls, [])
+
+    def test_configuration_error_maps_to_503(self):
+        transcription = FakeTranscriptionApplication(
+            failure=STTConfigurationError("not configured", provider="google")
+        )
+        client, session_id, token = self._build_client(transcription=transcription)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/transcribe",
+            content=b"fake-webm-audio-bytes",
+            headers={
+                "X-Jarvis-Session-Token": token,
+                "Content-Type": "audio/webm",
+            },
+        )
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_provider_unavailable_maps_to_502(self):
+        transcription = FakeTranscriptionApplication(
+            failure=STTProviderUnavailableError("down", provider="google")
+        )
+        client, session_id, token = self._build_client(transcription=transcription)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/transcribe",
+            content=b"fake-webm-audio-bytes",
+            headers={
+                "X-Jarvis-Session-Token": token,
+                "Content-Type": "audio/webm",
+            },
+        )
+
+        self.assertEqual(response.status_code, 502)
+
+    def test_authentication_error_maps_to_502(self):
+        transcription = FakeTranscriptionApplication(
+            failure=STTAuthenticationError("bad credential", provider="google")
+        )
+        client, session_id, token = self._build_client(transcription=transcription)
+
+        response = client.post(
+            f"/api/v1/sessions/{session_id}/transcribe",
+            content=b"fake-webm-audio-bytes",
+            headers={
+                "X-Jarvis-Session-Token": token,
+                "Content-Type": "audio/webm",
+            },
+        )
+
+        self.assertEqual(response.status_code, 502)
 
 
 if __name__ == "__main__":

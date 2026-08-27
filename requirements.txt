@@ -2,6 +2,7 @@ python-dotenv
 duckdb
 pandas
 pandas-ta-classic
+openpyxl
 pydantic
 smartapi-python
 pyotp
@@ -10,5 +11,8 @@ TA-Lib
 logzero
 websocket-client
 litellm
+google-cloud-texttospeech
+google-cloud-speech
+elevenlabs
 fastapi
 uvicorn[standard]

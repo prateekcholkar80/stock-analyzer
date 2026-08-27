@@ -24,6 +24,9 @@ _TRANSITION_MESSAGES = {
     ConversationState.RESPONDING: "Jarvis has prepared a response.",
     ConversationState.FAILED: "Jarvis could not complete the request.",
     ConversationState.DORMANT: "Jarvis returned to standby.",
+    ConversationState.AWAITING_CONFIRMATION: (
+        "Jarvis is waiting for a yes/no confirmation."
+    ),
 }
 
 

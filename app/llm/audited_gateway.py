@@ -23,6 +23,7 @@ _ACTOR_BY_ROLE = {
     LLMRole.BEAR: PromptAuditActor.BEAR,
     LLMRole.JUDGE: PromptAuditActor.JUDGE,
     LLMRole.JARVIS: PromptAuditActor.JARVIS,
+    LLMRole.TICKER_RESOLVER: PromptAuditActor.TICKER_RESOLVER,
 }
 
 

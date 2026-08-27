@@ -101,6 +101,14 @@ class InMemoryInstrumentResolverTests(unittest.TestCase):
                     _reliance(),
                 )
 
+    def test_list_instruments_returns_full_catalog(self):
+        resolver = InMemoryInstrumentResolver((_reliance(), _tcs()))
+
+        self.assertEqual(
+            set(resolver.list_instruments()),
+            {_reliance(), _tcs()},
+        )
+
     def test_normalizes_spaces_and_punctuation_for_exact_matching(self):
         resolver = InMemoryInstrumentResolver((_tcs(),))
 

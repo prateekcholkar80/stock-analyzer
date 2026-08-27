@@ -39,6 +39,9 @@ from app.models.signals import (
 from app.models.storage import EndToEndSwingAnalysisResult
 from app.orchestration.agent_orchestrator import AgentOrchestrator
 from app.presentation.llm_failures import present_llm_failure
+from app.use_cases.resolve_ticker_conversationally import (
+    TickerConversationalResolutionResult,
+)
 from tests.unit.test_build_multi_timeframe_evidence import (
     _cyclical_timeframes,
 )
@@ -136,6 +139,22 @@ class RecordingPresenter:
             model_id="fake-jarvis",
             generated_at=datetime.now(UTC),
         )
+
+
+class FakeTickerResolutionExecutor:
+    def __init__(self, results=(), refresh_count=1):
+        self.results = list(results)
+        self.attempt_calls = []
+        self.refresh_calls = 0
+        self._refresh_count = refresh_count
+
+    def attempt(self, command):
+        self.attempt_calls.append(command)
+        return self.results.pop(0)
+
+    def refresh_catalog(self):
+        self.refresh_calls += 1
+        return self._refresh_count
 
 
 class RecordingJudgeFollowUpExecutor:
@@ -236,6 +255,36 @@ class JarvisConversationConfigTests(unittest.TestCase):
     def test_requires_user_name(self):
         with self.assertRaises(ConfigurationError):
             JarvisConversationConfig.from_environment({})
+
+    def test_defaults_resolution_failure_threshold_to_three(self):
+        config = JarvisConversationConfig.from_environment(
+            {"JARVIS_USER_NAME": "Prateek"}
+        )
+
+        self.assertEqual(
+            config.consecutive_resolution_failures_before_refresh_prompt, 3
+        )
+
+    def test_loads_custom_resolution_failure_threshold(self):
+        config = JarvisConversationConfig.from_environment(
+            {
+                "JARVIS_USER_NAME": "Prateek",
+                "JARVIS_RESOLUTION_FAILURE_THRESHOLD": "5",
+            }
+        )
+
+        self.assertEqual(
+            config.consecutive_resolution_failures_before_refresh_prompt, 5
+        )
+
+    def test_rejects_non_integer_resolution_failure_threshold(self):
+        with self.assertRaises(ConfigurationError):
+            JarvisConversationConfig.from_environment(
+                {
+                    "JARVIS_USER_NAME": "Prateek",
+                    "JARVIS_RESOLUTION_FAILURE_THRESHOLD": "not-a-number",
+                }
+            )
 
 
 class JarvisConversationSessionTests(unittest.TestCase):
@@ -510,6 +559,226 @@ class JarvisConversationSessionTests(unittest.TestCase):
         )
         self.assertEqual(turn.state_after, ConversationState.LISTENING)
         self.assertNotIn("raw secret detail", turn.display_message)
+
+    def test_resolution_failure_without_ticker_resolver_is_unaffected(self):
+        # No ticker_resolution_executor configured: behavior must be
+        # byte-for-byte identical to before this feature existed.
+        executor = RecordingResearchExecutor(
+            failures=(InstrumentNotFoundError("raw secret detail"),)
+        )
+        session = JarvisConversationSession(
+            executor,
+            JarvisConversationConfig(user_name="Prateek"),
+            session_id_factory=lambda: "session-2b",
+        )
+
+        turn = session.handle_text("Hey Jarvis analyze Mystery Limited")
+
+        self.assertEqual(
+            turn.outcome,
+            ConversationOutcome.CLARIFICATION_REQUIRED,
+        )
+        self.assertEqual(turn.state_after, ConversationState.LISTENING)
+
+    def test_ticker_guess_requests_confirmation_and_awaits_reply(self):
+        executor = RecordingResearchExecutor(
+            failures=(InstrumentNotFoundError("no exact match"),)
+        )
+        resolver = FakeTickerResolutionExecutor(
+            results=[
+                TickerConversationalResolutionResult(
+                    outcome="resolved_needs_confirmation",
+                    chosen_symbol="RELIANCE-EQ",
+                    exchange="NSE",
+                )
+            ]
+        )
+        session = JarvisConversationSession(
+            executor,
+            JarvisConversationConfig(user_name="Prateek"),
+            ticker_resolution_executor=resolver,
+            session_id_factory=lambda: "session-guess",
+        )
+
+        turn = session.handle_text("Hey Jarvis analyze Rel for me")
+
+        self.assertEqual(
+            turn.outcome, ConversationOutcome.CONFIRMATION_REQUESTED
+        )
+        self.assertEqual(
+            turn.state_after, ConversationState.AWAITING_CONFIRMATION
+        )
+        self.assertIn("RELIANCE-EQ", turn.display_message)
+        self.assertEqual(resolver.attempt_calls, ["analyze Rel for me"])
+
+    def test_yes_to_ticker_guess_resumes_with_confirmed_symbol(self):
+        executor = RecordingResearchExecutor(
+            failures=(InstrumentNotFoundError("no exact match"),)
+        )
+        resolver = FakeTickerResolutionExecutor(
+            results=[
+                TickerConversationalResolutionResult(
+                    outcome="resolved_needs_confirmation",
+                    chosen_symbol="RELIANCE-EQ",
+                    exchange="NSE",
+                )
+            ]
+        )
+        session = JarvisConversationSession(
+            executor,
+            JarvisConversationConfig(user_name="Prateek"),
+            ticker_resolution_executor=resolver,
+            session_id_factory=lambda: "session-yes",
+        )
+        session.handle_text("Hey Jarvis analyze Rel for me")
+
+        turn = session.handle_text("yes")
+
+        self.assertEqual(turn.outcome, ConversationOutcome.COMPLETED)
+        self.assertEqual(turn.state_after, ConversationState.DORMANT)
+        self.assertEqual(
+            executor.calls[-1][0],
+            "Analyze RELIANCE-EQ for a swing trade",
+        )
+
+    def test_no_to_ticker_guess_returns_to_listening_without_leaking_state(
+        self,
+    ):
+        executor = RecordingResearchExecutor(
+            failures=(InstrumentNotFoundError("no exact match"),)
+        )
+        resolver = FakeTickerResolutionExecutor(
+            results=[
+                TickerConversationalResolutionResult(
+                    outcome="resolved_needs_confirmation",
+                    chosen_symbol="RELIANCE-EQ",
+                    exchange="NSE",
+                )
+            ]
+        )
+        session = JarvisConversationSession(
+            executor,
+            JarvisConversationConfig(user_name="Prateek"),
+            ticker_resolution_executor=resolver,
+            session_id_factory=lambda: "session-no",
+        )
+        session.handle_text("Hey Jarvis analyze Rel for me")
+
+        decline_turn = session.handle_text("no")
+
+        self.assertEqual(
+            decline_turn.outcome,
+            ConversationOutcome.CLARIFICATION_REQUIRED,
+        )
+        self.assertEqual(decline_turn.state_after, ConversationState.LISTENING)
+
+        # A fresh command afterward works normally -- no leaked pending state.
+        follow_up_turn = session.handle_text("Analyze TCS for a swing trade")
+        self.assertEqual(follow_up_turn.outcome, ConversationOutcome.COMPLETED)
+        self.assertEqual(executor.calls[-1][0], "Analyze TCS for a swing trade")
+
+    def test_repeated_failures_reach_threshold_and_offer_catalog_refresh(self):
+        executor = RecordingResearchExecutor(
+            failures=[
+                InstrumentNotFoundError("miss 1"),
+                InstrumentNotFoundError("miss 2"),
+                InstrumentNotFoundError("miss 3"),
+            ]
+        )
+        resolver = FakeTickerResolutionExecutor(
+            results=[
+                TickerConversationalResolutionResult(outcome="not_found"),
+                TickerConversationalResolutionResult(outcome="ambiguous"),
+                TickerConversationalResolutionResult(outcome="not_found"),
+            ]
+        )
+        session = JarvisConversationSession(
+            executor,
+            JarvisConversationConfig(
+                user_name="Prateek",
+                consecutive_resolution_failures_before_refresh_prompt=3,
+            ),
+            ticker_resolution_executor=resolver,
+            session_id_factory=lambda: "session-threshold",
+        )
+
+        first = session.handle_text("Hey Jarvis analyze Zzz for me")
+        second = session.handle_text("Analyze Zzz for me")
+        third = session.handle_text("Analyze Zzz for me")
+
+        self.assertEqual(first.outcome, ConversationOutcome.CLARIFICATION_REQUIRED)
+        self.assertEqual(second.outcome, ConversationOutcome.CLARIFICATION_REQUIRED)
+        self.assertEqual(
+            third.outcome, ConversationOutcome.CONFIRMATION_REQUESTED
+        )
+        self.assertEqual(
+            third.state_after, ConversationState.AWAITING_CONFIRMATION
+        )
+
+    def test_yes_to_catalog_refresh_calls_refresh_then_retries_original(self):
+        executor = RecordingResearchExecutor(
+            failures=[
+                InstrumentNotFoundError("miss 1"),
+                InstrumentNotFoundError("miss 2"),
+                InstrumentNotFoundError("miss 3"),
+            ]
+        )
+        resolver = FakeTickerResolutionExecutor(
+            results=[
+                TickerConversationalResolutionResult(outcome="not_found"),
+                TickerConversationalResolutionResult(outcome="not_found"),
+                TickerConversationalResolutionResult(outcome="not_found"),
+            ]
+        )
+        session = JarvisConversationSession(
+            executor,
+            JarvisConversationConfig(
+                user_name="Prateek",
+                consecutive_resolution_failures_before_refresh_prompt=3,
+            ),
+            ticker_resolution_executor=resolver,
+            session_id_factory=lambda: "session-refresh",
+        )
+        session.handle_text("Hey Jarvis analyze Zzz for me")
+        session.handle_text("Analyze Zzz for me")
+        session.handle_text("Analyze Zzz for me")
+
+        turn = session.handle_text("yes")
+
+        self.assertEqual(resolver.refresh_calls, 1)
+        self.assertEqual(turn.outcome, ConversationOutcome.COMPLETED)
+        # The fourth execute() call is a retry of the exact command that
+        # triggered the refresh-confirmation (the third failed attempt) --
+        # this time it succeeds since no failure is queued for it.
+        self.assertEqual(executor.calls[-1][0], "Analyze Zzz for me")
+
+    def test_busy_guard_does_not_apply_while_awaiting_confirmation(self):
+        executor = RecordingResearchExecutor(
+            failures=(InstrumentNotFoundError("no exact match"),)
+        )
+        resolver = FakeTickerResolutionExecutor(
+            results=[
+                TickerConversationalResolutionResult(
+                    outcome="resolved_needs_confirmation",
+                    chosen_symbol="RELIANCE-EQ",
+                    exchange="NSE",
+                )
+            ]
+        )
+        session = JarvisConversationSession(
+            executor,
+            JarvisConversationConfig(user_name="Prateek"),
+            ticker_resolution_executor=resolver,
+            session_id_factory=lambda: "session-busy-check",
+        )
+        session.handle_text("Hey Jarvis analyze Rel for me")
+        self.assertEqual(
+            session.state, ConversationState.AWAITING_CONFIRMATION
+        )
+
+        turn = session.handle_text("yes")
+
+        self.assertNotEqual(turn.outcome, ConversationOutcome.BUSY)
 
     def test_llm_failure_preserves_candid_safe_voice_and_display_copy(self):
         failure = present_llm_failure(

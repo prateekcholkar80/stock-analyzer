@@ -38,6 +38,27 @@ class LLMSettingsTests(unittest.TestCase):
             settings.for_role(LLMRole.JARVIS).model,
             "openai/test-model",
         )
+        self.assertEqual(
+            settings.for_role(LLMRole.TICKER_RESOLVER).model,
+            "openai/test-model",
+        )
+
+    def test_ticker_resolver_can_override_shared_model_and_generation_settings(
+        self,
+    ):
+        settings = LLMSettings.from_environment(
+            {
+                "JARVIS_LLM_MODEL": "provider/shared",
+                "JARVIS_TICKER_RESOLVER_LLM_MODEL": "provider/resolver",
+                "JARVIS_TICKER_RESOLVER_LLM_TEMPERATURE": "0.1",
+                "JARVIS_TICKER_RESOLVER_LLM_MAX_TOKENS": "150",
+            }
+        )
+
+        resolver = settings.for_role(LLMRole.TICKER_RESOLVER)
+        self.assertEqual(resolver.model, "provider/resolver")
+        self.assertEqual(resolver.temperature, 0.1)
+        self.assertEqual(resolver.max_tokens, 150)
 
     def test_persona_can_override_shared_model_and_generation_settings(self):
         settings = LLMSettings.from_environment(
@@ -170,6 +191,15 @@ class LLMSettingsTests(unittest.TestCase):
         self.assertEqual(
             settings.for_role(LLMRole.JARVIS).max_tokens,
             5000,
+        )
+        self.assertEqual(
+            settings.for_role(LLMRole.TICKER_RESOLVER),
+            LLMRoleSettings(
+                role=LLMRole.TICKER_RESOLVER,
+                model="provider/model",
+                temperature=0.0,
+                max_tokens=300,
+            ),
         )
 
     def test_rejects_invalid_temperature_for_each_role(self):

@@ -37,6 +37,7 @@ class PromptAuditActor(StrEnum):
     BULL = "bull"
     BEAR = "bear"
     JUDGE = "judge"
+    TICKER_RESOLVER = "ticker_resolver"
 
 
 class PromptAuditEventType(StrEnum):
@@ -45,6 +46,12 @@ class PromptAuditEventType(StrEnum):
     LLM_REQUEST = "llm_request"
     LLM_RESPONSE = "llm_response"
     LLM_FAILURE = "llm_failure"
+    TTS_REQUEST = "tts_request"
+    TTS_RESPONSE = "tts_response"
+    TTS_FAILURE = "tts_failure"
+    STT_REQUEST = "stt_request"
+    STT_RESPONSE = "stt_response"
+    STT_FAILURE = "stt_failure"
 
 
 class PromptAuditConfig(BaseModel):

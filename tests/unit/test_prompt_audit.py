@@ -257,6 +257,24 @@ class PromptAuditedLLMGatewayTests(unittest.TestCase):
             )
         )
 
+    def test_records_ticker_resolver_role_under_its_own_actor(self):
+        sink = InMemoryPromptAuditSink()
+        gateway = PromptAuditedLLMGateway(
+            RecordingGateway(),
+            LLMRole.TICKER_RESOLVER,
+            sink,
+        )
+
+        gateway.generate(
+            system="# Role\nTicker Resolver",
+            messages=[{"role": "user", "content": "# Context\ndata"}],
+            response_model=Draft,
+        )
+
+        self.assertTrue(
+            all(record["actor"] == "ticker_resolver" for record in sink.records)
+        )
+
     def test_records_only_failure_type_and_propagates_error(self):
         sink = InMemoryPromptAuditSink()
         gateway = PromptAuditedLLMGateway(
@@ -353,6 +371,33 @@ class ConversationPromptAuditTests(unittest.TestCase):
             )
             self.assertEqual(records[0]["actor"], "user")
             self.assertEqual(records[1]["actor"], "jarvis")
+
+    def test_conversation_composition_threads_ticker_resolution_executor(self):
+        class _FakeTickerResolutionExecutor:
+            def attempt(self, command):
+                raise NotImplementedError
+
+            def refresh_catalog(self):
+                raise NotImplementedError
+
+        sentinel = _FakeTickerResolutionExecutor()
+        session = compose_jarvis_conversation(
+            object(),
+            conversation_config=JarvisConversationConfig(user_name="Prateek"),
+            instrument_resolver=InMemoryInstrumentResolver(
+                (
+                    ResolvedInstrument(
+                        exchange="NSE",
+                        symbol_token="2885",
+                        symbol="RELIANCE-EQ",
+                        display_name="RELIANCE",
+                    ),
+                )
+            ),
+            ticker_resolution_executor=sentinel,
+        )
+
+        self.assertIs(session._ticker_resolution_executor, sentinel)
 
     def test_conversation_composition_rejects_two_audit_sources(self):
         with self.assertRaisesRegex(ValueError, "either prompt audit"):

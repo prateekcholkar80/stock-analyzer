@@ -74,6 +74,36 @@ class BrowserConversationInputRequest(TechnicalModel):
         return normalized
 
 
+class SpeechSynthesisRequest(TechnicalModel):
+    """Stateless text-to-speech request -- not tied to any turn ID."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    text: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("text")
+    @classmethod
+    def normalize_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("speech synthesis text must not be blank")
+        return normalized
+
+
+class SpeechTranscriptionResponse(TechnicalModel):
+    """Transcription result -- transcript is None for no-speech-detected
+    audio, which is valid data and returns 200, not an error.
+    """
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    schema_version: Literal["jarvis.http_transcription.v1"] = (
+        "jarvis.http_transcription.v1"
+    )
+    transcript: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
 class BrowserOperationResultResponse(TechnicalModel):
     """Polling response that never claims a result before completion."""
 

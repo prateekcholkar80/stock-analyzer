@@ -179,6 +179,44 @@ cases.
 Generated `.duckdb` and `.duckdb.wal` files contain local research state and
 must not be committed to source control.
 
+The instrument-identity, AMFI market-cap, and NSE sector-master catalogs used by
+conversational ticker resolution are **not** part of this schema. They are
+downloaded snapshots cached as plain JSON files under `data/cache/` (also
+git-ignored), each carrying its own release/provenance metadata, and refreshed
+only by an explicit `.refresh()` call. There is no time-based expiry and no
+normalized table for them.
+
+## Rolling Market-Series Refresh Semantics
+
+Repeated swing analysis reuses this existing market-series repository rather
+than introducing a broker-specific cache table. For the exact
+`(exchange, symbol_token, symbol, interval)` identity, the rolling pull:
+
+1. selects the stored series with the most advanced candle timestamp;
+2. re-fetches a configurable recent correction overlap (seven calendar days by
+   default) through bounded Angel history chunks;
+3. deduplicates fetched timestamps and lets the newly fetched candle replace an
+   older candle at the same timestamp;
+4. counts genuinely new and corrected candles separately; and
+5. archives a new immutable dataset only when content changed.
+
+An unchanged refresh reuses the existing `dataset_id`; it does not create a
+duplicate immutable envelope. New/corrected/deduplicated counts, requested and
+stored ranges, resume/check timestamps, chunk count, and same-session intraday
+gaps live in the typed `RollingFetchReceipt` and the in-memory dashboard refresh
+projection. They are not additional schema-v3 normalized tables.
+
+The gap detector reports only cadence gaps between adjacent intraday candles on
+the same IST date. Overnight, weekend, and holiday-shaped gaps are deliberately
+ignored. This is not an NSE holiday-calendar audit and must not be queried as
+one.
+
+The current Broker LTP is also not stored as a market candle. It is an
+independently timestamped quote attached to the completed in-memory operation
+and may differ from the latest completed daily/weekly analysis close. Durable
+quote history and refresh-provenance history require explicit repository ports
+before they can be treated as database-backed dashboard history.
+
 ## Multi-Timeframe Persistence Boundary
 
 Schema version 3 predates the combined conversational multi-timeframe result.

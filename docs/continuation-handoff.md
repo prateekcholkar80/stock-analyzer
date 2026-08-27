@@ -1,6 +1,6 @@
 # Jarvis Implementation Continuation Handoff
 
-Last updated: **2026-08-23 (Asia/Kolkata)**
+Last updated: **2026-08-27 (Asia/Kolkata)**
 
 Use this file to resume implementation without relying on chat history. The
 authoritative architectural detail remains in `docs/current-baseline.md`; this
@@ -9,10 +9,9 @@ evidence, local artifacts, known gaps, and recommended next work.
 
 ## 1. Current Verified State
 
-- Offline regression baseline: **1,337 passing unit and integration tests**.
-- Bytecode compilation completed successfully.
-- `pip check` reported no broken requirements.
-- `git diff --check` completed successfully.
+- Offline regression baseline: **1,685 passing Python unit/integration tests**.
+- Browser baseline: production build plus **36 passing frontend tests**.
+- The production browser build reports a non-fatal Plotly chunk-size advisory.
 - Live Reliance run authenticated with Angel One and completed the default
   daily/weekly Bull/Bear/Judge workflow.
 - Live result: **bearish, 62% confidence, deterministic `NO_TRADE`**.
@@ -20,9 +19,32 @@ evidence, local artifacts, known gaps, and recommended next work.
 - The hard no-trade numeric-hallucination guard was added after that run and
   validated offline; the post-guard build has not yet had another live run.
 
-The working tree contains a coherent but currently unstaged multi-file feature
-set. Inspect `git status` and `git diff` before staging. Do not stage `.env`,
-`logs/`, generated instrument caches, `.duckdb`, or `.duckdb.wal` files.
+Work added since the `29a4183` (`Build Jarvis browser research console`) commit,
+covered offline but **not yet exercised live**:
+
+- Conversational ticker-resolution fallback: deterministic ranked shortlist ->
+  shortlist-constrained `TICKER_RESOLVER` LLM proposal -> mandatory yes/no
+  confirmation -> resume; catalog-refresh offer after
+  `JARVIS_RESOLUTION_FAILURE_THRESHOLD` consecutive failures. Opt-in.
+- Composed `NseInstrumentCatalog`: Angel identity + AMFI SEBI cap-class + NSE
+  sector/industry, JSON-cached under `data/cache/`.
+- New shared conversation state `AWAITING_CONFIRMATION` and outcome
+  `CONFIRMATION_REQUESTED`, plus a `FAILED -> PROCESSING` transition in the
+  browser coordinator so a confirmed guess can resume.
+- Angel instrument-master cache TTL removed; the cache is now sticky and only
+  replaced by `.refresh()`.
+- Provider-neutral speech synthesis (`app/tts/`) and transcription (`app/stt/`)
+  with `google` and `elevenlabs` adapters, metadata-only prompt audit,
+  `TTSError`/`STTError` hierarchies, and optional `/speech` and `/transcribe`
+  HTTP routes. Browser voice-reply and microphone-VAD toggles.
+- New env: `JARVIS_TICKER_RESOLVER_LLM_*`, `JARVIS_RESOLUTION_FAILURE_THRESHOLD`,
+  `JARVIS_TTS_*`, `JARVIS_STT_*`. New deps: `openpyxl`,
+  `google-cloud-texttospeech`, `google-cloud-speech`, `elevenlabs`.
+
+Inspect `git status` and `git diff` before staging documentation or
+future work. Never stage `.env`, `logs/`, generated instrument/catalog caches
+(`data/cache/`), `.duckdb`, `.duckdb.wal`, frontend build output, or local
+Wrangler state.
 
 ## 2. Frozen Product Decisions
 
@@ -30,8 +52,9 @@ These decisions were explicitly agreed and should not be changed accidentally:
 
 1. Jarvis is for swing and long-term research, not intraday trading or a live
    ticker/feed UI.
-2. The user-facing swing workflow is **long-only**. It may return an actionable
-   long plan or `NO_TRADE`; it must never propose a short.
+2. The user-facing decision vocabulary is **`BUY` or `NO_TRADE`**. An
+   actionable plan is long; bearish, neutral, conflicted, insufficient, or
+   risk-blocked evidence must produce `NO_TRADE`, never a short recommendation.
 3. Minimum reward/risk is **1:2 (2R)**, with **1:3 (3R)** shown as a preferred
    extension when structurally feasible.
 4. One hourly source series is fetched. Completed daily candles are aggregated
@@ -57,6 +80,22 @@ These decisions were explicitly agreed and should not be changed accidentally:
 12. Financial statements, earnings calls, document RAG, news, sentiment, and
     fundamentals are intentionally parked. When added, document conclusions
     must be citation-bound and must disclose missing documents.
+13. Broker LTP and completed analysis close are different facts and must remain
+    separately labelled. The current quote must never overwrite an OHLC candle.
+14. Hiding an indicator in the UI affects presentation only. Backend technical,
+    accumulation, setup, and debate calculations always run.
+15. Current OHLCV/OBV/volume analysis is not genuine order flow. Do not claim
+    bid/ask aggressor evidence until a tick/book data contract is implemented.
+16. An LLM-guessed ticker is never used without an explicit user yes/no
+    confirmation. The LLM proposal is structurally limited to symbols on the
+    deterministic shortlist and can never invent one. The yes/no classifier is
+    deterministic and non-LLM; anything not clearly affirmative is "no".
+17. Speech synthesis and transcription are provider-neutral. Provider selection
+    (`google` / `elevenlabs`) is configuration only. The prompt-audit trail
+    records speech metadata only — never audio bytes or transcript/synthesized
+    text. An empty STT transcript is valid "no speech" data, not an error.
+18. The `/speech` and `/transcribe` routes are optional and only mounted when
+    the capability is composed. Their absence must never break the core UI.
 
 ## 3. Default Executable Workflow
 
@@ -65,19 +104,30 @@ typed text or transcribed voice
   -> anchored wake phrase: "Hey Jarvis"
   -> JarvisConversationSession
   -> PatternSwingIntentInterpreter
-  -> AngelInstrumentMasterResolver
+  -> AngelInstrumentMasterResolver (exact match; sticky cache, refresh() only)
+       on InstrumentNotFound/Ambiguous and if composed:
+         ResolveTickerConversationally
+           shortlist_candidates (deterministic, ranked, real NSE entries)
+           -> resolve_via_llm (TICKER_RESOLVER, constrained to the shortlist)
+           -> AWAITING_CONFIRMATION ("Did you mean X?" / "Refresh the list?")
+           -> yes -> resume as "Analyze X for a swing trade" (or refresh+retry)
   -> SwingAnalysisCommand (NSE, token, symbol, ONE_HOUR)
   -> PullRollingMarketSeries (resumable/chunked, archived hourly data)
+       correction overlap -> new/corrected/deduplicated/unchanged receipt
+  -> timestamped Broker LTP (optional presentation fact, never a candle)
   -> DeriveSwingTimeframes
        ONE_HOUR -> completed ONE_DAY -> completed ONE_WEEK
   -> ParallelTimeframeTechnicalOrchestrator
        DailyTechnicalSwingAgent || WeeklyTechnicalSwingAgent
+       daily accumulation/sweeps || weekly accumulation/sweeps
   -> existing JarvisSwingJudge releases one fingerprinted evidence package
   -> Bull and Bear debate both timeframes
   -> same Debate Judge synthesizes verdict and confidence
   -> BuildMultiTimeframeLongTradePlan
        actionable long only when Judge and daily profile are bullish
        otherwise NO_TRADE
+  -> BuildMultiTimeframeSwingInterpretation
+       setup matrices + alignment + readiness + structural risk + 2R/3R
   -> JarvisBrowserOperationHandler
        evidence-locked CEO presentation and immutable operation output
   -> AsyncBrowserOperationRunner
@@ -89,6 +139,9 @@ typed text or transcribed voice
 The source request must currently use `ONE_HOUR`. The application rejects a
 different source interval for this multi-timeframe use case. Aggregation uses
 completed buckets only and fingerprints hourly, daily, and weekly lineage.
+Angel's 15:15 IST start-stamped hourly candle is accepted as the closing
+constituent only after the 15:30 session cutoff. An incomplete daily or weekly
+tail is excluded by default.
 
 ## 4. Technical and Trade Contracts
 
@@ -98,6 +151,22 @@ pivots, HH/HL/LH/LL structure, BOS, CHOCH, fair value gaps, and the complete
 support/resistance lifecycle (active zones, confirmed breaks, retests, role
 reversals, and failed breaks). Signal calculations use TA-Lib where suitable;
 price-action lifecycle/state logic remains explicit application code.
+
+The parallel assignments now also run the timeframe-aware accumulation
+detector. A zone is supported by bounded range, containment, touch/rejection,
+ATR-compression, slope, OBV, and volume metrics and follows a validated
+forming/confirmed/breakout/retest/hold/failure/invalidation/expiry lifecycle.
+Liquidity sweeps require a breach of an already-known boundary followed by a
+close-based reclaim; a wick breach alone is not enough. No qualifying base is a
+valid empty result and must not be replaced with a visually guessed zone.
+
+Each timeframe exposes both full setup matrices. Bullish has nine ordered
+steps: prior downtrend, CHOCH, BOS above resistance, volume expansion, pullback
+into FVG/support, EMA20>EMA50, RSI>50, confirmed HL, and next HH. Bearish has
+eight: uptrend exhaustion, buy-side liquidity sweep, bearish CHOCH, BOS below
+support, volume expansion, bearish FVG retest, EMA20<EMA50, and bearish RSI
+divergence. Every step remains visible as confirmed/developing/pending/
+contradicted/invalidated/unavailable; absence is never fabricated as evidence.
 
 The multi-timeframe release contains separate immediate support/resistance,
 confirmed pivots, profiles, and evidence IDs for daily and weekly data. Package,
@@ -119,7 +188,7 @@ The user-facing trade policy is `jarvis.long_only_2r_swing_policy.v1`:
 
 The lower-level research planner, backtester, schema, and historical metrics
 still support short scenarios. That is intentional for research compatibility;
-only the default Jarvis multi-timeframe product path is long-only.
+the default Jarvis product path exposes only `BUY` or `NO_TRADE`.
 
 ## 5. LLM and Presentation Contracts
 
@@ -158,10 +227,22 @@ session.handle_text("Hey Jarvis")
 session.handle_voice_transcript("Hey Jarvis, analyze Reliance for a swing trade")
 ```
 
-`handle_voice_transcript()` accepts already-transcribed text; microphone,
-speech-to-text, and speech synthesis are not implemented. A wake-only turn
-greets `JARVIS_USER_NAME` and asks how it can help. While listening, the next
-request does not need to repeat the wake phrase.
+`handle_voice_transcript()` accepts already-transcribed text. Server-side
+speech synthesis (`/speech`) and transcription (`/transcribe`) now exist as
+optional capabilities, and the browser has opt-in voice-reply and
+microphone-VAD toggles, but there is no acoustic wake-word engine and no
+hands-free session. A wake-only turn greets `JARVIS_USER_NAME` and asks how it
+can help. While listening, the next request does not need to repeat the wake
+phrase.
+
+When exact instrument resolution fails and the conversational fallback is
+composed, the session (or browser coordinator) enters `AWAITING_CONFIRMATION`
+and asks a single yes/no question — either `Did you mean "<SYMBOL>"?` for a
+shortlist-constrained LLM guess, or an offer to refresh the company list after
+`JARVIS_RESOLUTION_FAILURE_THRESHOLD` consecutive failures. `classify_yes_no`
+is deterministic and non-LLM; a "yes" resumes the original request (carrying
+`to_date`), anything else returns to listening with a clarification prompt. A
+completed analysis resets the consecutive-failure counter.
 
 After a successful multi-timeframe analysis, the session retains the exact
 approved technical review and debate orchestrator needed by
@@ -192,6 +273,30 @@ provider-specific environment variables. Blank Bull/Bear/Judge/persona model
 overrides inherit according to `app/llm/config.py`. The verified Anthropic
 combination is recorded in `docs/current-baseline.md`; model slugs,
 temperatures, and token needs must be revalidated per provider/model.
+
+Optional additions (all safe to leave unset):
+
+```dotenv
+JARVIS_TICKER_RESOLVER_LLM_MODEL=""        # falls back to JARVIS_LLM_MODEL
+JARVIS_TICKER_RESOLVER_LLM_TEMPERATURE="0.0"
+JARVIS_TICKER_RESOLVER_LLM_MAX_TOKENS="300"
+JARVIS_RESOLUTION_FAILURE_THRESHOLD="3"
+
+JARVIS_TTS_PROVIDER="google"              # or "elevenlabs"
+JARVIS_TTS_VOICE_NAME="en-GB-Neural2-B"
+JARVIS_TTS_LANGUAGE_CODE="en-GB"
+JARVIS_STT_PROVIDER="google"              # or "elevenlabs"
+JARVIS_STT_LANGUAGE_CODE="en-IN"
+# GOOGLE_APPLICATION_CREDENTIALS="/path/to/key.json"   # Google TTS/STT
+# ELEVENLABS_API_KEY="..."                             # ElevenLabs TTS/STT
+```
+
+The conversational ticker-resolution fallback is only composed when both an
+`AmfiMarketCapCatalog` and an `NseSectorMasterCatalog` (or a pre-built
+`ticker_resolution_executor`) are passed to `compose_jarvis_swing_research` /
+`compose_jarvis_browser_operations`. `/speech` and `/transcribe` are only
+mounted when a speech / transcription application is passed to
+`create_jarvis_http_app` (see `examples/browser_api.py`).
 
 ## 8. Running and Inspecting the Live Scenario
 
@@ -235,6 +340,15 @@ not implemented.
 - Workflow and prompt-audit events are validated at the IST offset.
 - Market candles are timezone-aware; hourly aggregation is performed in the
   configured market timezone and only completed daily/weekly buckets are used.
+- Repeated analysis resumes the exact stored exchange/token/symbol/interval
+  series, re-fetches a seven-day correction overlap, and creates a new immutable
+  dataset only for new or corrected candles. Duplicate fetched timestamps are
+  counted and collapsed. A fully unchanged refresh reuses the prior dataset.
+- Gap reporting is deliberately limited to missing intervals within one IST
+  trading date. Overnight, weekend, and holiday-shaped gaps are not reported as
+  definite missing broker candles.
+- Broker LTP has its own observation timestamp. Daily/weekly analysis uses the
+  latest completed candle and can legitimately differ from LTP.
 - DuckDB uses `TIMESTAMPTZ`, preserving instants while the domain retains
   timezone-aware values. Do not assume every physical database rendering is an
   IST-formatted string.
@@ -253,12 +367,15 @@ Run before staging:
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python -m compileall -q app examples tests
 .venv/bin/python -m pip check
+cd frontend && npm test
 git diff --check
 git status --short
 ```
 
-Expected full-suite baseline for this handoff: `Ran 1344 tests` and `OK`.
-Do not treat a live provider call as part of the offline regression suite.
+Expected full-suite baseline for this handoff: `Ran 1685 tests` and `OK`, then
+`36` passing frontend tests after a successful production build. Do not treat a
+live provider call as part of the offline regression suite. The build's Plotly
+chunk-size warning is advisory; any actual build/test failure remains blocking.
 
 ### UI event foundation added after the original handoff
 
@@ -305,19 +422,68 @@ wake-aware Jarvis command center with a code-rendered reactor, extensible agent
 cards, authenticated conversation/workflow SSE consumption, event-derived
 progress matrix, bounded daily/weekly candlesticks, evidence and levels,
 Bull/Bear/Judge synthesis, and exact trade/no-trade presentation. It contains
-no microphone, STT, TTS, or ElevenLabs credential. The browser defaults to the
+no ElevenLabs credential in client code. The browser defaults to the
 Python API at `http://127.0.0.1:8000`; the live API example now allows local
-port 3000 as well as the former port 5173.
+ports 3000, 3001, and 5173.
+
+The completed browser experience now also includes:
+
+- separate scrollable daily and weekly Plotly candlestick charts;
+- independently labelled Broker LTP and completed timeframe analysis close;
+- immediate confirmed support/resistance horizontal bands in green/red;
+- EMA20/EMA50 as the minimal default, with a collapsed indicator drawer;
+- selectable Bollinger, RSI, volume, prior-period CPR, FVG, pivots,
+  support/resistance lifecycle, HH/HL/LH/LL, BOS/CHOCH, accumulation, liquidity
+  sweep, and named candlestick-pattern overlays;
+- `Clean`, `Trend`, `Price action`, `Patterns`, `Decision`, and `Everything`
+  presets with device-local per-timeframe preferences;
+- daily x-axis compression for weekends and absent weekdays without inventing
+  candles;
+- complete compact bullish/bearish setup progressions and weekly/daily role
+  explanations;
+- verdict-aware colour and copy: bearish/neutral are no-trade, bullish but
+  risk-blocked is caution/no-trade, and only an approved plan is a buy setup;
+- confidence wording that identifies confidence in the Judge verdict rather
+  than implying a price-direction probability;
+- legacy chart compatibility: missing newer arrays become empty overlays with a
+  fresh-analysis notice instead of an `undefined.indicators` crash;
+- refresh-scoped sessions: `pagehide` best-effort closes the old session and a
+  back/forward-cache restore forces a reload/new session;
+- an `awaiting_confirmation` conversation state with a `confirmation_requested`
+  turn outcome, driving the "Did you mean …?" / "Refresh the list?" yes/no
+  prompt; and
+- two device-local voice toggles: "voice replies" (posts each `spoken_message`
+  to `/speech` and plays the audio) and "voice input" (microphone capture with
+  a local amplitude-threshold VAD that uploads a finished utterance to
+  `/transcribe`, muted while Jarvis is speaking). Both fail silently and never
+  block conversation text; the routes may be absent server-side.
+
+Support or resistance can legitimately be absent when no confirmed multi-touch
+zone of the required effective type exists on that side of price. The UI states
+that explicitly. Accumulation zones remain separate evidence and are not
+silently reclassified as support/resistance.
 
 ## 11. Known Gaps and Honest Boundaries
 
-- No microphone, acoustic wake-word engine, speech-to-text, or text-to-speech.
-- No WebSocket alternative, browser client, or 3D Jarvis dashboard. HTTP
-  polling/replay, authenticated SSE streaming, wake-aware conversation routes,
-  and a typed dashboard projection are implemented.
+- No acoustic wake-word engine and no hands-free/streaming audio session.
+  Server-side speech synthesis (`/speech`) and transcription (`/transcribe`),
+  the `google`/`elevenlabs` adapters, and opt-in browser voice-reply +
+  microphone-VAD toggles are implemented; audio is never persisted.
+- The Google/ElevenLabs speech adapters and the AMFI/NSE catalog downloads have
+  not been run against live endpoints/credentials in this baseline.
+- Conversational ticker resolution is opt-in and covered offline only. The AMFI
+  cap-class xlsx URL is a hardcoded per-release constant with no auto-discovery.
+- Speech routes have no rate limiting or per-session quota; `/transcribe` only
+  caps a single upload at 10 MiB.
+- No WebSocket alternative or full 3D/audio Jarvis experience. The browser
+  console, HTTP/SSE transport, dynamic reactor, operation matrix, Plotly charts,
+  setup view, debate, and executive briefing are implemented.
 - No document upload/parser/chunker/vector index/RAG or financial agent.
 - No news, sentiment, macro, portfolio construction, or order placement.
 - No live market ticker; the product is historical/swing research.
+- No genuine order-flow feed, recorder, schema, analysis agent, or historical
+  backtest. Existing OHLCV/OBV/volume/accumulation evidence is only a proxy for
+  price-volume behavior, not bid/ask aggressor flow.
 - Natural-language routing remains deliberately narrow and single-instrument.
 - Angel rate-limit/chunk defaults are estimates and need confirmation against
   the active SmartAPI account/docs before large production pulls.
@@ -329,6 +495,12 @@ port 3000 as well as the former port 5173.
 - A naturally bullish live end-to-end actionable plan remains unobserved. The
   bearish live no-trade path and all actionable contracts are validated.
 - Multi-timeframe result persistence and dashboard query tables remain pending.
+- Browser refresh cleanup is best-effort. There is no server-side idle-session
+  expiry or garbage collector for abruptly abandoned in-memory sessions.
+- Intraday gap detection does not use an exchange holiday calendar; it avoids
+  false weekend/overnight alerts but cannot classify every absent weekday.
+- Plotly is dynamically loaded but still creates a client chunk above the
+  build tool's default 500 kB advisory threshold.
 
 ## 12. Recommended Next Steps, One at a Time
 
@@ -338,12 +510,17 @@ port 3000 as well as the former port 5173.
    and presentation tables. This is the recommended immediate step.
 2. Persist the completed dashboard aggregate and add historical-run queries;
    the live completed-operation read model is implemented.
-3. Add browser microphone capture, speech-to-text, a provider-neutral TTS port,
-   and a server-side ElevenLabs adapter to the implemented workflow-matrix UI.
-4. Build the interactive Jarvis UI against those result/event contracts; do not
-   scrape text logs to infer state.
-5. Add microphone/wake-word/STT/TTS adapters while keeping transcript handling
-   and financial logic vendor-neutral.
+3. If genuine order flow is prioritized, define a database-neutral
+   `MarketMicrostructureGateway`/`OrderFlowGateway` and immutable tick/book
+   contracts before selecting Angel best-five prospective capture or licensed
+   historical NSE order/trade data. Never backfill “real order flow” from
+   candles.
+4. Browser microphone capture, speech-to-text, the provider-neutral TTS/STT
+   ports, and the Google/ElevenLabs adapters are implemented. Remaining audio
+   work: exercise the adapters and catalog downloads against live
+   endpoints/credentials, add an acoustic wake-word engine, and add rate
+   limiting to `/speech` and `/transcribe` — all while keeping transcript
+   handling and financial logic vendor-neutral.
 6. Add user-controlled financial-document ingestion and citation-preserving RAG,
    followed by a document-grounded fundamental agent.
 7. Extend the same evidence package/debate/Judge contracts to technical plus

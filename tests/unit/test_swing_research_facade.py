@@ -1,13 +1,24 @@
+import io
 import unittest
 from datetime import UTC, datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
+
+import pandas as pd
 
 from app.commands.swing_analysis import JarvisSwingAnalysisCommandHandler
 from app.composition.research import compose_jarvis_swing_research
 from app.exceptions import InstrumentNotFoundError, LLMConfigurationError
 from app.facades.swing_research import JarvisSwingResearchFacade
+from app.instruments.amfi_market_cap import AmfiMarketCapCatalog, AmfiMarketCapConfig
 from app.instruments.in_memory import InMemoryInstrumentResolver
+from app.instruments.nse_sector_master import (
+    NseSectorMasterCatalog,
+    NseSectorMasterConfig,
+)
 from app.llm.config import LLMSettings
+from app.llm.gateway import StructuredGeneration
 from app.logging_config import get_operation_id
 from app.models.instruments import ResolvedInstrument
 from app.models.interaction import (
@@ -223,6 +234,78 @@ class JarvisSwingResearchFacadeTests(unittest.TestCase):
             facade.execute("request")
 
 
+class FakeAngelIdentitySource:
+    def __init__(self, instruments):
+        self.instruments = tuple(instruments)
+        self.refresh_calls = 0
+        self._by_symbol = {item.symbol: item for item in self.instruments}
+
+    def list_instruments(self):
+        return self.instruments
+
+    def refresh(self):
+        self.refresh_calls += 1
+        return len(self.instruments)
+
+    def resolve(self, query, *, exchange=None):
+        match = self._by_symbol.get(query)
+        if match is None:
+            raise InstrumentNotFoundError(
+                "No configured instrument matches the requested company"
+            )
+        return match
+
+
+class FakeTickerResolverGateway:
+    def __init__(self, draft_payloads):
+        self.draft_payloads = list(draft_payloads)
+        self.calls = []
+
+    @property
+    def configuration_fingerprint(self):
+        return "a" * 64
+
+    def generate(self, *, system, messages, response_model):
+        self.calls.append((system, messages))
+        payload = self.draft_payloads.pop(0)
+        return StructuredGeneration[response_model](
+            value=response_model(**payload),
+            provider="fake-provider",
+            model="fake-resolver-model",
+            attempt_count=1,
+        )
+
+
+def _empty_amfi_catalog(tmp_path):
+    frame = pd.DataFrame(
+        {
+            "Sr No": [1],
+            "Company Name": ["Reliance Industries Limited"],
+            "NSE Symbol": ["RELIANCE"],
+            "Category": ["Large Cap"],
+        }
+    )
+    buffer = io.BytesIO()
+    frame.to_excel(buffer, index=False, engine="openpyxl")
+    config = AmfiMarketCapConfig(cache_path=Path(tmp_path) / "amfi.json")
+    catalog = AmfiMarketCapCatalog(
+        config, downloader=lambda *a: buffer.getvalue()
+    )
+    catalog._entries = ()
+    return catalog
+
+
+def _empty_nse_catalog(tmp_path):
+    payload = (
+        b"SYMBOL,NAME OF COMPANY,SECTOR,INDUSTRY\n"
+        b"RELIANCE,Reliance Industries Limited,Energy,Oil & Gas\n"
+    )
+    config = NseSectorMasterConfig(cache_path=Path(tmp_path) / "nse.json")
+    catalog = NseSectorMasterCatalog(config, downloader=lambda *a: payload)
+    catalog._mapping = {}
+    return catalog
+
+
 class JarvisSwingResearchCompositionTests(unittest.TestCase):
     def setUp(self):
         self.instrument_resolver = InMemoryInstrumentResolver(
@@ -334,6 +417,75 @@ class JarvisSwingResearchCompositionTests(unittest.TestCase):
                 instrument_resolver=self.instrument_resolver,
                 instrument_config=AngelInstrumentMasterConfig(),
             )
+
+    def test_ticker_resolution_executor_is_none_without_catalogs(self):
+        facade = compose_jarvis_swing_research(
+            object(),
+            instrument_resolver=self.instrument_resolver,
+            settings=self.settings,
+        )
+
+        self.assertIsNone(facade.ticker_resolution_executor)
+
+    def test_ticker_resolution_executor_is_lazily_composed_when_catalogs_given(
+        self,
+    ):
+        def eager_gateway_builder(role_settings):
+            raise AssertionError(
+                "gateway must not be built until first ticker-resolution use"
+            )
+
+        with TemporaryDirectory() as tmp:
+            facade = compose_jarvis_swing_research(
+                object(),
+                instrument_resolver=FakeAngelIdentitySource(
+                    (
+                        ResolvedInstrument(
+                            exchange="NSE",
+                            symbol_token="2885",
+                            symbol="RELIANCE-EQ",
+                            display_name="Reliance Industries Limited",
+                        ),
+                    )
+                ),
+                settings=self.settings,
+                gateway_builder=eager_gateway_builder,
+                amfi_catalog=_empty_amfi_catalog(tmp),
+                nse_sector_catalog=_empty_nse_catalog(tmp),
+            )
+
+        self.assertIsNotNone(facade.ticker_resolution_executor)
+        # Composition itself never invoked the gateway builder.
+
+    def test_ticker_resolution_executor_resolves_via_llm_on_first_use(self):
+        gateway = FakeTickerResolverGateway(
+            [{"chosen_symbols": ("RELIANCE-EQ",), "is_ambiguous": False}]
+        )
+        with TemporaryDirectory() as tmp:
+            facade = compose_jarvis_swing_research(
+                object(),
+                instrument_resolver=FakeAngelIdentitySource(
+                    (
+                        ResolvedInstrument(
+                            exchange="NSE",
+                            symbol_token="2885",
+                            symbol="RELIANCE-EQ",
+                            display_name="Reliance Industries Limited",
+                        ),
+                    )
+                ),
+                settings=self.settings,
+                gateway_builder=lambda role_settings: gateway,
+                amfi_catalog=_empty_amfi_catalog(tmp),
+                nse_sector_catalog=_empty_nse_catalog(tmp),
+            )
+
+            result = facade.ticker_resolution_executor.attempt(
+                "Analyze Rel for me"
+            )
+
+        self.assertEqual(result.outcome, "resolved_needs_confirmation")
+        self.assertEqual(result.chosen_symbol, "RELIANCE-EQ")
 
 
 if __name__ == "__main__":

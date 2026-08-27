@@ -8,16 +8,19 @@ from app.composition.debate import (
 )
 from app.facades.swing_research import JarvisSwingResearchFacade
 from app.gateways.instruments import InstrumentResolver
+from app.instruments.amfi_market_cap import AmfiMarketCapCatalog
 from app.instruments.angel_master import (
     AngelInstrumentMasterConfig,
     AngelInstrumentMasterResolver,
 )
+from app.instruments.nse_sector_master import NseSectorMasterCatalog
 from app.intents.swing_analysis import (
     PatternSwingIntentInterpreter,
     SwingIntentInterpreter,
 )
-from app.llm.config import LLMSettings
-from app.llm.factory import GatewayBuilder
+from app.llm.audited_gateway import PromptAuditedLLMGateway
+from app.llm.config import LLMRole, LLMSettings, get_llm_settings
+from app.llm.factory import GatewayBuilder, LLMGatewayFactory
 from app.llm.preflight import LLMPreflightValidator
 from app.orchestration.agent_orchestrator import AgentOrchestrator
 from app.orchestration.debate_orchestrator import (
@@ -27,6 +30,9 @@ from app.orchestration.debate_orchestrator import (
 from app.use_cases.pull_rolling_market_series import PullRollingMarketSeries
 from app.use_cases.resolve_swing_analysis_request import (
     ResolveSwingAnalysisRequest,
+)
+from app.use_cases.resolve_ticker_conversationally import (
+    ResolveTickerConversationally,
 )
 from app.use_cases.run_end_to_end_multi_timeframe_swing_analysis import (
     RunEndToEndMultiTimeframeSwingAnalysis,
@@ -103,6 +109,62 @@ class _LazyJarvisJudgeFollowUp:
         )
 
 
+class _LazyTickerResolutionExecutor:
+    """Build the TICKER_RESOLVER gateway only on first use, mirroring
+    LazyJarvisResearchPresenter's lazy-build pattern for the persona role.
+    """
+
+    def __init__(
+        self,
+        *,
+        interpreter: SwingIntentInterpreter,
+        angel_identity_source: AngelInstrumentMasterResolver,
+        amfi_catalog: AmfiMarketCapCatalog,
+        nse_sector_catalog: NseSectorMasterCatalog,
+        settings: LLMSettings | None,
+        gateway_builder: GatewayBuilder | None,
+        prompt_audit_sink: PromptAuditSink | None,
+    ) -> None:
+        self._interpreter = interpreter
+        self._angel_identity_source = angel_identity_source
+        self._amfi_catalog = amfi_catalog
+        self._nse_sector_catalog = nse_sector_catalog
+        self._settings = settings
+        self._gateway_builder = gateway_builder
+        self._prompt_audit_sink = prompt_audit_sink
+        self._use_case: ResolveTickerConversationally | None = None
+        self._lock = RLock()
+
+    def attempt(self, command: str):
+        return self._get_use_case().attempt(command)
+
+    def refresh_catalog(self) -> int:
+        return self._get_use_case().refresh_catalog()
+
+    def _get_use_case(self) -> ResolveTickerConversationally:
+        with self._lock:
+            if self._use_case is None:
+                settings = self._settings or get_llm_settings()
+                factory = (
+                    LLMGatewayFactory(settings)
+                    if self._gateway_builder is None
+                    else LLMGatewayFactory(settings, self._gateway_builder)
+                )
+                gateway = PromptAuditedLLMGateway(
+                    factory.for_role(LLMRole.TICKER_RESOLVER),
+                    LLMRole.TICKER_RESOLVER,
+                    self._prompt_audit_sink,
+                )
+                self._use_case = ResolveTickerConversationally(
+                    interpreter=self._interpreter,
+                    angel_identity_source=self._angel_identity_source,
+                    amfi_catalog=self._amfi_catalog,
+                    nse_sector_catalog=self._nse_sector_catalog,
+                    resolver_gateway=gateway,
+                )
+            return self._use_case
+
+
 def compose_jarvis_swing_research(
     rolling_fetch: PullRollingMarketSeries,
     *,
@@ -117,8 +179,19 @@ def compose_jarvis_swing_research(
     preflight_builder: PreflightBuilder = LLMPreflightValidator,
     event_sink: WorkflowEventSink | None = None,
     prompt_audit_sink: PromptAuditSink | None = None,
+    ticker_resolution_executor=None,
+    amfi_catalog: AmfiMarketCapCatalog | None = None,
+    nse_sector_catalog: NseSectorMasterCatalog | None = None,
 ) -> JarvisSwingResearchFacade:
-    """Compose natural-language-to-debate research without eager LLM I/O."""
+    """Compose natural-language-to-debate research without eager LLM I/O.
+
+    The conversational ticker-resolution fallback (partial/fuzzy company
+    names) is opt-in: pass a pre-built ``ticker_resolution_executor``, or
+    both ``amfi_catalog`` and ``nse_sector_catalog`` to have one lazily
+    composed (built only on first use, mirroring the persona presenter's
+    lazy pattern). Leaving all three unset disables the feature entirely
+    and preserves today's exact-match-only resolution behavior.
+    """
     if instrument_resolver is not None and instrument_config is not None:
         raise ValueError(
             "provide either an instrument resolver or its configuration"
@@ -132,12 +205,13 @@ def compose_jarvis_swing_research(
             else AngelInstrumentMasterConfig.from_environment()
         )
     )
+    resolved_intent_interpreter = (
+        intent_interpreter
+        if intent_interpreter is not None
+        else PatternSwingIntentInterpreter()
+    )
     request_resolver = ResolveSwingAnalysisRequest(
-        (
-            intent_interpreter
-            if intent_interpreter is not None
-            else PatternSwingIntentInterpreter()
-        ),
+        resolved_intent_interpreter,
         resolved_instrument_resolver,
     )
     executor_factory = _LazySwingAnalysisExecutorFactory(
@@ -151,6 +225,21 @@ def compose_jarvis_swing_research(
         prompt_audit_sink=prompt_audit_sink,
     )
     command_handler = JarvisSwingAnalysisCommandHandler(executor_factory)
+    resolved_ticker_resolution_executor = ticker_resolution_executor
+    if (
+        resolved_ticker_resolution_executor is None
+        and amfi_catalog is not None
+        and nse_sector_catalog is not None
+    ):
+        resolved_ticker_resolution_executor = _LazyTickerResolutionExecutor(
+            interpreter=resolved_intent_interpreter,
+            angel_identity_source=resolved_instrument_resolver,
+            amfi_catalog=amfi_catalog,
+            nse_sector_catalog=nse_sector_catalog,
+            settings=settings,
+            gateway_builder=gateway_builder,
+            prompt_audit_sink=prompt_audit_sink,
+        )
     return JarvisSwingResearchFacade(
         request_resolver,
         command_handler,
@@ -158,4 +247,5 @@ def compose_jarvis_swing_research(
         judge_follow_up_executor=(
             _LazyJarvisJudgeFollowUp(executor_factory)
         ),
+        ticker_resolution_executor=resolved_ticker_resolution_executor,
     )

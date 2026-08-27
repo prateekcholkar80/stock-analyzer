@@ -127,4 +127,5 @@ def compose_jarvis_conversation(
             if judge_follow_up_executor is not None
             else research.judge_follow_up_executor
         ),
+        ticker_resolution_executor=research.ticker_resolution_executor,
     )

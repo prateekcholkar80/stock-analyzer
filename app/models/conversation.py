@@ -28,6 +28,7 @@ class ConversationState(StrEnum):
     PROCESSING = "processing"
     RESPONDING = "responding"
     FAILED = "failed"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
 
 
 class ConversationOutcome(StrEnum):
@@ -38,6 +39,7 @@ class ConversationOutcome(StrEnum):
     CLARIFICATION_REQUIRED = "clarification_required"
     BUSY = "busy"
     DISPATCHED = "dispatched"
+    CONFIRMATION_REQUESTED = "confirmation_requested"
 
 
 class JarvisUtterance(TechnicalModel):

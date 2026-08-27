@@ -164,6 +164,146 @@ class LLMResponseValidationError(LLMError):
     """Raised when an LLM response cannot be parsed into the expected schema."""
 
 
+@dataclass(frozen=True, slots=True)
+class TTSFailureContext:
+    """Sanitized metadata safe to expose at application boundaries."""
+
+    provider: str | None = None
+    voice: str | None = None
+    operation_id: str | None = None
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in ("provider", "voice", "operation_id"):
+            object.__setattr__(
+                self,
+                field_name,
+                _validated_optional_failure_identifier(
+                    field_name,
+                    getattr(self, field_name),
+                ),
+            )
+        if not isinstance(self.retryable, bool):
+            raise TypeError("TTS failure retryable must be a boolean")
+
+
+class TTSError(ExternalServiceError):
+    """Base exception for safe, classified text-to-speech failures."""
+
+    default_retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str | None = None,
+        voice: str | None = None,
+        operation_id: str | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.context = TTSFailureContext(
+            provider=provider,
+            voice=voice,
+            operation_id=operation_id,
+            retryable=(
+                self.default_retryable
+                if retryable is None
+                else retryable
+            ),
+        )
+
+
+class TTSConfigurationError(TTSError):
+    """Raised when mandatory TTS configuration is missing or invalid."""
+
+
+class TTSAuthenticationError(TTSError):
+    """Raised when a TTS provider rejects configured credentials."""
+
+
+class TTSProviderUnavailableError(TTSError):
+    """Raised when a TTS provider cannot currently be reached."""
+
+    default_retryable = True
+
+
+class TTSSynthesisError(TTSError):
+    """Raised when a TTS provider returns empty or invalid audio."""
+
+
+@dataclass(frozen=True, slots=True)
+class STTFailureContext:
+    """Sanitized metadata safe to expose at application boundaries."""
+
+    provider: str | None = None
+    language_code: str | None = None
+    operation_id: str | None = None
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in ("provider", "language_code", "operation_id"):
+            object.__setattr__(
+                self,
+                field_name,
+                _validated_optional_failure_identifier(
+                    field_name,
+                    getattr(self, field_name),
+                ),
+            )
+        if not isinstance(self.retryable, bool):
+            raise TypeError("STT failure retryable must be a boolean")
+
+
+class STTError(ExternalServiceError):
+    """Base exception for safe, classified speech-to-text failures."""
+
+    default_retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str | None = None,
+        language_code: str | None = None,
+        operation_id: str | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.context = STTFailureContext(
+            provider=provider,
+            language_code=language_code,
+            operation_id=operation_id,
+            retryable=(
+                self.default_retryable
+                if retryable is None
+                else retryable
+            ),
+        )
+
+
+class STTConfigurationError(STTError):
+    """Raised when mandatory STT configuration is missing or invalid."""
+
+
+class STTAuthenticationError(STTError):
+    """Raised when an STT provider rejects configured credentials."""
+
+
+class STTProviderUnavailableError(STTError):
+    """Raised when an STT provider cannot currently be reached."""
+
+    default_retryable = True
+
+
+class STTTranscriptionError(STTError):
+    """Raised when an STT provider returns a malformed response.
+
+    Not raised for a genuinely empty/no-speech-detected result -- that is
+    valid data (Transcription with an empty transcript), not a failure.
+    """
+
+
 class StorageError(ApplicationError):
     """Raised when a persistence adapter cannot complete an operation."""
 

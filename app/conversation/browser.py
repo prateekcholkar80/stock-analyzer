@@ -6,11 +6,17 @@ from typing import Protocol, runtime_checkable
 
 from app.conversation.config import JarvisConversationConfig
 from app.conversation.follow_up import looks_like_analysis_follow_up
+from app.conversation.pending_confirmation import (
+    PendingConfirmation,
+    classify_yes_no,
+)
+from app.conversation.session import TickerResolutionExecutor
 from app.conversation.wake_word import (
     NormalizedWakePhraseDetector,
     WakePhraseDetector,
 )
 from app.exceptions import (
+    ApplicationError,
     BrowserOperationConflictError,
     BrowserSessionNotFoundError,
 )
@@ -43,7 +49,13 @@ _TRANSITION_MESSAGES = {
     ConversationState.RESPONDING: "Jarvis has prepared a response.",
     ConversationState.FAILED: "Jarvis could not complete the request.",
     ConversationState.DORMANT: "Jarvis returned to standby.",
+    ConversationState.AWAITING_CONFIRMATION: (
+        "Jarvis is waiting for a yes/no confirmation."
+    ),
 }
+_INSTRUMENT_RESOLUTION_FAILURE_CODES = frozenset(
+    {"instrument.not_found", "instrument.ambiguous"}
+)
 _SLEEP_COMMANDS = frozenset(
     {
         "go to sleep",
@@ -61,8 +73,12 @@ _ALLOWED_TRANSITIONS = {
     (ConversationState.LISTENING, ConversationState.DORMANT),
     (ConversationState.PROCESSING, ConversationState.RESPONDING),
     (ConversationState.PROCESSING, ConversationState.FAILED),
+    (ConversationState.PROCESSING, ConversationState.AWAITING_CONFIRMATION),
+    (ConversationState.AWAITING_CONFIRMATION, ConversationState.PROCESSING),
+    (ConversationState.AWAITING_CONFIRMATION, ConversationState.LISTENING),
     (ConversationState.RESPONDING, ConversationState.DORMANT),
     (ConversationState.FAILED, ConversationState.DORMANT),
+    (ConversationState.FAILED, ConversationState.PROCESSING),
 }
 
 
@@ -92,6 +108,9 @@ class _ConversationRecord:
     last_text: str | None = None
     last_channel: InputChannel | None = None
     last_operation_id: str | None = None
+    last_command: str | None = None
+    pending_confirmation: PendingConfirmation | None = None
+    consecutive_resolution_failures: int = 0
 
 
 class BrowserConversationCoordinator:
@@ -103,6 +122,7 @@ class BrowserConversationCoordinator:
         config: JarvisConversationConfig,
         *,
         wake_detector: WakePhraseDetector | None = None,
+        ticker_resolution_executor: TickerResolutionExecutor | None = None,
     ) -> None:
         if not isinstance(operations, BrowserConversationOperations):
             raise ValueError("browser conversation requires operation services")
@@ -113,9 +133,17 @@ class BrowserConversationCoordinator:
         )
         if not isinstance(detector, WakePhraseDetector):
             raise ValueError("browser conversation requires a wake detector")
+        if ticker_resolution_executor is not None and not isinstance(
+            ticker_resolution_executor,
+            TickerResolutionExecutor,
+        ):
+            raise ValueError(
+                "browser conversation requires a ticker resolution executor"
+            )
         self._operations = operations
         self._config = config
         self._wake_detector = detector
+        self._ticker_resolution_executor = ticker_resolution_executor
         self._records: dict[str, _ConversationRecord] = {}
         self._lock = RLock()
 
@@ -219,10 +247,19 @@ class BrowserConversationCoordinator:
                 raise BrowserOperationConflictError(
                     "conversation idempotency key was reused"
                 )
+
+            if record.snapshot.state is ConversationState.AWAITING_CONFIRMATION:
+                return self._handle_confirmation_reply(
+                    record,
+                    utterance,
+                    key,
+                    operation_id_factory,
+                    at,
+                )
+
             if record.snapshot.state in {
                 ConversationState.PROCESSING,
                 ConversationState.RESPONDING,
-                ConversationState.FAILED,
             }:
                 operation = (
                     self._operations.get_operation(
@@ -294,52 +331,132 @@ class BrowserConversationCoordinator:
                     input_channel=utterance.channel,
                 )
 
-            kind = (
-                BrowserOperationKind.JUDGE_FOLLOW_UP
-                if record.snapshot.has_follow_up_context
-                and looks_like_analysis_follow_up(command)
-                else BrowserOperationKind.SWING_ANALYSIS
+            return self._dispatch(
+                record,
+                utterance,
+                key,
+                operation_id_factory,
+                at,
+                command,
             )
-            operation = self._operations.submit(
-                BrowserOperationRequest(
-                    operation_id=operation_id_factory(),
-                    session_id=record.snapshot.session_id,
-                    idempotency_key=key,
-                    kind=kind,
-                    input_channel=utterance.channel,
-                    message=command,
-                    requested_at=at,
-                )
+
+    def _dispatch(
+        self,
+        record: "_ConversationRecord",
+        utterance: JarvisUtterance,
+        key: str,
+        operation_id_factory: Callable[[], str],
+        at: datetime,
+        command: str,
+    ) -> BrowserConversationTurn:
+        """Submit a resolved command as a new operation. Called while
+        holding self._lock, either from handle() for a fresh command or
+        from _handle_confirmation_reply() after a "yes" resumes a
+        pending ticker guess or catalog refresh.
+        """
+        kind = (
+            BrowserOperationKind.JUDGE_FOLLOW_UP
+            if record.snapshot.has_follow_up_context
+            and looks_like_analysis_follow_up(command)
+            else BrowserOperationKind.SWING_ANALYSIS
+        )
+        operation = self._operations.submit(
+            BrowserOperationRequest(
+                operation_id=operation_id_factory(),
+                session_id=record.snapshot.session_id,
+                idempotency_key=key,
+                kind=kind,
+                input_channel=utterance.channel,
+                message=command,
+                requested_at=at,
             )
-            record.last_idempotency_key = key
-            record.last_text = utterance.text
-            record.last_channel = utterance.channel
-            record.last_operation_id = operation.request.operation_id
+        )
+        record.last_idempotency_key = key
+        record.last_text = utterance.text
+        record.last_channel = utterance.channel
+        record.last_operation_id = operation.request.operation_id
+        record.last_command = command
+        self._transition_locked(
+            record,
+            ConversationState.PROCESSING,
+            utterance.channel,
+            at,
+            active_operation_id=operation.request.operation_id,
+            has_follow_up_context=(
+                record.snapshot.has_follow_up_context
+                if kind is BrowserOperationKind.JUDGE_FOLLOW_UP
+                else False
+            ),
+            display_message=(
+                "Certainly. I’ll coordinate the analysts and return with "
+                "the evidence once the Judge has finished."
+            ),
+            spoken_message=(
+                "Certainly. I’ll coordinate the analysts and report back."
+            ),
+        )
+        return BrowserConversationTurn(
+            outcome=ConversationOutcome.DISPATCHED,
+            conversation=record.snapshot,
+            input_channel=utterance.channel,
+            operation=operation,
+        )
+
+    def _handle_confirmation_reply(
+        self,
+        record: "_ConversationRecord",
+        utterance: JarvisUtterance,
+        key: str,
+        operation_id_factory: Callable[[], str],
+        at: datetime,
+    ) -> BrowserConversationTurn:
+        """Handle a "yes"/"no" reply while AWAITING_CONFIRMATION. Called
+        while holding self._lock.
+        """
+        pending = record.pending_confirmation
+        assert pending is not None
+        if classify_yes_no(utterance.text) != "yes":
+            record.pending_confirmation = None
+            record.consecutive_resolution_failures += 1
+            message = (
+                "No problem. Let me know the company or NSE symbol you'd "
+                "like to analyze."
+            )
             self._transition_locked(
                 record,
-                ConversationState.PROCESSING,
+                ConversationState.LISTENING,
                 utterance.channel,
                 at,
-                active_operation_id=operation.request.operation_id,
-                has_follow_up_context=(
-                    record.snapshot.has_follow_up_context
-                    if kind is BrowserOperationKind.JUDGE_FOLLOW_UP
-                    else False
-                ),
-                display_message=(
-                    "Certainly. I’ll coordinate the analysts and return with "
-                    "the evidence once the Judge has finished."
-                ),
-                spoken_message=(
-                    "Certainly. I’ll coordinate the analysts and report back."
-                ),
+                display_message=message,
+                spoken_message=message,
             )
             return BrowserConversationTurn(
-                outcome=ConversationOutcome.DISPATCHED,
+                outcome=ConversationOutcome.CLARIFICATION_REQUIRED,
                 conversation=record.snapshot,
                 input_channel=utterance.channel,
-                operation=operation,
             )
+
+        record.pending_confirmation = None
+        if pending.kind == "catalog_refresh":
+            if self._ticker_resolution_executor is not None:
+                try:
+                    self._ticker_resolution_executor.refresh_catalog()
+                except ApplicationError:
+                    # Resolution below will simply fail again and route
+                    # through the normal failure handling; a refresh
+                    # failure must not crash the turn.
+                    pass
+            command = pending.original_command
+        else:
+            command = f"Analyze {pending.chosen_symbol} for a swing trade"
+        return self._dispatch(
+            record,
+            utterance,
+            key,
+            operation_id_factory,
+            at,
+            command,
+        )
 
     def sleep(
         self,
@@ -409,6 +526,7 @@ class BrowserConversationCoordinator:
         if not operation.status.terminal:
             return
         if operation.status is BrowserOperationStatus.COMPLETED:
+            record.consecutive_resolution_failures = 0
             output = self._operations.get_result(operation_id)
             if output is None:
                 raise RuntimeError("completed conversation result disappeared")
@@ -444,6 +562,14 @@ class BrowserConversationCoordinator:
             )
             return
         failure = operation.failure
+        if (
+            operation.request.kind is BrowserOperationKind.SWING_ANALYSIS
+            and self._ticker_resolution_executor is not None
+            and failure is not None
+            and failure.code in _INSTRUMENT_RESOLUTION_FAILURE_CODES
+            and self._attempt_ticker_resolution_locked(record, operation, at)
+        ):
+            return
         self._transition_locked(
             record,
             ConversationState.FAILED,
@@ -457,6 +583,82 @@ class BrowserConversationCoordinator:
             ),
             spoken_message="I couldn't complete that safely. Please try again.",
         )
+
+    def _attempt_ticker_resolution_locked(
+        self,
+        record: _ConversationRecord,
+        operation: BrowserOperationSnapshot,
+        at: datetime,
+    ) -> bool:
+        """Called from _reconcile_locked (holding self._lock) when a
+        SWING_ANALYSIS operation failed on instrument resolution. Tries
+        the conversational ticker-resolution fallback and, if it has
+        something to propose, pivots the conversation into
+        AWAITING_CONFIRMATION instead of a flat failure. Returns True if
+        it took over the transition, False to let the caller fall back
+        to the normal FAILED transition using the operation's original
+        failure message.
+
+        Runs the resolution attempt (a real LLM call) while holding the
+        coordinator's shared lock -- acceptable for a single-user local
+        deployment; a multi-session production deployment would want
+        this call moved outside the lock.
+        """
+        assert self._ticker_resolution_executor is not None
+        command = record.last_command
+        if command is None:
+            return False
+        try:
+            result = self._ticker_resolution_executor.attempt(command)
+        except ApplicationError:
+            return False
+
+        channel = operation.request.input_channel
+        if result.outcome == "resolved_needs_confirmation":
+            record.pending_confirmation = PendingConfirmation(
+                kind="ticker_guess",
+                original_command=command,
+                chosen_symbol=result.chosen_symbol,
+                exchange=result.exchange,
+            )
+            message = f'Did you mean "{result.chosen_symbol}"? Reply yes or no.'
+            self._transition_locked(
+                record,
+                ConversationState.AWAITING_CONFIRMATION,
+                channel,
+                at,
+                active_operation_id=None,
+                display_message=message,
+                spoken_message=message,
+            )
+            return True
+
+        record.consecutive_resolution_failures += 1
+        threshold = (
+            self._config.consecutive_resolution_failures_before_refresh_prompt
+        )
+        if record.consecutive_resolution_failures < threshold:
+            return False
+
+        record.pending_confirmation = PendingConfirmation(
+            kind="catalog_refresh",
+            original_command=command,
+        )
+        message = (
+            "I'm having trouble matching that company against my "
+            "current list. Should I refresh it and try again? Reply "
+            "yes or no."
+        )
+        self._transition_locked(
+            record,
+            ConversationState.AWAITING_CONFIRMATION,
+            channel,
+            at,
+            active_operation_id=None,
+            display_message=message,
+            spoken_message=message,
+        )
+        return True
 
     def _transition_locked(
         self,

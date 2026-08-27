@@ -43,6 +43,7 @@ class JarvisSwingResearchFacade:
         command_handler: SwingCommandHandler,
         event_sink: WorkflowEventSink | None = None,
         judge_follow_up_executor=None,
+        ticker_resolution_executor=None,
     ) -> None:
         if not isinstance(request_resolver, SwingRequestResolver):
             raise ValueError(
@@ -61,11 +62,16 @@ class JarvisSwingResearchFacade:
         self._command_handler = command_handler
         self._event_sink = event_sink
         self._judge_follow_up_executor = judge_follow_up_executor
+        self._ticker_resolution_executor = ticker_resolution_executor
         self._logger = get_logger("facades.swing_research")
 
     @property
     def judge_follow_up_executor(self):
         return self._judge_follow_up_executor
+
+    @property
+    def ticker_resolution_executor(self):
+        return self._ticker_resolution_executor
 
     def execute(
         self,

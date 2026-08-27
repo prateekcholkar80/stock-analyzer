@@ -14,6 +14,10 @@ class JarvisConversationConfig(TechnicalModel):
 
     user_name: str = Field(min_length=1, max_length=100)
     wake_phrase: str = Field(default="Hey Jarvis", min_length=1, max_length=100)
+    consecutive_resolution_failures_before_refresh_prompt: int = Field(
+        default=3,
+        ge=1,
+    )
 
     @field_validator("user_name", "wake_phrase")
     @classmethod
@@ -29,11 +33,24 @@ class JarvisConversationConfig(TechnicalModel):
         environment: Mapping[str, str] | None = None,
     ) -> "JarvisConversationConfig":
         values = os.environ if environment is None else environment
+        kwargs = {
+            "user_name": values.get("JARVIS_USER_NAME", ""),
+            "wake_phrase": values.get("JARVIS_WAKE_PHRASE", "Hey Jarvis"),
+        }
+        threshold = values.get(
+            "JARVIS_RESOLUTION_FAILURE_THRESHOLD",
+        )
+        if threshold is not None and threshold.strip():
+            try:
+                kwargs["consecutive_resolution_failures_before_refresh_prompt"] = (
+                    int(threshold)
+                )
+            except ValueError as exc:
+                raise ConfigurationError(
+                    "JARVIS_RESOLUTION_FAILURE_THRESHOLD must be an integer"
+                ) from exc
         try:
-            return cls(
-                user_name=values.get("JARVIS_USER_NAME", ""),
-                wake_phrase=values.get("JARVIS_WAKE_PHRASE", "Hey Jarvis"),
-            )
+            return cls(**kwargs)
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(
                 "Jarvis conversation configuration is invalid; set "

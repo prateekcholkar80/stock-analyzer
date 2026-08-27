@@ -71,7 +71,13 @@ _FOLLOW_UP_RULES = (
     "the exact qualified daily: or weekly: id. If the requested fact is "
     "unavailable, say so plainly and cite the closest relevant evidence "
     "that establishes the limitation. This is research, not guaranteed "
-    "investment advice. Correct only errors named in Feedback."
+    "investment advice. Correct only errors named in Feedback. answer is "
+    "also read aloud by a text-to-speech engine, so punctuate it as "
+    "natural spoken prose: complete sentences separated by periods, with "
+    "commas where a speaker would naturally pause. Never use bullet "
+    "points, numbered lists, Markdown, emojis, or asterisks in answer, "
+    "since those either get read aloud literally or are silently dropped "
+    "by speech synthesis."
 )
 _FOLLOW_UP_SYSTEM_PROMPT = build_system_prompt(
     role=(

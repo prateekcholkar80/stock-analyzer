@@ -6,7 +6,7 @@ from typing import Protocol, runtime_checkable
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -14,16 +14,29 @@ from app.api.models import (
     BrowserConversationInputRequest,
     BrowserOperationResultResponse,
     CreateBrowserSessionResponse,
+    SpeechSynthesisRequest,
+    SpeechTranscriptionResponse,
     SubmitBrowserOperationRequest,
 )
 from app.api.session_auth import (
     BrowserSessionAuthorizer,
     InMemoryBrowserSessionAuthorizer,
 )
+from app.audit.prompt_audit import prompt_audit_session_context
 from app.exceptions import (
     BrowserOperationConflictError,
     BrowserOperationNotFoundError,
     BrowserSessionNotFoundError,
+    STTAuthenticationError,
+    STTConfigurationError,
+    STTError,
+    STTProviderUnavailableError,
+    STTTranscriptionError,
+    TTSAuthenticationError,
+    TTSConfigurationError,
+    TTSError,
+    TTSProviderUnavailableError,
+    TTSSynthesisError,
 )
 from app.models.browser_operations import (
     BrowserOperationOutput,
@@ -46,11 +59,14 @@ from app.presentation.dashboard import (
     DashboardProjectionError,
     JarvisDashboardProjector,
 )
+from app.stt.gateway import Transcription
+from app.tts.gateway import SpeechSynthesis
 
 
 IST = ZoneInfo("Asia/Kolkata")
 ApiClock = Callable[[], datetime]
 IdFactory = Callable[[], str]
+_MAX_TRANSCRIPTION_AUDIO_BYTES = 10 * 1024 * 1024
 
 
 @runtime_checkable
@@ -140,10 +156,29 @@ class BrowserConversationApplication(Protocol):
     ) -> ConversationEventBatch:
         ...
 
+
+@runtime_checkable
+class SpeechSynthesisApplication(Protocol):
+    """Stateless text-to-speech capability -- not tied to any turn ID."""
+
+    def synthesize(self, *, text: str) -> SpeechSynthesis:
+        ...
+
+
+@runtime_checkable
+class TranscriptionApplication(Protocol):
+    """Stateless speech-to-text capability -- not tied to any turn ID."""
+
+    def transcribe(self, *, audio: bytes, media_type: str) -> Transcription:
+        ...
+
+
 def create_jarvis_http_app(
     operations: BrowserOperationApplication,
     *,
     conversation: BrowserConversationApplication | None = None,
+    speech: SpeechSynthesisApplication | None = None,
+    transcription: TranscriptionApplication | None = None,
     dashboard_projector: JarvisDashboardProjector | None = None,
     authorizer: BrowserSessionAuthorizer | None = None,
     clock: ApiClock | None = None,
@@ -163,6 +198,16 @@ def create_jarvis_http_app(
         BrowserConversationApplication,
     ):
         raise ValueError("Jarvis HTTP API requires a conversation application")
+    if speech is not None and not isinstance(
+        speech,
+        SpeechSynthesisApplication,
+    ):
+        raise ValueError("Jarvis HTTP API requires a speech synthesis application")
+    if transcription is not None and not isinstance(
+        transcription,
+        TranscriptionApplication,
+    ):
+        raise ValueError("Jarvis HTTP API requires a transcription application")
     resolved_authorizer = authorizer or InMemoryBrowserSessionAuthorizer()
     resolved_dashboard_projector = (
         dashboard_projector or JarvisDashboardProjector()
@@ -249,6 +294,46 @@ def create_jarvis_http_app(
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(TTSError)
+    async def tts_failure(_request, exc):
+        if isinstance(exc, TTSConfigurationError):
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        elif isinstance(
+            exc,
+            (
+                TTSProviderUnavailableError,
+                TTSAuthenticationError,
+                TTSSynthesisError,
+            ),
+        ):
+            status_code = status.HTTP_502_BAD_GATEWAY
+        else:
+            status_code = status.HTTP_502_BAD_GATEWAY
+        return JSONResponse(
+            status_code=status_code,
+            content={"detail": "Speech synthesis is currently unavailable."},
+        )
+
+    @app.exception_handler(STTError)
+    async def stt_failure(_request, exc):
+        if isinstance(exc, STTConfigurationError):
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        elif isinstance(
+            exc,
+            (
+                STTProviderUnavailableError,
+                STTAuthenticationError,
+                STTTranscriptionError,
+            ),
+        ):
+            status_code = status.HTTP_502_BAD_GATEWAY
+        else:
+            status_code = status.HTTP_502_BAD_GATEWAY
+        return JSONResponse(
+            status_code=status_code,
+            content={"detail": "Speech transcription is currently unavailable."},
         )
 
     def authorize(session_id: str, access_token: str | None) -> None:
@@ -632,6 +717,71 @@ def create_jarvis_http_app(
                     "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
                 },
+            )
+
+    if speech is not None:
+
+        @app.post("/api/v1/sessions/{session_id}/speech")
+        def synthesize_speech(
+            session_id: str,
+            body: SpeechSynthesisRequest,
+            x_jarvis_session_token: str | None = Header(default=None),
+        ) -> Response:
+            # Deliberate exception to "every route returns a pydantic
+            # model": this is binary audio, not JSON-serializable data.
+            authorize(session_id, x_jarvis_session_token)
+            with prompt_audit_session_context(session_id):
+                synthesis = speech.synthesize(text=body.text)
+            return Response(
+                content=synthesis.audio,
+                media_type=synthesis.media_type,
+            )
+
+    if transcription is not None:
+
+        @app.post(
+            "/api/v1/sessions/{session_id}/transcribe",
+            response_model=SpeechTranscriptionResponse,
+        )
+        async def transcribe_speech(
+            session_id: str,
+            request: Request,
+            x_jarvis_session_token: str | None = Header(default=None),
+        ) -> SpeechTranscriptionResponse:
+            # Deliberate exception to "every request body is a validated
+            # pydantic model": this is binary audio in, the mirror image
+            # of /speech's binary audio out.
+            authorize(session_id, x_jarvis_session_token)
+            content_type = request.headers.get("content-type", "audio/webm")
+            content_length = request.headers.get("content-length")
+            if (
+                content_length is not None
+                and content_length.isdigit()
+                and int(content_length) > _MAX_TRANSCRIPTION_AUDIO_BYTES
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail="uploaded audio exceeds the transcription size limit",
+                )
+            audio_bytes = await request.body()
+            if not audio_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="transcription request body must not be empty",
+                )
+            if len(audio_bytes) > _MAX_TRANSCRIPTION_AUDIO_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail="uploaded audio exceeds the transcription size limit",
+                )
+            with prompt_audit_session_context(session_id):
+                transcription_result = transcription.transcribe(
+                    audio=audio_bytes,
+                    media_type=content_type,
+                )
+            return SpeechTranscriptionResponse(
+                transcript=transcription_result.transcript or None,
+                confidence=transcription_result.confidence,
             )
 
     @app.get(

@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, NamedTuple
 
 from app.audit.prompt_audit import (
     PromptAuditConfig,
@@ -7,6 +7,7 @@ from app.audit.prompt_audit import (
 )
 from app.composition.conversation import LazyJarvisResearchPresenter
 from app.composition.research import compose_jarvis_swing_research
+from app.conversation.browser import BrowserConversationCoordinator
 from app.conversation.config import JarvisConversationConfig
 from app.workflow.browser_runner import (
     AsyncBrowserOperationRunner,
@@ -22,6 +23,21 @@ from app.workflow.operations import (
 from app.use_cases.pull_rolling_market_series import PullRollingMarketSeries
 
 
+class JarvisBrowserApplication(NamedTuple):
+    """Bundle of the two composition roots examples/browser_api.py needs:
+    the async operation runner (fed to create_jarvis_http_app as
+    ``operations``) and the wake-aware conversation coordinator (fed as
+    ``conversation``). Bundled together because the conversation
+    coordinator's optional ticker-resolution fallback is built from the
+    same research facade the operation runner already composes -- keeping
+    them as two independently-constructed objects in the caller would
+    require rebuilding (or threading through) that facade a second time.
+    """
+
+    runner: AsyncBrowserOperationRunner
+    conversation: BrowserConversationCoordinator
+
+
 def compose_jarvis_browser_operations(
     rolling_fetch: PullRollingMarketSeries,
     *,
@@ -33,8 +49,17 @@ def compose_jarvis_browser_operations(
     prompt_audit_sink: PromptAuditSink | None = None,
     max_workers: int = 2,
     **research_dependencies: Any,
-) -> AsyncBrowserOperationRunner:
-    """Compose the real research workflow behind the browser operation port."""
+) -> JarvisBrowserApplication:
+    """Compose the real research workflow behind the browser operation port.
+
+    The conversational ticker-resolution fallback (partial/fuzzy company
+    names, e.g. "Infosys" instead of the exact listed symbol) is opt-in,
+    exactly mirroring compose_jarvis_swing_research: pass both
+    ``amfi_catalog`` and ``nse_sector_catalog`` (as part of
+    **research_dependencies) to have it composed and wired into the
+    returned conversation coordinator. Leaving them unset preserves
+    today's exact-match-only resolution behavior.
+    """
 
     if prompt_audit_config is not None and prompt_audit_sink is not None:
         raise ValueError(
@@ -77,9 +102,15 @@ def compose_jarvis_browser_operations(
         user_name=resolved_config.user_name,
         context_store=context_store,
     )
-    return AsyncBrowserOperationRunner(
+    runner = AsyncBrowserOperationRunner(
         resolved_registry,
         handler,
         resolved_results,
         max_workers=max_workers,
     )
+    conversation = BrowserConversationCoordinator(
+        runner,
+        resolved_config,
+        ticker_resolution_executor=research.ticker_resolution_executor,
+    )
+    return JarvisBrowserApplication(runner=runner, conversation=conversation)

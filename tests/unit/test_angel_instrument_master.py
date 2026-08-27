@@ -91,14 +91,12 @@ class AngelInstrumentMasterConfigTests(unittest.TestCase):
             DEFAULT_ANGEL_INSTRUMENT_MASTER_URL,
         )
         self.assertEqual(config.exchanges, ("NSE",))
-        self.assertEqual(config.cache_ttl_seconds, 86_400)
 
     def test_loads_optional_environment_overrides(self):
         config = AngelInstrumentMasterConfig.from_environment(
             {
                 "ANGEL_INSTRUMENT_MASTER_URL": "https://example.test/master",
                 "ANGEL_INSTRUMENT_CACHE_PATH": "tmp/instruments.json",
-                "ANGEL_INSTRUMENT_CACHE_TTL_SECONDS": "60",
                 "ANGEL_INSTRUMENT_DOWNLOAD_TIMEOUT_SECONDS": "5.5",
                 "ANGEL_INSTRUMENT_MAX_PAYLOAD_BYTES": "2048",
                 "ANGEL_INSTRUMENT_EXCHANGES": " nse, bse ",
@@ -106,7 +104,6 @@ class AngelInstrumentMasterConfigTests(unittest.TestCase):
         )
 
         self.assertEqual(config.cache_path, Path("tmp/instruments.json"))
-        self.assertEqual(config.cache_ttl_seconds, 60)
         self.assertEqual(config.download_timeout_seconds, 5.5)
         self.assertEqual(config.max_payload_bytes, 2048)
         self.assertEqual(config.exchanges, ("NSE", "BSE"))
@@ -114,7 +111,6 @@ class AngelInstrumentMasterConfigTests(unittest.TestCase):
     def test_rejects_insecure_or_invalid_configuration(self):
         invalid_values = (
             {"endpoint_url": "http://example.test/master"},
-            {"cache_ttl_seconds": -1},
             {"download_timeout_seconds": 0.0},
             {"max_payload_bytes": 1},
             {"exchanges": ()},
@@ -196,13 +192,11 @@ class AngelInstrumentMasterResolverTests(unittest.TestCase):
         self.temporary_directory = TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
         self.cache_path = Path(self.temporary_directory.name) / "cache.json"
-        self.now = 2_000_000_000.0
 
     def _config(self, **overrides):
         values = {
             "endpoint_url": "https://example.test/master.json",
             "cache_path": self.cache_path,
-            "cache_ttl_seconds": 60,
             "download_timeout_seconds": 7.0,
             "max_payload_bytes": 10_000,
             "exchanges": ("NSE",),
@@ -210,18 +204,16 @@ class AngelInstrumentMasterResolverTests(unittest.TestCase):
         values.update(overrides)
         return AngelInstrumentMasterConfig(**values)
 
-    def _write_cache(self, payload, *, age_seconds):
+    def _write_cache(self, payload):
         self.cache_path.write_bytes(payload)
-        modified = self.now - age_seconds
-        os.utime(self.cache_path, (modified, modified))
 
-    def test_fresh_valid_cache_avoids_download(self):
-        self._write_cache(_payload(_equity()), age_seconds=30)
+    def test_any_valid_cache_avoids_download_regardless_of_age(self):
+        self._write_cache(_payload(_equity()))
+        os.utime(self.cache_path, (0, 0))
         downloader = RecordingDownloader(failure=AssertionError("no call"))
         resolver = AngelInstrumentMasterResolver(
             self._config(),
             downloader=downloader,
-            clock=lambda: self.now,
         )
 
         instrument = resolver.resolve("Reliance", exchange="NSE")
@@ -229,17 +221,12 @@ class AngelInstrumentMasterResolverTests(unittest.TestCase):
         self.assertEqual(instrument.symbol_token, "2885")
         self.assertEqual(downloader.calls, [])
 
-    def test_expired_cache_downloads_validates_and_replaces_atomically(self):
-        self._write_cache(
-            _payload(_equity(token="old-token")),
-            age_seconds=61,
-        )
+    def test_downloads_only_when_no_cache_exists(self):
         downloaded = _payload(_equity(token="new-token"))
         downloader = RecordingDownloader(payload=downloaded)
         resolver = AngelInstrumentMasterResolver(
             self._config(),
             downloader=downloader,
-            clock=lambda: self.now,
         )
 
         instrument = resolver.resolve("Reliance")
@@ -252,27 +239,32 @@ class AngelInstrumentMasterResolverTests(unittest.TestCase):
         self.assertEqual(self.cache_path.read_bytes(), downloaded)
         self.assertEqual(list(self.cache_path.parent.glob("*.tmp")), [])
 
-    def test_transient_download_failure_uses_valid_stale_cache(self):
-        stale = _payload(_equity(token="stale-token"))
-        self._write_cache(stale, age_seconds=61)
+    def test_explicit_refresh_replaces_a_sticky_cache(self):
+        self._write_cache(_payload(_equity(token="old-token")))
+        downloader = RecordingDownloader(
+            payload=_payload(_equity(token="new-token"))
+        )
         resolver = AngelInstrumentMasterResolver(
             self._config(),
-            downloader=RecordingDownloader(
-                failure=InstrumentMasterDownloadError("offline")
-            ),
-            clock=lambda: self.now,
+            downloader=downloader,
+        )
+        self.assertEqual(
+            resolver.resolve("Reliance").symbol_token, "old-token"
         )
 
-        instrument = resolver.resolve("Reliance")
+        count = resolver.refresh()
 
-        self.assertEqual(instrument.symbol_token, "stale-token")
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            resolver.resolve("Reliance").symbol_token, "new-token"
+        )
+        self.assertEqual(self.cache_path.read_bytes(), downloader.payload)
 
     def test_download_failure_without_cache_remains_typed_and_safe(self):
         secret = "network-library-secret"
         resolver = AngelInstrumentMasterResolver(
             self._config(),
             downloader=RecordingDownloader(failure=RuntimeError(secret)),
-            clock=lambda: self.now,
         )
 
         with self.assertRaises(InstrumentMasterDownloadError) as context:
@@ -281,24 +273,24 @@ class AngelInstrumentMasterResolverTests(unittest.TestCase):
         self.assertIsInstance(context.exception.__cause__, RuntimeError)
         self.assertNotIn(secret, str(context.exception))
 
-    def test_invalid_download_never_falls_back_to_stale_cache(self):
-        self._write_cache(_payload(_equity()), age_seconds=61)
+    def test_invalid_cache_falls_through_to_download_and_surfaces_bad_data(
+        self,
+    ):
+        self._write_cache(b"not-json")
         resolver = AngelInstrumentMasterResolver(
             self._config(),
-            downloader=RecordingDownloader(payload=b"not-json"),
-            clock=lambda: self.now,
+            downloader=RecordingDownloader(payload=b"also-not-json"),
         )
 
         with self.assertRaises(InstrumentMasterDataError):
             resolver.resolve("Reliance")
 
-    def test_invalid_fresh_cache_is_replaced_by_valid_download(self):
-        self._write_cache(b"not-json", age_seconds=1)
+    def test_invalid_cache_is_replaced_by_valid_download(self):
+        self._write_cache(b"not-json")
         downloaded = _payload(_equity())
         resolver = AngelInstrumentMasterResolver(
             self._config(),
             downloader=RecordingDownloader(payload=downloaded),
-            clock=lambda: self.now,
         )
 
         instrument = resolver.resolve("Reliance")
@@ -330,7 +322,6 @@ class AngelInstrumentMasterResolverTests(unittest.TestCase):
         resolver = AngelInstrumentMasterResolver(
             self._config(),
             downloader=RecordingDownloader(payload=payload),
-            clock=lambda: self.now,
         )
 
         self.assertEqual(resolver.refresh(), 1)
@@ -348,7 +339,6 @@ class AngelInstrumentMasterResolverTests(unittest.TestCase):
         resolver = AngelInstrumentMasterResolver(
             self._config(exchanges=("BSE",)),
             downloader=RecordingDownloader(payload=_payload(bse)),
-            clock=lambda: self.now,
         )
 
         self.assertEqual(
@@ -369,8 +359,7 @@ class AngelInstrumentMasterResolverTests(unittest.TestCase):
                 resolver = AngelInstrumentMasterResolver(
                     self._config(),
                     downloader=RecordingDownloader(payload=payload),
-                    clock=lambda: self.now,
-                )
+                        )
                 with self.assertRaises(InstrumentMasterDataError):
                     resolver.resolve("Reliance")
 
@@ -386,7 +375,6 @@ class AngelInstrumentMasterResolverTests(unittest.TestCase):
         resolver = AngelInstrumentMasterResolver(
             self._config(),
             downloader=downloader,
-            clock=lambda: self.now,
         )
         resolver.resolve("Reliance")
         downloader.payload = _payload(_equity(token="updated-token"))
@@ -397,13 +385,27 @@ class AngelInstrumentMasterResolverTests(unittest.TestCase):
         self.assertEqual(resolver.resolve("Reliance").symbol_token, "updated-token")
         self.assertEqual(len(downloader.calls), 2)
 
+    def test_list_instruments_returns_full_cached_catalog(self):
+        downloader = RecordingDownloader(
+            payload=_payload(_equity(), _equity(token="11536", symbol="TCS-EQ", name="TCS"))
+        )
+        resolver = AngelInstrumentMasterResolver(
+            self._config(),
+            downloader=downloader,
+        )
+
+        instruments = resolver.list_instruments()
+
+        self.assertEqual(
+            {instrument.symbol for instrument in instruments},
+            {"RELIANCE-EQ", "TCS-EQ"},
+        )
+
     def test_rejects_invalid_dependencies(self):
         with self.assertRaises(ValueError):
             AngelInstrumentMasterResolver(config="invalid")
         with self.assertRaises(ValueError):
             AngelInstrumentMasterResolver(downloader="invalid")
-        with self.assertRaises(ValueError):
-            AngelInstrumentMasterResolver(clock=None)
 
 
 if __name__ == "__main__":

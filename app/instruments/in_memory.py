@@ -31,6 +31,9 @@ class InMemoryInstrumentResolver:
             raise ValueError("instrument catalog identities must be unique")
         self._catalog = catalog
 
+    def list_instruments(self) -> tuple[ResolvedInstrument, ...]:
+        return self._catalog
+
     def resolve(
         self,
         query: str,
