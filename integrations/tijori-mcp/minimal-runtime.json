@@ -1,0 +1,116 @@
+{
+  "schema_version": "jarvis.tijori_minimal_runtime.v1",
+  "status": "design_target_not_installed",
+  "source": {
+    "commit": "64be6c49f99a3fb3355ab5a727ce05cf260a7acc",
+    "tree": "6371a84c18189710fef2c96e1301bcef751a3831"
+  },
+  "runtime": {
+    "family": "node",
+    "release_line": "24.x",
+    "release_policy": "active_lts_exact_patch_must_be_pinned",
+    "module_type": "module",
+    "transport": "stdio",
+    "shell_allowed": false,
+    "inherited_environment_allowed": false
+  },
+  "approved_tools": [
+    "search_company",
+    "resolve_company_ids",
+    "get_company_overview",
+    "get_financials",
+    "get_shareholding"
+  ],
+  "required_runtime_dependencies": [
+    {
+      "name": "@modelcontextprotocol/sdk",
+      "reason": "MCP stdio server lifecycle and tool registration",
+      "version_policy": "exact_patched_version"
+    },
+    {
+      "name": "playwright",
+      "reason": "user-session-scoped authenticated page retrieval",
+      "version_policy": "exact_patched_version"
+    },
+    {
+      "name": "zod",
+      "reason": "bounded MCP tool input validation",
+      "version_policy": "exact_patched_version"
+    }
+  ],
+  "removed_upstream_dependencies": [
+    {
+      "name": "cheerio",
+      "reason": "not imported by the approved five-tool path"
+    },
+    {
+      "name": "dotenv",
+      "reason": "credentials and inherited dotenv configuration are prohibited"
+    },
+    {
+      "name": "pdf-parse",
+      "reason": "document fetching and parsing are outside the approved tool surface"
+    }
+  ],
+  "retained_source_responsibilities": [
+    "minimal MCP server entrypoint",
+    "owner-scoped browser session loader",
+    "company search",
+    "company identifier resolution",
+    "company overview retrieval",
+    "financial statement retrieval",
+    "shareholding retrieval",
+    "overview parser",
+    "financial statement parser",
+    "shareholding parser"
+  ],
+  "required_refactors": [
+    {
+      "id": "split-company-overview",
+      "reason": "the upstream company module eagerly imports pdf-parse for a disabled document tool"
+    },
+    {
+      "id": "remove-upstream-cache",
+      "reason": "one-operation processes make it ineffective and Jarvis DuckDB owns cache retention"
+    },
+    {
+      "id": "replace-session-path",
+      "reason": "session location must come only from the hardened Jarvis transport"
+    },
+    {
+      "id": "fail-closed-readiness",
+      "reason": "missing selectors, malformed responses, and HTTP failures cannot become valid empty evidence"
+    },
+    {
+      "id": "jarvis-result-envelope",
+      "reason": "every tool must return the validated status and payload contract expected by the Python adapter"
+    }
+  ],
+  "excluded_source": [
+    "setup.js",
+    "discover.js",
+    "src/auth.js",
+    "src/cache.js",
+    "src/tools/market.js",
+    "src/tools/metrics.js",
+    "src/tools/screener.js",
+    "src/parsers/market.js",
+    "document fetching and PDF parsing",
+    "knowledge-base discovery",
+    "revenue mix",
+    "market share",
+    "operational metrics",
+    "fund flow",
+    "macro and market tools",
+    "screeners"
+  ],
+  "release_gates": {
+    "exact_dependency_versions": true,
+    "lockfile_required": true,
+    "zero_critical_vulnerabilities": true,
+    "zero_high_vulnerabilities": true,
+    "offline_contract_tests_required": true,
+    "live_authentication_allowed": false,
+    "live_provider_calls_allowed": false
+  }
+}

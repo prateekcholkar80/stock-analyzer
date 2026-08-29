@@ -1,6 +1,7 @@
 # Backtest Storage Schema
 
-Jarvis stores market, backtest, and debate research in DuckDB schema version 3.
+Jarvis stores market, backtest, debate, and cached fundamental evidence in
+DuckDB schema version 4.
 The design has two layers:
 
 - Immutable JSON envelopes preserve the exact validated domain aggregate for replay, audit, and compatibility.
@@ -20,6 +21,10 @@ instrument -> market dataset -> candles
                            |
                            +-> technical result -> debate transcript/verdict
                                               -> signal signature
+
+tenant/provider/issuer request -> fundamental snapshot -> sources
+                                                    |-> normalized facts
+                                                    +-> conflicts
 ```
 
 Identifiers and SHA-256 fingerprints make the lineage reproducible:

@@ -304,6 +304,120 @@ class STTTranscriptionError(STTError):
     """
 
 
+def _validated_optional_fundamental_identifier(
+    field_name: str,
+    value: str | None,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(
+            f"fundamental failure {field_name} must be a string"
+        )
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(
+            f"fundamental failure {field_name} must not be blank"
+        )
+    if len(normalized) > 160:
+        raise ValueError(
+            f"fundamental failure {field_name} must be bounded"
+        )
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class FundamentalGatewayFailureContext:
+    """Sanitized provider metadata safe for logs and API boundaries."""
+
+    capability: str | None = None
+    provider: str | None = None
+    provider_connection_id: str | None = None
+    operation_id: str | None = None
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "capability",
+            "provider",
+            "provider_connection_id",
+            "operation_id",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _validated_optional_fundamental_identifier(
+                    field_name,
+                    getattr(self, field_name),
+                ),
+            )
+        if not isinstance(self.retryable, bool):
+            raise TypeError(
+                "fundamental failure retryable must be a boolean"
+            )
+
+
+class FundamentalGatewayError(ExternalServiceError):
+    """Base error for safe, classified fundamental-provider failures."""
+
+    default_retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        capability: str | None = None,
+        provider: str | None = None,
+        provider_connection_id: str | None = None,
+        operation_id: str | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.context = FundamentalGatewayFailureContext(
+            capability=capability,
+            provider=provider,
+            provider_connection_id=provider_connection_id,
+            operation_id=operation_id,
+            retryable=(
+                self.default_retryable
+                if retryable is None
+                else retryable
+            ),
+        )
+
+
+class FundamentalGatewayConfigurationError(FundamentalGatewayError):
+    """Raised when a fundamental adapter is absent or misconfigured."""
+
+
+class FundamentalGatewayAuthenticationError(FundamentalGatewayError):
+    """Raised when a provider rejects the user's scoped session."""
+
+
+class FundamentalGatewayEntitlementError(FundamentalGatewayError):
+    """Raised when the user's provider plan does not allow a capability."""
+
+
+class FundamentalCapabilityUnavailableError(FundamentalGatewayError):
+    """Raised when an adapter does not implement a requested capability."""
+
+
+class FundamentalProviderUnavailableError(FundamentalGatewayError):
+    """Raised when the provider cannot currently complete the request."""
+
+    default_retryable = True
+
+
+class FundamentalProviderRateLimitError(FundamentalGatewayError):
+    """Raised when a fundamental provider throttles the scoped account."""
+
+    default_retryable = True
+
+
+class FundamentalResponseValidationError(FundamentalGatewayError):
+    """Raised when untrusted provider data fails the evidence contract."""
+
+
 class StorageError(ApplicationError):
     """Raised when a persistence adapter cannot complete an operation."""
 

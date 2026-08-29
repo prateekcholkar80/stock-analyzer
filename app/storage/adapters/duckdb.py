@@ -1,4 +1,6 @@
 import json
+from collections.abc import Callable
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from threading import RLock
@@ -22,9 +24,18 @@ from app.models.storage import (
     debate_run_summary,
     market_series_summary,
 )
+from app.models.fundamental_storage import (
+    FundamentalRepositoryScope,
+    FundamentalSnapshotCacheKey,
+    FundamentalSnapshotQuery,
+    FundamentalSnapshotSummary,
+    StoredFundamentalSnapshot,
+    fundamental_snapshot_summary,
+)
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
+FundamentalCacheClock = Callable[[], datetime]
 
 
 class DuckDBJarvisStorage:
@@ -32,16 +43,23 @@ class DuckDBJarvisStorage:
 
     adapter_name = "duckdb"
 
-    def __init__(self, database: str | Path) -> None:
+    def __init__(
+        self,
+        database: str | Path,
+        *,
+        clock: FundamentalCacheClock | None = None,
+    ) -> None:
         database_name = str(database)
         if not database_name.strip():
             raise ValueError("DuckDB database path cannot be blank")
         self._database = database_name
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = RLock()
         self._closed = False
         try:
             self._connection = duckdb.connect(database_name)
             self._initialize_schema()
+            self.purge_expired_fundamental_snapshots(as_of=self._now())
         except StorageError:
             self._close_after_initialization_failure()
             raise
@@ -448,6 +466,289 @@ class DuckDBJarvisStorage:
             ),
         )
 
+    def save_fundamental_snapshot(
+        self,
+        stored: StoredFundamentalSnapshot,
+    ) -> StoredFundamentalSnapshot:
+        value = StoredFundamentalSnapshot.model_validate(stored)
+        summary = fundamental_snapshot_summary(value)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_fundamental_locked(as_of=now)
+                if value.stored_at > now:
+                    raise StorageError(
+                        "fundamental snapshot storage time is in the future"
+                    )
+                if value.is_expired(as_of=now):
+                    raise StorageError(
+                        "expired fundamental snapshot cannot be saved"
+                    )
+
+                existing = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_fundamental_snapshots "
+                    "WHERE cache_entry_id = ?",
+                    [value.cache_key.cache_entry_id],
+                ).fetchone()
+                if existing is not None:
+                    if existing[0] != value.storage_fingerprint:
+                        raise StorageConflictError(
+                            "fundamental cache key already contains "
+                            "different data"
+                        )
+                    persisted = StoredFundamentalSnapshot.model_validate_json(
+                        existing[1]
+                    )
+                    if persisted.storage_fingerprint != existing[0]:
+                        raise StorageError(
+                            "DuckDB fundamental snapshot fingerprint is "
+                            "inconsistent"
+                        )
+                else:
+                    self._insert_fundamental_parent(value, summary)
+                    persisted = value
+                self._persist_fundamental_details(persisted)
+                self._connection.execute("COMMIT")
+                return StoredFundamentalSnapshot.model_validate_json(
+                    persisted.model_dump_json(exclude_computed_fields=True)
+                )
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to persist DuckDB fundamental snapshot"
+                ) from exc
+
+    def get_fundamental_snapshot(
+        self,
+        key: FundamentalSnapshotCacheKey,
+        *,
+        scope: FundamentalRepositoryScope,
+        as_of: datetime,
+    ) -> StoredFundamentalSnapshot | None:
+        requested_key = FundamentalSnapshotCacheKey.model_validate(key)
+        caller_scope = FundamentalRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(
+            as_of,
+            "fundamental cache read time",
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_fundamental_locked(as_of=read_at)
+                if requested_key.repository_scope != caller_scope:
+                    row = None
+                else:
+                    row = self._connection.execute(
+                        "SELECT storage_fingerprint, payload_json "
+                        "FROM jarvis_fundamental_snapshots "
+                        "WHERE cache_entry_id = ? AND tenant_id = ? "
+                        "AND provider_connection_id = ? AND provider = ? "
+                        "AND stored_at <= ? AND expires_at > ?",
+                        [
+                            requested_key.cache_entry_id,
+                            caller_scope.tenant_id,
+                            caller_scope.provider_connection_id,
+                            caller_scope.provider,
+                            read_at,
+                            read_at,
+                        ],
+                    ).fetchone()
+                self._connection.execute("COMMIT")
+                if row is None:
+                    return None
+                persisted = StoredFundamentalSnapshot.model_validate_json(
+                    row[1]
+                )
+                if (
+                    persisted.storage_fingerprint != row[0]
+                    or persisted.cache_key != requested_key
+                    or persisted.cache_key.repository_scope != caller_scope
+                ):
+                    raise StorageError(
+                        "DuckDB fundamental snapshot failed integrity checks"
+                    )
+                return StoredFundamentalSnapshot.model_validate_json(
+                    persisted.model_dump_json(exclude_computed_fields=True)
+                )
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to load DuckDB fundamental snapshot"
+                ) from exc
+
+    def list_fundamental_snapshots(
+        self,
+        query: FundamentalSnapshotQuery,
+        *,
+        as_of: datetime,
+    ) -> tuple[FundamentalSnapshotSummary, ...]:
+        filters = FundamentalSnapshotQuery.model_validate(query)
+        read_at = _require_aware_datetime(
+            as_of,
+            "fundamental cache list time",
+        )
+        clauses = [
+            "tenant_id = ?",
+            "provider_connection_id = ?",
+            "provider = ?",
+            "stored_at <= ?",
+            "expires_at > ?",
+        ]
+        parameters: list[object] = [
+            filters.tenant_id,
+            filters.provider_connection_id,
+            filters.provider,
+            read_at,
+            read_at,
+        ]
+        _append_filter(clauses, parameters, "symbol", filters.symbol)
+        _append_filter(clauses, parameters, "exchange", filters.exchange)
+        if filters.capabilities:
+            placeholders = ", ".join("?" for _ in filters.capabilities)
+            clauses.append(f"capability IN ({placeholders})")
+            parameters.extend(
+                _enum_value(value)
+                for value in filters.capabilities
+            )
+        if filters.retrieved_from is not None:
+            clauses.append("retrieved_at >= ?")
+            parameters.append(filters.retrieved_from)
+        if filters.retrieved_to is not None:
+            clauses.append("retrieved_at <= ?")
+            parameters.append(filters.retrieved_to)
+        sql = (
+            "SELECT cache_entry_id, summary_json "
+            "FROM jarvis_fundamental_snapshots WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY retrieved_at DESC, stored_at DESC, "
+            "cache_entry_id DESC LIMIT ? OFFSET ?"
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_fundamental_locked(as_of=read_at)
+                rows = self._connection.execute(
+                    sql,
+                    [*parameters, filters.limit, filters.offset],
+                ).fetchall()
+                self._connection.execute("COMMIT")
+                summaries = tuple(
+                    FundamentalSnapshotSummary.model_validate_json(row[1])
+                    for row in rows
+                )
+                if any(
+                    summary.cache_entry_id != row[0]
+                    or summary.tenant_id != filters.tenant_id
+                    or summary.provider_connection_id
+                    != filters.provider_connection_id
+                    or summary.provider != filters.provider
+                    for summary, row in zip(summaries, rows, strict=True)
+                ):
+                    raise StorageError(
+                        "DuckDB fundamental summary failed integrity checks"
+                    )
+                return summaries
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to list DuckDB fundamental snapshots"
+                ) from exc
+
+    def delete_fundamental_snapshot(
+        self,
+        key: FundamentalSnapshotCacheKey,
+        *,
+        scope: FundamentalRepositoryScope,
+    ) -> bool:
+        requested_key = FundamentalSnapshotCacheKey.model_validate(key)
+        caller_scope = FundamentalRepositoryScope.model_validate(scope)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_fundamental_locked(as_of=now)
+                exists = None
+                if requested_key.repository_scope == caller_scope:
+                    exists = self._connection.execute(
+                        "SELECT 1 FROM jarvis_fundamental_snapshots "
+                        "WHERE cache_entry_id = ? AND tenant_id = ? "
+                        "AND provider_connection_id = ? AND provider = ?",
+                        [
+                            requested_key.cache_entry_id,
+                            caller_scope.tenant_id,
+                            caller_scope.provider_connection_id,
+                            caller_scope.provider,
+                        ],
+                    ).fetchone()
+                if exists is not None:
+                    self._delete_fundamental_entry_locked(
+                        requested_key.cache_entry_id
+                    )
+                self._connection.execute("COMMIT")
+                return exists is not None
+            except duckdb.Error as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to delete DuckDB fundamental snapshot"
+                ) from exc
+
+    def purge_expired_fundamental_snapshots(
+        self,
+        *,
+        as_of: datetime,
+    ) -> int:
+        purge_at = _require_aware_datetime(
+            as_of,
+            "fundamental cache purge time",
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                removed = self._purge_expired_fundamental_locked(
+                    as_of=purge_at
+                )
+                self._connection.execute("COMMIT")
+                return removed
+            except duckdb.Error as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to purge DuckDB fundamental snapshots"
+                ) from exc
+
     def find_similar_debate_runs(
         self,
         signature: tuple[str, ...],
@@ -513,7 +814,7 @@ class DuckDBJarvisStorage:
                     raise StorageError(
                         "Invalid DuckDB storage schema version"
                     ) from exc
-                if current_version not in (None, 1, 2, _SCHEMA_VERSION):
+                if current_version not in (None, 1, 2, 3, _SCHEMA_VERSION):
                     raise StorageError(
                         "Unsupported DuckDB storage schema version: "
                         f"{row[0]}"
@@ -521,6 +822,7 @@ class DuckDBJarvisStorage:
                 self._create_tables()
                 self._create_normalized_tables()
                 self._create_debate_tables()
+                self._create_fundamental_tables()
                 if current_version == 1:
                     self._backfill_normalized_schema()
                 if row is None:
@@ -633,6 +935,185 @@ class DuckDBJarvisStorage:
             """
             CREATE INDEX IF NOT EXISTS jarvis_debate_signal_signature_token
             ON jarvis_debate_signal_signature (token)
+            """
+        )
+
+    def _create_fundamental_tables(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_fundamental_snapshots (
+                cache_entry_id VARCHAR PRIMARY KEY,
+                cache_key_fingerprint VARCHAR NOT NULL UNIQUE,
+                storage_fingerprint VARCHAR NOT NULL,
+                tenant_id VARCHAR NOT NULL,
+                provider_connection_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                capability VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                isin VARCHAR,
+                provider_company_id VARCHAR,
+                provider_slug VARCHAR,
+                as_of_date DATE,
+                request_max_periods BIGINT,
+                request_quarters BIGINT,
+                include_promoter_pledge BOOLEAN,
+                request_id VARCHAR NOT NULL,
+                request_fingerprint VARCHAR NOT NULL,
+                result_fingerprint VARCHAR NOT NULL,
+                snapshot_id VARCHAR NOT NULL,
+                snapshot_fingerprint VARCHAR NOT NULL,
+                retrieval_status VARCHAR NOT NULL,
+                evidence_posture VARCHAR NOT NULL,
+                validation_status VARCHAR NOT NULL,
+                retrieved_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                stored_at TIMESTAMPTZ NOT NULL,
+                source_count BIGINT NOT NULL,
+                fact_count BIGINT NOT NULL,
+                conflict_count BIGINT NOT NULL,
+                summary_json VARCHAR NOT NULL,
+                payload_json VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_fundamental_scope_lookup
+            ON jarvis_fundamental_snapshots (
+                tenant_id,
+                provider_connection_id,
+                provider,
+                retrieved_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_fundamental_issuer_lookup
+            ON jarvis_fundamental_snapshots (
+                tenant_id,
+                provider_connection_id,
+                exchange,
+                symbol,
+                capability,
+                retrieved_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_fundamental_expiry_lookup
+            ON jarvis_fundamental_snapshots (expires_at)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_fundamental_request_statements (
+                cache_entry_id VARCHAR NOT NULL,
+                statement_index BIGINT NOT NULL,
+                statement VARCHAR NOT NULL,
+                PRIMARY KEY (cache_entry_id, statement_index),
+                UNIQUE (cache_entry_id, statement)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+            jarvis_fundamental_request_period_types (
+                cache_entry_id VARCHAR NOT NULL,
+                period_type_index BIGINT NOT NULL,
+                period_type VARCHAR NOT NULL,
+                PRIMARY KEY (cache_entry_id, period_type_index),
+                UNIQUE (cache_entry_id, period_type)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_fundamental_sources (
+                cache_entry_id VARCHAR NOT NULL,
+                source_index BIGINT NOT NULL,
+                source_id VARCHAR NOT NULL,
+                source_type VARCHAR NOT NULL,
+                source_rank VARCHAR NOT NULL,
+                as_of_date DATE,
+                published_at TIMESTAMPTZ,
+                retrieved_at TIMESTAMPTZ NOT NULL,
+                freshness_status VARCHAR NOT NULL,
+                validation_status VARCHAR NOT NULL,
+                content_fingerprint VARCHAR NOT NULL,
+                source_json VARCHAR NOT NULL,
+                PRIMARY KEY (cache_entry_id, source_index),
+                UNIQUE (cache_entry_id, source_id)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_fundamental_source_lookup
+            ON jarvis_fundamental_sources (
+                source_type,
+                source_rank,
+                as_of_date
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_fundamental_facts (
+                cache_entry_id VARCHAR NOT NULL,
+                fact_index BIGINT NOT NULL,
+                evidence_id VARCHAR NOT NULL,
+                statement VARCHAR NOT NULL,
+                line_item_id VARCHAR NOT NULL,
+                line_item_standard VARCHAR NOT NULL,
+                period_label VARCHAR NOT NULL,
+                period_type VARCHAR NOT NULL,
+                period_start DATE,
+                period_end DATE,
+                value_kind VARCHAR NOT NULL,
+                normalized_value VARCHAR,
+                currency VARCHAR,
+                normalized_unit VARCHAR,
+                availability_status VARCHAR NOT NULL,
+                evidence_label VARCHAR NOT NULL,
+                confidence VARCHAR NOT NULL,
+                freshness_status VARCHAR NOT NULL,
+                validation_status VARCHAR NOT NULL,
+                conflict_status VARCHAR NOT NULL,
+                fact_json VARCHAR NOT NULL,
+                PRIMARY KEY (cache_entry_id, fact_index),
+                UNIQUE (cache_entry_id, evidence_id)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_fundamental_fact_lookup
+            ON jarvis_fundamental_facts (
+                statement,
+                line_item_id,
+                period_type,
+                period_end
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_fundamental_conflicts (
+                cache_entry_id VARCHAR NOT NULL,
+                conflict_index BIGINT NOT NULL,
+                conflict_id VARCHAR NOT NULL,
+                conflict_type VARCHAR NOT NULL,
+                status VARCHAR NOT NULL,
+                material BOOLEAN NOT NULL,
+                working_evidence_id VARCHAR,
+                conflict_json VARCHAR NOT NULL,
+                PRIMARY KEY (cache_entry_id, conflict_index),
+                UNIQUE (cache_entry_id, conflict_id)
+            )
             """
         )
 
@@ -1490,6 +1971,227 @@ class DuckDBJarvisStorage:
                 segments,
             )
 
+    def _now(self) -> datetime:
+        return _require_aware_datetime(
+            self._clock(),
+            "fundamental repository clock",
+        )
+
+    def _insert_fundamental_parent(
+        self,
+        stored: StoredFundamentalSnapshot,
+        summary: FundamentalSnapshotSummary,
+    ) -> None:
+        key = stored.cache_key
+        issuer = key.issuer
+        values = [
+            key.cache_entry_id,
+            key.cache_key_fingerprint,
+            stored.storage_fingerprint,
+            key.tenant_id,
+            key.provider_connection_id,
+            key.provider,
+            _enum_value(key.capability),
+            issuer.exchange,
+            issuer.symbol,
+            issuer.isin,
+            issuer.provider_company_id,
+            issuer.provider_slug,
+            key.as_of_date,
+            key.max_periods,
+            key.quarters,
+            key.include_promoter_pledge,
+            stored.request.request_id,
+            stored.request_fingerprint,
+            stored.result_fingerprint,
+            summary.snapshot_id,
+            stored.snapshot_fingerprint,
+            _enum_value(stored.retrieval.status),
+            _enum_value(summary.evidence_posture),
+            _enum_value(summary.validation_status),
+            stored.retrieved_at,
+            stored.expires_at,
+            stored.stored_at,
+            summary.source_count,
+            summary.fact_count,
+            summary.conflict_count,
+            summary.model_dump_json(),
+            stored.model_dump_json(exclude_computed_fields=True),
+        ]
+        self._connection.execute(
+            "INSERT INTO jarvis_fundamental_snapshots ("
+            "cache_entry_id, cache_key_fingerprint, storage_fingerprint, "
+            "tenant_id, provider_connection_id, provider, capability, "
+            "exchange, symbol, isin, provider_company_id, provider_slug, "
+            "as_of_date, request_max_periods, request_quarters, "
+            "include_promoter_pledge, "
+            "request_id, request_fingerprint, result_fingerprint, "
+            "snapshot_id, snapshot_fingerprint, retrieval_status, "
+            "evidence_posture, validation_status, retrieved_at, expires_at, "
+            "stored_at, source_count, fact_count, conflict_count, "
+            "summary_json, payload_json"
+            ") VALUES (" + ", ".join("?" for _ in values) + ")",
+            values,
+        )
+
+    def _persist_fundamental_details(
+        self,
+        stored: StoredFundamentalSnapshot,
+    ) -> None:
+        cache_entry_id = stored.cache_key.cache_entry_id
+        for table in (
+            "jarvis_fundamental_request_statements",
+            "jarvis_fundamental_request_period_types",
+            "jarvis_fundamental_sources",
+            "jarvis_fundamental_facts",
+            "jarvis_fundamental_conflicts",
+        ):
+            self._connection.execute(
+                f"DELETE FROM {table} WHERE cache_entry_id = ?",
+                [cache_entry_id],
+            )
+
+        statements = [
+            [cache_entry_id, index, _enum_value(statement)]
+            for index, statement in enumerate(stored.cache_key.statements)
+        ]
+        if statements:
+            self._connection.executemany(
+                "INSERT INTO jarvis_fundamental_request_statements "
+                "VALUES (?, ?, ?)",
+                statements,
+            )
+
+        period_types = [
+            [cache_entry_id, index, _enum_value(period_type)]
+            for index, period_type in enumerate(
+                stored.cache_key.period_types
+            )
+        ]
+        if period_types:
+            self._connection.executemany(
+                "INSERT INTO jarvis_fundamental_request_period_types "
+                "VALUES (?, ?, ?)",
+                period_types,
+            )
+
+        snapshot = stored.retrieval.snapshot
+        if snapshot is None:
+            raise StorageError(
+                "stored fundamental snapshot is missing its evidence payload"
+            )
+        sources = [
+            [
+                cache_entry_id,
+                index,
+                source.source_id,
+                _enum_value(source.source_type),
+                _enum_value(source.source_rank),
+                source.as_of_date,
+                source.published_at,
+                source.retrieved_at,
+                _enum_value(source.freshness_status),
+                _enum_value(source.validation_status),
+                source.content_fingerprint,
+                source.model_dump_json(),
+            ]
+            for index, source in enumerate(snapshot.sources)
+        ]
+        self._connection.executemany(
+            "INSERT INTO jarvis_fundamental_sources VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            sources,
+        )
+
+        facts = [
+            [
+                cache_entry_id,
+                index,
+                fact.evidence_id,
+                _enum_value(fact.statement),
+                fact.line_item_id,
+                fact.line_item_standard,
+                fact.period.label,
+                _enum_value(fact.period.period_type),
+                fact.period.start_date,
+                fact.period.end_date,
+                _enum_value(fact.value_kind),
+                (
+                    str(fact.normalized_value)
+                    if fact.normalized_value is not None
+                    else None
+                ),
+                fact.currency,
+                fact.normalized_unit,
+                _enum_value(fact.availability_status),
+                _enum_value(fact.evidence_label),
+                _enum_value(fact.confidence),
+                _enum_value(fact.freshness_status),
+                _enum_value(fact.validation_status),
+                _enum_value(fact.conflict_status),
+                fact.model_dump_json(),
+            ]
+            for index, fact in enumerate(snapshot.facts)
+        ]
+        self._connection.executemany(
+            "INSERT INTO jarvis_fundamental_facts VALUES ("
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+            ")",
+            facts,
+        )
+
+        conflicts = [
+            [
+                cache_entry_id,
+                index,
+                conflict.conflict_id,
+                _enum_value(conflict.conflict_type),
+                _enum_value(conflict.status),
+                conflict.material,
+                conflict.working_evidence_id,
+                conflict.model_dump_json(),
+            ]
+            for index, conflict in enumerate(snapshot.conflicts)
+        ]
+        if conflicts:
+            self._connection.executemany(
+                "INSERT INTO jarvis_fundamental_conflicts VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?)",
+                conflicts,
+            )
+
+    def _delete_fundamental_entry_locked(self, cache_entry_id: str) -> None:
+        for table in (
+            "jarvis_fundamental_request_statements",
+            "jarvis_fundamental_request_period_types",
+            "jarvis_fundamental_sources",
+            "jarvis_fundamental_facts",
+            "jarvis_fundamental_conflicts",
+        ):
+            self._connection.execute(
+                f"DELETE FROM {table} WHERE cache_entry_id = ?",
+                [cache_entry_id],
+            )
+        self._connection.execute(
+            "DELETE FROM jarvis_fundamental_snapshots "
+            "WHERE cache_entry_id = ?",
+            [cache_entry_id],
+        )
+
+    def _purge_expired_fundamental_locked(
+        self,
+        *,
+        as_of: datetime,
+    ) -> int:
+        rows = self._connection.execute(
+            "SELECT cache_entry_id FROM jarvis_fundamental_snapshots "
+            "WHERE expires_at <= ? ORDER BY cache_entry_id",
+            [as_of],
+        ).fetchall()
+        for (cache_entry_id,) in rows:
+            self._delete_fundamental_entry_locked(cache_entry_id)
+        return len(rows)
+
     def _get_payload(
         self,
         *,
@@ -1614,6 +2316,17 @@ def _common_filter_clauses(query) -> tuple[list[str], list[object]]:
         clauses.append("stored_at <= ?")
         parameters.append(query.stored_to)
     return clauses, parameters
+
+
+def _require_aware_datetime(
+    value: datetime,
+    field_name: str,
+) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError(f"{field_name} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must include timezone information")
+    return value
 
 
 def _enum_value(value):

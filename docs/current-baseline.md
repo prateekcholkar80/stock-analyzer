@@ -6,7 +6,7 @@ natural-language routing, instrument resolution, workflow observability, and
 wake-activated conversation. It is the authoritative implementation baseline;
 `README.md` provides the shorter project-level view.
 
-Automated test count as of this writing: **1,685 Python tests** (`tests/unit` +
+Automated test count as of this writing: **1,874 Python tests** (`tests/unit` +
 `tests/integration`) plus **36 browser tests**, all passing without live broker
 or LLM credentials. The browser validation includes a production build.
 
@@ -141,7 +141,22 @@ app/
   presentation/dashboard.py     Bounded evidence-preserving dashboard projector
   presentation/technical_chart.py  Server-owned chart geometry, patterns, CPR, and overlays
 
+  gateways/fundamentals.py        Five-capability, read-only fundamental
+                                  request/result and runtime Protocol boundary
+
+  fundamentals/
+    tijori_mcp_contracts.py       Offline-safe five-tool transport envelopes and
+                                  strict synthetic provider-response contracts
+    adapters/tijori_mcp.py        Network-free Tijori-to-domain normalization,
+                                  capability mapping, and safe failure translation
+    transports/stdio_mcp.py       Pinned local MCP JSON-RPC process boundary,
+                                  session isolation, timeouts, and cleanup
+
   models/                    Pydantic domain models (all frozen/validated)
+    fundamentals.py             Tenant-scoped, provider-neutral fundamental
+                                source/fact/lineage/conflict/snapshot contracts
+    fundamental_storage.py      Semantic cache keys, ten-day retention,
+                                stored snapshots, queries, and summaries
     market.py                   Candle, HistoricalCandleSeries, MarketQuote
     technical.py                 TechnicalModel base class
     signals.py                   SignalCategory/Direction/Strength, evidence + profile models, stance classifiers
@@ -178,9 +193,11 @@ app/
     debate_session.py             DebateSession -- in-process state machine for one debate's working memory
 
   storage/                   Ports-and-adapters persistence
+    fundamental_repositories.py Database-neutral fundamental cache Protocol
+    adapters/fundamental_in_memory.py Thread-safe tenant-isolated fundamental cache
     repositories.py              MarketSeriesRepository/BacktestRunRepository/DebateRunRepository Protocols -> JarvisStorageAdapter
     adapters/in_memory.py         InMemoryJarvisStorage (test double, full Protocol conformance)
-    adapters/duckdb.py            DuckDBJarvisStorage (schema v3: immutable JSON envelopes + normalized tables)
+    adapters/duckdb.py            DuckDBJarvisStorage (schema v4: immutable JSON envelopes + normalized tables)
 
   services/
     market_data.py               MarketDataService -- normalizes Angel One responses into domain models
@@ -396,9 +413,11 @@ Ports-and-adapters, database-neutral. `JarvisStorageAdapter`
 (`app/storage/repositories.py`) composes three Protocols —
 `MarketSeriesRepository`, `BacktestRunRepository`, `DebateRunRepository` —
 each implemented in full by both `InMemoryJarvisStorage` (test double) and
-`DuckDBJarvisStorage` (**schema version 3**).
+`DuckDBJarvisStorage`. The separate `FundamentalSnapshotRepository` is
+implemented by `InMemoryFundamentalSnapshotRepository` and the same
+`DuckDBJarvisStorage` (**schema version 4**).
 
-Storage design, consistent across all three repositories:
+Storage design, consistent across the persisted aggregate repositories:
 - Immutable JSON envelope (the exact validated aggregate, for replay/audit)
   **plus** normalized relational tables (for dashboard queries without
   re-decoding JSON).
@@ -406,16 +425,18 @@ Storage design, consistent across all three repositories:
   saving identical content twice is idempotent, saving different content
   under an existing identifier raises `StorageConflictError`.
 - No `REFERENCES` foreign-key constraints anywhere (a deliberate,
-  repo-wide convention) — cascading deletes are handled by explicit code
-  in the generic `_delete()` helper, not the database.
+  repo-wide convention) — dependent-row deletes are handled explicitly by
+  adapter transaction code, not hidden database cascades.
 
-DuckDB tables as of schema v3: `jarvis_storage_metadata`,
+DuckDB tables as of schema v4: `jarvis_storage_metadata`,
 `jarvis_market_series`, `jarvis_market_candles`, `jarvis_instruments`,
 `jarvis_instrument_symbols`, `jarvis_strategy_configurations`,
 `jarvis_strategy_weights`, `jarvis_backtest_runs` (+ 8 evaluation/trade/
-equity/performance detail tables), and — new in v3 — `jarvis_debate_runs`
-+ `jarvis_debate_signal_signature`. Full backtest-table detail and example
-dashboard queries: `docs/backtest-storage-schema.md`.
+equity/performance detail tables), `jarvis_debate_runs` +
+`jarvis_debate_signal_signature`, and six fundamental-cache relations:
+`jarvis_fundamental_snapshots`, request statements, request period types,
+sources, facts, and conflicts. Full backtest-table detail and example dashboard
+queries: `docs/backtest-storage-schema.md`.
 
 `ResearchArchiveService` (`app/services/research_archive.py`) is the
 application-layer wrapper every use case actually depends on, rather than
@@ -1209,6 +1230,8 @@ The following cases have explicit automated coverage in the current build:
 | Browser rendering | SSR build, deterministic initial IST clock placeholder, missing-date compression, optional overlay preferences | Hydration from server/client clock disagreement, missing chart arrays causing `undefined` access, corrupt local preferences blocking the chart |
 | Ticker resolution | Ranked deterministic shortlist, one-symbol constrained LLM proposal, yes/no confirm, catalog-refresh offer after N failures, resume after "yes" | Symbol invented off the shortlist, LLM call on an empty shortlist, auto-accept without confirmation, "maybe" treated as "yes", refresh failure crashing the turn |
 | Speech (TTS/STT) | Provider chosen by config, empty transcript returns 200, metadata-only audit, routes absent when uncomposed, credential only on first use | Audio or transcript text written to the audit trail, empty/oversized upload accepted, provider/auth detail in the client error, adapter that fails the Protocol check |
+| Fundamental evidence | Tenant/provider scope, strict normalized values, source fingerprints, freshness, conflicts, lineage, immutable snapshot | Secret fields, source-rank masquerading, missing/unvalidated lineage, stale upgrades, cycles, unresolved decision-grade conflicts, or secondary-only decision evidence |
+| Fundamental cache contract | Semantic per-tenant/provider/issuer/capability scope; immutable request/result/snapshot chain; ten-day maximum retention | Cross-request or cross-tenant chain, invalid scope, failed/rejected payload, stale-at-save entry, overlong retention, unscoped listing, raw payload/session storage |
 
 ### 3.24 Conversational Ticker Resolution
 
@@ -1361,6 +1384,296 @@ Capture is muted for the duration of TTS playback so Jarvis never hears itself.
 Corrupt or unavailable `localStorage` falls back to "off" and never blocks
 rendering.
 
+### 3.26 Provider-Neutral Fundamental Evidence Foundation
+
+Phase 1, Step 1.1 introduces a domain-only fundamental evidence boundary in
+`app/models/fundamentals.py`. It is intentionally independent of Tijori,
+Angel One, DuckDB, and the configured LLM. It makes the bring-your-own-service
+model explicit: each external connection is scoped by `tenant_id` and
+`provider_connection_id`; only a one-way account-reference hash and declared
+entitlement metadata may enter the domain model. Passwords, cookies, API keys,
+CSRF tokens, and session objects have no fields in these contracts.
+
+Each source records its semantic type and hierarchy rank, period/as-of,
+publication and timezone-aware retrieval timestamps, freshness, parser and
+provider-schema versions, validation state, and SHA-256 content fingerprint.
+The source type describes evidentiary authority, not transport: accessing a
+secondary aggregator through an MCP connection does not turn it into a primary
+or authoritative connected-system disclosure.
+
+Each normalized fact preserves the original value, strict `Decimal` normalized
+value, statement and standardized line-item identity, explicit reporting
+period, units/currency, availability, evidence label, confidence, freshness,
+validation, conflict status, source references, and parent calculation chain.
+Missing, paywalled, not-entitled, malformed, and unavailable facts are explicit
+states; they are never inferred into numeric values. Conflicting values remain
+separate facts joined by an explained conflict record instead of being silently
+averaged.
+
+`FundamentalEvidenceSnapshot` validates the aggregate chain of custody. It
+rejects duplicate IDs, unknown or fingerprint-mismatched sources, lineage
+cycles, future retrievals, source/fact freshness upgrades, source-label
+masquerading, and inconsistent conflicts. A decision-grade release requires
+fully validated and current/period-acceptable evidence with no unresolved or
+missing facts. Every decision-grade fact must also trace directly or through
+parent lineage to user-governing, authoritative connected-system, or primary
+public evidence. Provider-standardized data such as Tijori can normalize and
+cross-check research, but cannot be the sole decision-grade source.
+
+Phase 1, Step 1.2 adds the runtime-checkable `FundamentalEvidenceGateway` and
+versioned request/result contracts in `app/gateways/fundamentals.py`. Its only
+approved capabilities are company search, issuer resolution, company overview,
+financial statements, and shareholding history. Every request carries the
+tenant/provider connection and a content fingerprint. Every response carries
+the same binding metadata, adapter/provider-contract fingerprints, ordered
+timezone-aware execution timestamps, and a stable result fingerprint.
+
+The capability manifest records run-specific availability and entitlement;
+configuration is not treated as proof of readiness. Search/resolution is
+bounded and explicitly resolves, abstains, or reports ambiguity. Evidence
+retrieval explicitly represents completed, partial, unavailable, not-entitled,
+paywalled, not-found, and validation-rejected outcomes. Capability-specific
+statement allow-lists prevent unrelated evidence from leaking through a result,
+and `validate_fundamental_response_binding()` rejects cross-request,
+cross-connection, cross-capability, or timestamp-mismatched responses.
+
+The safe `FundamentalGatewayError` hierarchy carries only capability, provider,
+provider-connection, operation, and retryability metadata. The contracts reject
+unknown secret or raw-payload fields without echoing their values. There is no
+document fetch, screener, write, portfolio, alert, or order capability.
+
+The gateway boundary itself does not implement a Tijori process,
+authentication, scorecard, red-flag scan, financial agent, or Bull/Bear/Judge
+integration. A separate offline normalization adapter is described below.
+
+Phase 1, Step 1.3 adds the database-neutral fundamental cache contract.
+`FundamentalSnapshotCacheKey` identifies reusable data by tenant, provider
+connection, provider, issuer, capability, as-of date, and semantic query scope;
+execution request IDs and timestamps are intentionally excluded. Consequently,
+the same user can repeat an identical analysis without forcing a full pull,
+while another tenant, provider account, period range, or requested dataset
+always produces a different key.
+
+`StoredFundamentalSnapshot` preserves the entire validated request -> gateway
+result -> evidence snapshot chain and verifies every content fingerprint. Its
+`retrieved_at` is the gateway completion time. `expires_at` must be later and no
+more than ten days after retrieval; expiry is inclusive, so an entry is invalid
+at exactly `expires_at`. Shorter retention is allowed when data sensitivity or
+new disclosures require it. An already-expired result cannot be saved.
+
+`FundamentalSnapshotQuery` requires tenant, provider connection, and provider
+scope for every listing. `FundamentalSnapshotSummary` exposes bounded metadata
+without facts or source payloads. The runtime-checkable
+`FundamentalSnapshotRepository` requires immutable idempotent saves, scoped
+non-expired reads/listings, exact deletion, and startup/opportunistic purge.
+Expired rows must never be returned even if physical deletion is pending.
+
+Phase 1, Step 1.4 implements the thread-safe reference adapter in
+`app/storage/adapters/fundamental_in_memory.py`. It performs no network access
+and stores only validated `StoredFundamentalSnapshot` objects. Every exact read
+and delete requires an explicit `FundamentalRepositoryScope`; providing a key
+from another tenant or provider connection returns no result. Scoped listing
+is deterministic, newest-first, filterable, and paginated, and never exposes
+the evidence payload through its summary surface.
+
+An injected timezone-aware clock makes retention behavior deterministic.
+Startup loading and every read/write path purge expired entries
+opportunistically, expiry remains inclusive, and data with a future
+`stored_at` timestamp is rejected. A historical read also refuses to reveal a
+snapshot that had not yet been stored at that `as_of` time. Identical saves are
+atomic and idempotent; different immutable content under an active semantic key
+raises `StorageConflictError`. Once the old row has expired, freshly retrieved
+evidence with the same semantic key can be saved, implementing the intended
+"reuse for up to ten days, then re-pull" behavior.
+
+The adapter uses an `RLock` and defensive deep copies. Concurrency tests cover
+64 simultaneous identical saves and competing-content races without duplicate
+rows or corruption. It remains the ephemeral reference implementation; Tijori,
+authentication, document processing, provider normalization services, and
+agents remain unconnected.
+
+Phase 1, Step 1.5 extends `DuckDBJarvisStorage` to schema version 4 and makes it
+conform to the same `FundamentalSnapshotRepository` protocol. The parent table
+stores indexed tenant/provider/issuer/capability, fingerprint, lifecycle, and
+payload-free summary columns beside an immutable validated JSON envelope.
+Separate normalized relations preserve requested statements and period types,
+evidence sources, normalized facts, and conflicts for future transparent
+dashboard and financial-agent queries without decoding every envelope.
+
+All writes, idempotency checks, child-table replacement, deletes, and expiry
+purges are transactional under the adapter's `RLock`. Parameterized SQL applies
+mandatory tenant/provider scope and filtering. Startup and opportunistic purge
+remove parent and all normalized child rows at inclusive expiry. A valid cache
+survives close/reopen; a schema-v3 database migrates to v4 without provider
+access; malformed envelopes or fingerprint mismatches fail closed as
+`StorageError`. DuckDB behavior is tested directly against the in-memory
+adapter, including repeated analysis reuse and automatic replacement after the
+ten-day cache ceiling.
+
+The database contains no provider credentials, cookies, browser sessions, raw
+HTML, or unrestricted MCP payloads. This step still does not download, install,
+authenticate, or invoke Tijori and does not connect any financial agent.
+
+Phase 1, Step 1.6 implements the first offline `TijoriMcpAdapter` vertical
+slice in `app/fundamentals/`. The adapter conforms to the provider-neutral
+gateway but depends only on an injected `TijoriMcpTransport` protocol. It has
+no subprocess, browser, network, login, credential, cookie, or repository
+download code. Production Tijori access therefore remains impossible in this
+step while the response and evidence boundary can be tested completely.
+
+The transport contract exposes exactly five immutable, read-only tool names:
+`search_company`, `resolve_company_ids`, `get_company_overview`,
+`get_financials`, and `get_shareholding`. Unknown names, duplicate capability
+advertisements, a changed provider-contract version, a mismatched response
+tool, and responses beyond the requested exchange/result/history scope fail
+closed. Tenant, provider-connection, entitlement, and account-reference data
+are passed separately as `ProviderConnectionScope`; tool arguments contain
+only the bounded business query and never copy connection/account metadata.
+
+Untrusted tool envelopes accept canonical JSON only and impose byte, nesting,
+node, key, collection, and string limits. Success requires a payload; failure
+states may not carry one. Synthetic provider shapes use strict field contracts,
+finite decimal values, unique identities and fact/source IDs, explicit period
+dates, and HTTPS Tijori-owned source URLs without credentials, query strings,
+or fragments. Schema drift, unsafe URLs, cross-issuer evidence, capability-
+incompatible statements, invalid timestamps, and malformed normalized values
+become sanitized `FundamentalResponseValidationError` instances; raw exception
+or provider values are never rendered in the safe message.
+
+Successful provider values are released only as `PROVIDER_STANDARDIZED`
+sources ranked `STANDARDIZED_PROVIDER` and
+`FACT_PROVIDER_STANDARDIZED` facts. They carry deterministic source, record,
+payload, evidence, snapshot, adapter, and result fingerprints plus explicit
+source/fact lineage. Snapshot posture is capped at `RESEARCH_GRADE`; the
+adapter cannot manufacture decision-grade evidence. Unavailable facts remain
+low-confidence partial/missing markers. Not-found, not-entitled, paywalled,
+and provider-unavailable evidence returns a typed snapshot-free retrieval
+state, while authentication, throttling, transport, and protocol failures map
+to the existing retry-aware exception hierarchy.
+
+Twenty-one synthetic adapter tests cover protocol conformance, allow-list
+immutability, canonical-payload limits, capability and authentication states,
+search/resolution outcomes, all three evidence tools, research-grade lineage,
+partial/missing facts, paywall/entitlement/unavailable outcomes, issuer and
+statement-scope rejection, unsafe locations, schema drift, clock ordering,
+secret-free arguments, and sanitized expected/unexpected failures. Together
+with the existing foundation, **168 focused fundamental tests** and **1,853
+full Python tests** pass. No Tijori source was downloaded or executed, no
+provider session was opened, and no provider payload was persisted.
+
+Phase 1, Step 1.7 implements `TijoriStdioMcpTransport`, the concrete local MCP
+process boundary, while remaining completely disconnected from upstream
+Tijori code and live authentication. Each inspection or tool invocation starts
+one pinned server process, performs the MCP `initialize` handshake, sends
+`notifications/initialized`, executes exactly one `tools/list` or `tools/call`
+request, and terminates the entire isolated process group. This intentionally
+simple lifecycle makes timeout and cleanup behavior deterministic; a future
+long-lived browser process may replace it behind the unchanged transport
+protocol after live-load requirements are measured.
+
+The transport never invokes a shell and inherits no application environment.
+It supplies only locale, the opaque scoped session-file path, and the pinned
+provider-contract version. Runtime executable and server entrypoint must be
+absolute regular files, not symlinks, must match configured SHA-256 hashes on
+construction and before every launch, and cannot be group/world writable. The
+entrypoint must be owned by the Jarvis process user. Session directories must
+be owner-only (`0700` equivalent); scoped session files use a non-identifying
+SHA-256 filename, must be regular single-link owner-owned files, have no
+group/world permissions (`0600` equivalent), and remain within a configured
+size ceiling. Missing or insecure session state fails as authentication rather
+than being silently recreated.
+
+Newline-delimited JSON-RPC input/output is bounded by total time, message size,
+JSON depth, and node count. Response IDs, protocol version, capabilities,
+Jarvis/Tijori experimental handshake metadata, provider-contract version,
+catalog tool names, text envelope shape, tool identity, and MCP `isError`
+semantics are validated before release. Only the five audited tools may be
+called or advertised. Server error text and stderr are discarded; only a
+sanitized configuration/authentication/entitlement/rate-limit/unavailable/
+protocol classification crosses the boundary. Parent environment secrets are
+not inherited.
+
+The synthetic MCP subprocess fixture exercises a real stdio handshake and is
+also connected end to end through `TijoriMcpAdapter` into the provider-neutral
+gateway result. Tests cover runtime and entrypoint tampering, insecure roots,
+files and symlinks, missing sessions, provider mismatch, unauthenticated
+metadata, tool allow-list enforcement, malformed/oversized messages,
+notifications, mismatched IDs, protocol and contract drift, RPC error mapping,
+non-JSON arguments, response-tool mismatch, inconsistent error envelopes,
+timeouts, process-group cleanup, parent-environment isolation, and deterministic
+non-identifying session paths.
+
+Step 1.7 validation evidence is **21 stdio transport tests**, **189 focused
+fundamental tests**, and **1,874 full Python tests**, all passing offline. Python
+compilation and `git diff --check` also pass.
+
+This is a transport implementation, not a Tijori installation. The repository
+has still not vendored or executed upstream code, created a browser, opened an
+authenticated provider session, or made a Tijori request. A hardened pinned
+fork and manual user-owned session creation remain separate approval-gated
+steps.
+
+Phase 1, Step 1.8 implements the Jarvis-owned minimal local Tijori bridge under
+`integrations/tijori-mcp/`. It is derived only from the pinned, statically
+audited upstream behavior needed by the approved five-tool surface; upstream
+setup/discovery, credential capture, cache, document, screener, market, macro,
+and write paths were not copied. Runtime dependencies are pinned exactly to
+`@modelcontextprotocol/sdk` 1.30.0, Playwright 1.62.1, and Zod 4.4.3, with a
+committed lockfile and a Node 24-only direct-start guard.
+
+The MCP server advertises exactly `search_company`, `resolve_company_ids`,
+`get_company_overview`, `get_financials`, and `get_shareholding` as read-only,
+idempotent tools. Startup loads only an owner-scoped pre-existing browser
+session boundary, performs a bounded authentication probe, and composes the
+provider registry only after a positive probe. Missing, expired, malformed, or
+unavailable authentication gates every tool without exposing browser/session
+details. The local browser runner serializes access, enforces bounded timeouts,
+and does not accept credentials as tool arguments.
+
+All five provider handlers now use deterministic, bounded normalization:
+
+- company search and identifier resolution re-read company-page metadata and
+  require exchange/symbol/ID consistency;
+- company overview maps only supported market-cap, P/E, ROE, and ROCE facts;
+- financials maps supported annual/quarterly income statement, balance sheet,
+  cash-flow, and EPS rows only when a rendered INR-crore unit and valid period
+  are present;
+- shareholding maps explicit quarterly promoter, FII, DII, public, and promoter
+  pledge percentages without inferring missing categories or totals; and
+- every evidence response carries a safe Tijori HTTPS source, observed IST
+  date, explicit missing/unknown states, and limitations requiring
+  reconciliation to primary company or exchange disclosures. Historical
+  `as_of_date` requests fail closed because the provider pages do not establish
+  point-in-time publication or restatement history.
+
+Provider HTTP/authentication/paywall/rate-limit failures are reduced to typed,
+payload-free result envelopes. Raw HTML, browser state, cookies, credentials,
+provider exception text, and unmapped provider rows are never returned or
+persisted. Offline MCP composition coverage exercises all five actual handlers
+through an authenticated synthetic browser boundary. **111 local bridge tests
+pass**. No live browser, Tijori login, provider request, or provider-data write
+was performed; user-owned session creation and live validation remain separate
+opt-in steps.
+
+Phase 1, Step 1.9 adds the Python composition boundary in
+`app/composition/fundamentals.py`. `compose_tijori_fundamental_gateway()`
+constructs the existing hardened stdio transport behind `TijoriMcpAdapter` and
+returns only the provider-neutral `FundamentalEvidenceGateway`. Composition
+validates pinned files and owner-only session-root configuration but does not
+start Node, launch Playwright, inspect a session, or call a provider. An
+injected transport builder keeps composition deterministic in tests.
+
+`load_tijori_stdio_settings()` reads only non-secret runtime controls:
+absolute runtime/server/session-root paths, SHA-256 pins, protocol/provider
+contract versions, timeouts, byte ceilings, concurrency, and session-size
+limits. It does not read a Tijori username, password, cookie, token, CSRF value,
+or account identity. Invalid values produce one sanitized `ConfigurationError`.
+The adapter contract defaults to the transport contract; an explicit mismatch
+fails during composition rather than on the first provider handshake.
+
+Five focused composition tests and all **194 fundamental/Tijori subsystem
+tests pass**. The local bridge baseline remains **111 passing Node tests**.
+
 ## 4. Configuration & Environment
 
 ```dotenv
@@ -1377,6 +1690,14 @@ JARVIS_BULL_LLM_MODEL=""
 JARVIS_BEAR_LLM_MODEL=""
 JARVIS_JUDGE_LLM_MODEL=""
 JARVIS_PERSONA_LLM_MODEL=""
+
+# Optional local Tijori fundamental-evidence bridge (non-secret settings only)
+JARVIS_TIJORI_RUNTIME_EXECUTABLE="/absolute/path/to/pinned-node-24"
+JARVIS_TIJORI_RUNTIME_SHA256="64-lowercase-hex-characters"
+JARVIS_TIJORI_SERVER_ENTRYPOINT="/absolute/path/to/integrations/tijori-mcp/src/index.js"
+JARVIS_TIJORI_SERVER_SHA256="64-lowercase-hex-characters"
+JARVIS_TIJORI_SESSION_ROOT="/absolute/path/to/owner-only-session-directory"
+JARVIS_TIJORI_PROVIDER_CONTRACT_VERSION="tijori.local_contract.v1"
 
 JARVIS_BULL_LLM_TEMPERATURE="0.4"
 JARVIS_BEAR_LLM_TEMPERATURE="0.4"
@@ -1476,7 +1797,7 @@ stored under the file system's access and retention controls.
 cd frontend && npm test
 ```
 
-Current count: **1,685 Python tests** plus **36 browser tests**, fully offline.
+Current count: **1,874 Python tests** plus **36 browser tests**, fully offline.
 The frontend build currently emits a non-fatal advisory that the dynamically
 loaded Plotly chunk is larger than 500 kB after minification. Conventions to
 preserve:
@@ -1518,10 +1839,14 @@ preserve:
   The lower-level deterministic planner, execution engine, storage schema, and
   walk-forward metrics intentionally still support both long and short research
   scenarios. The default Jarvis conversation can release only long or no-trade.
-- **No fundamental, sentiment, or macro analysis** anywhere in the repo,
-  not even stubs (P&L/valuation metrics, news/analyst sentiment, FII/DII
-  flows, macro/rate data — all still just the target architecture,
-  section 7).
+- **No fundamental, sentiment, or macro agent analysis yet.** The first
+  provider-neutral fundamental evidence contracts now exist for tenant-scoped
+  connections, sources, normalized facts, conflicts, lineage, and immutable
+  snapshots, with in-memory and DuckDB cache repositories. The offline Tijori
+  normalization adapter, hardened stdio transport, and pinned five-tool local
+  bridge now exist and are covered offline. There is no user-facing session
+  provisioning flow, live authenticated validation, scorecard, red-flag
+  engine, financial agent, or debate integration yet.
 - **No genuine order-flow pipeline.** Current hourly/daily/weekly OHLCV, OBV,
   accumulation, volume expansion, and liquidity-sweep calculations are
   price-volume evidence, not bid/ask aggressor flow. Genuine evaluation needs
@@ -1529,7 +1854,7 @@ preserve:
   need a prospective headless recorder; historical replay needs a separately
   licensed order/trade dataset. No `OrderFlowGateway`, recorder, storage schema,
   analyzer, agent, or backtest has been implemented.
-- **No debate/verdict *quality* eval harness.** 1,685 Python tests verify the
+- **No debate/verdict *quality* eval harness.** 1,874 Python tests verify the
   pipeline is *implemented correctly* (schemas, citations, determinism,
   chain-of-custody) — none of them score whether an argument was good or
   a verdict was right against what actually happened next. The
@@ -1593,7 +1918,9 @@ User-stated direction for where Jarvis is headed, not yet fully built:
 
 - **Data Ingestion Layer**: Angel One + financial databases + news feeds
   -> OHLC, P&L reports, conference calls, FII/DII data.
-- **Analysis Modules**: Technical (built), Fundamental (not built),
+- **Analysis Modules**: Technical (built), Fundamental evidence/gateway/cache
+  contracts plus in-memory/DuckDB repositories, Tijori adapter/transport, and
+  bounded local five-tool provider bridge (built; financial agent not built),
   Sentiment (not built), Macro (not built).
 - **AI Agent Layer (Debate)**: Bull vs Bear — **built** (section 3.10),
   currently technical-evidence-only; fundamental/sentiment/macro modules
@@ -1609,6 +1936,28 @@ User-stated direction for where Jarvis is headed, not yet fully built:
 
 ## 8. Document History
 
+- **2026-08-28**: Added the tenant-scoped, provider-neutral fundamental
+  evidence foundation and five-capability read gateway: source hierarchy and
+  fingerprints, strict normalized facts, explicit missing/unavailable states,
+  conflict preservation, calculation lineage, immutable snapshot
+  fingerprinting, primary-backed decision-grade release, capability manifests,
+  versioned request/result contracts, cross-scope response binding, safe
+  gateway failures, semantic cache identity, ten-day repository/expiry
+  contracts, the thread-safe in-memory reference adapter, and DuckDB schema v4
+  persistent fundamental caching with normalized evidence tables, mandatory
+  point-operation scope, opportunistic purge, deterministic queries,
+  point-in-time reads, refresh-after-expiry, and atomic conflict handling.
+  Added the offline five-tool Tijori normalizer, pinned local stdio MCP
+  transport, and Jarvis-owned minimal local provider bridge with owner-only
+  session validation, bounded JSON-RPC/browser execution, deterministic
+  company/overview/financial/shareholding handlers, environment isolation,
+  timeouts, process cleanup, and synthetic five-tool MCP composition coverage.
+  The local bridge has **111 passing offline tests** and has not been exercised
+  against a live Tijori session. Added the sanitized Python composition and
+  environment-loading boundary; all **194 fundamental/Tijori subsystem tests**
+  pass.
+  Revalidated 1,874 Python tests and the existing 36-test frontend baseline
+  without live provider credentials.
 - **2026-08-27**: Documented the conversational ticker-resolution fallback
   (deterministic ranked shortlist -> shortlist-constrained `TICKER_RESOLVER`
   LLM proposal -> mandatory yes/no confirmation -> resume, with a

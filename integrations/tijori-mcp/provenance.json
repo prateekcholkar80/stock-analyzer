@@ -1,0 +1,98 @@
+{
+  "schema_version": "jarvis.external_source_provenance.v1",
+  "integration": "tijori-finance-mcp",
+  "status": "verified_not_vendored_not_executed",
+  "verified_at": "2026-08-28",
+  "upstream": {
+    "repository": "https://github.com/LaZZy0v0/tijori-finance-mcp.git",
+    "commit": "64be6c49f99a3fb3355ab5a727ce05cf260a7acc",
+    "tree": "6371a84c18189710fef2c96e1301bcef751a3831",
+    "commit_date": "2026-07-14T17:27:44+05:30",
+    "commit_subject": "Improve README description for MCP server",
+    "package_name": "tijori-finance-mcp",
+    "package_version": "1.0.0",
+    "lockfile_version": 3,
+    "declared_license": "MIT"
+  },
+  "sha256": {
+    "package.json": "b545913108c11866d124a00a3de12b6b0fdbd5716eba24450ac69ae643749538",
+    "package-lock.json": "a6cf5bfff18834c272ebd55c4c73a69ef41a8da00929e0e03c26603c3c1f2438",
+    "LICENSE": "06997c676983f33c0375d738c802a61015e71b2bceaa6b404c0dbbd37eaa8920"
+  },
+  "approved_tools": [
+    "search_company",
+    "resolve_company_ids",
+    "get_company_overview",
+    "get_financials",
+    "get_shareholding"
+  ],
+  "prohibited_upstream_scripts": [
+    "setup.js",
+    "discover.js"
+  ],
+  "dependency_audit": {
+    "audited_at": "2026-08-28",
+    "command": "npm audit --package-lock-only --omit=dev --json",
+    "audit_report_version": 2,
+    "production_dependencies": 122,
+    "vulnerabilities": {
+      "critical": 0,
+      "high": 4,
+      "moderate": 1,
+      "low": 1,
+      "total": 6
+    },
+    "affected_packages": [
+      {
+        "name": "fast-uri",
+        "severity": "high",
+        "direct": false,
+        "fix_available": true
+      },
+      {
+        "name": "hono",
+        "severity": "high",
+        "direct": false,
+        "fix_available": true
+      },
+      {
+        "name": "ip-address",
+        "severity": "high",
+        "direct": false,
+        "fix_available": true
+      },
+      {
+        "name": "undici",
+        "severity": "high",
+        "direct": false,
+        "fix_available": true
+      },
+      {
+        "name": "@hono/node-server",
+        "severity": "moderate",
+        "direct": false,
+        "fix_available": true
+      },
+      {
+        "name": "body-parser",
+        "severity": "low",
+        "direct": false,
+        "fix_available": true
+      }
+    ],
+    "gate": {
+      "required": "zero critical and zero high vulnerabilities",
+      "passed": false,
+      "live_execution_allowed": false
+    }
+  },
+  "verification_scope": {
+    "source_downloaded_to_temporary_directory": true,
+    "source_copied_into_application_repository": false,
+    "dependencies_installed": false,
+    "scripts_executed": false,
+    "browser_started": false,
+    "provider_authenticated": false,
+    "provider_network_request_made": false
+  }
+}

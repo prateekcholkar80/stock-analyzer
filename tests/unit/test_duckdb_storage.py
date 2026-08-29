@@ -115,7 +115,7 @@ class DuckDBStorageTests(unittest.TestCase):
         with self.storage() as storage:
             self.assertIsInstance(storage, JarvisStorageAdapter)
             self.assertEqual(storage.adapter_name, "duckdb")
-            self.assertEqual(storage.schema_version, 3)
+            self.assertEqual(storage.schema_version, 4)
             self.assertEqual(storage.database, str(self.database))
 
         connection = duckdb.connect(str(self.database), read_only=True)
@@ -131,7 +131,7 @@ class DuckDBStorageTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(version, ("3",))
+        self.assertEqual(version, ("4",))
         self.assertTrue(
             {
                 "jarvis_instruments",
@@ -151,6 +151,12 @@ class DuckDBStorageTests(unittest.TestCase):
                 "jarvis_backtest_performance_segments",
                 "jarvis_debate_runs",
                 "jarvis_debate_signal_signature",
+                "jarvis_fundamental_snapshots",
+                "jarvis_fundamental_request_statements",
+                "jarvis_fundamental_request_period_types",
+                "jarvis_fundamental_sources",
+                "jarvis_fundamental_facts",
+                "jarvis_fundamental_conflicts",
             }.issubset(tables)
         )
 
@@ -638,7 +644,7 @@ class DuckDBStorageTests(unittest.TestCase):
             ).fetchone()[0]
             loaded = migrated.get_backtest_run("legacy-run")
 
-        self.assertEqual(version, "3")
+        self.assertEqual(version, "4")
         self.assertEqual(candle_count, 2)
         self.assertEqual(equity_count, 2)
         self.assertEqual(loaded.run_id, "legacy-run")

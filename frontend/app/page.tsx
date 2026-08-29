@@ -318,6 +318,7 @@ export default function Home() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recorderChunksRef = useRef<Blob[]>([]);
   const captureIntervalRef = useRef<number | null>(null);
+  const captureRequestedRef = useRef(false);
   const captureSuspendedRef = useRef(false);
   const captureStateRef = useRef<VoiceCaptureState>("idle");
   const silenceElapsedRef = useRef(0);
@@ -664,6 +665,10 @@ export default function Home() {
     if (micStreamRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!captureRequestedRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       micStreamRef.current = stream;
       const audioContext = new AudioContext();
       audioContextRef.current = audioContext;
@@ -700,19 +705,30 @@ export default function Home() {
         captureStateRef.current = result.nextState;
         if (result.utteranceComplete) void uploadVoiceSegment();
       }, tickIntervalMs);
-    } catch {
-      setVoiceInputEnabled(false);
-      setError("Microphone access was denied or unavailable.");
+    } catch (reason) {
+      stopVoiceCapture();
+      throw reason;
     }
-  }, [uploadVoiceSegment]);
+  }, [stopVoiceCapture, uploadVoiceSegment]);
 
   useEffect(() => {
     if (!voiceInputEnabled || !session || !token) {
+      captureRequestedRef.current = false;
       stopVoiceCapture();
       return;
     }
-    void startVoiceCapture();
-    return () => stopVoiceCapture();
+    captureRequestedRef.current = true;
+    let cancelled = false;
+    void startVoiceCapture().catch(() => {
+      if (cancelled) return;
+      setVoiceInputEnabled(false);
+      setError("Microphone access was denied or unavailable.");
+    });
+    return () => {
+      cancelled = true;
+      captureRequestedRef.current = false;
+      stopVoiceCapture();
+    };
   }, [voiceInputEnabled, session, token, startVoiceCapture, stopVoiceCapture]);
 
   const submit = (event: FormEvent) => {

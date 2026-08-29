@@ -5,6 +5,9 @@ __pycache__/
 # Virtual environment
 .venv/
 
+# JavaScript dependencies
+node_modules/
+
 # Environment variables
 .env
 

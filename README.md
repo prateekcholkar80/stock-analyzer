@@ -452,9 +452,21 @@ current adapters are:
 - `InMemoryJarvisStorage` for tests and transient workflows
 - `DuckDBJarvisStorage` for local analytical persistence
 
-DuckDB schema version 3 stores market datasets, normalized candles, strategy
+DuckDB schema version 4 stores market datasets, normalized candles, strategy
 configuration and weights, backtest evaluations/trades/equity/performance, and
 debate transcripts/verdicts with signal signatures for precedent retrieval.
+It also stores tenant-scoped, ten-day fundamental snapshot envelopes with
+normalized request scope, sources, facts, and conflicts; provider credentials
+and browser sessions are never stored.
+
+The first Tijori integration slice is deliberately offline: a provider-neutral
+`TijoriMcpAdapter` normalizes synthetic responses for five audited read-only
+tools into research-grade, provider-standardized evidence. It contains no
+network, subprocess, browser, login, or credential code, and cannot access a
+live Tijori account. A hardened local stdio MCP transport is implemented and
+tested only against a synthetic server; the patched upstream fork and login
+flow remain gated by the security and data-use review in
+[docs/tijori-mcp-source-audit.md](docs/tijori-mcp-source-audit.md).
 Generated databases are local artifacts and must not be committed.
 
 See [docs/backtest-storage-schema.md](docs/backtest-storage-schema.md) for the
