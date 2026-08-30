@@ -425,6 +425,95 @@ class DuckDBFundamentalSnapshotRepositoryTests(unittest.TestCase):
         )
         self.assertEqual(normalized_fact_count, 1)
 
+    def test_explicit_refresh_transactionally_replaces_active_evidence(self):
+        old = build_entry()
+        later = timedelta(hours=2)
+        refreshed = build_entry(
+            requested_at=REQUESTED_AT + later,
+            completed_at=COMPLETED_AT + later,
+        )
+        with self.storage() as storage:
+            self.clock.now = old.stored_at
+            storage.save_fundamental_snapshot(old)
+            self.clock.now = refreshed.stored_at
+
+            saved = storage.replace_fundamental_snapshot(
+                refreshed,
+                scope=self.scope,
+            )
+            loaded = storage.get_fundamental_snapshot(
+                refreshed.cache_key,
+                scope=self.scope,
+                as_of=self.clock.now,
+            )
+            relation_counts = {
+                table: storage._connection.execute(
+                    f"SELECT count(*) FROM {table}"
+                ).fetchone()[0]
+                for table in FUNDAMENTAL_TABLES
+            }
+
+        self.assertEqual(saved, refreshed)
+        self.assertEqual(loaded, refreshed)
+        self.assertEqual(
+            relation_counts,
+            {
+                "jarvis_fundamental_snapshots": 1,
+                "jarvis_fundamental_request_statements": len(
+                    refreshed.cache_key.statements
+                ),
+                "jarvis_fundamental_request_period_types": len(
+                    refreshed.cache_key.period_types
+                ),
+                "jarvis_fundamental_sources": 1,
+                "jarvis_fundamental_facts": 1,
+                "jarvis_fundamental_conflicts": 0,
+            },
+        )
+
+    def test_failed_explicit_refresh_rolls_back_without_losing_evidence(self):
+        old = build_entry()
+        later = timedelta(hours=2)
+        refreshed = build_entry(
+            requested_at=REQUESTED_AT + later,
+            completed_at=COMPLETED_AT + later,
+        )
+        other_scope = FundamentalRepositoryScope(
+            tenant_id="tenant.other",
+            provider_connection_id="provider.tijori.other",
+            provider="tijori",
+        )
+        with self.storage() as storage:
+            self.clock.now = old.stored_at
+            storage.save_fundamental_snapshot(old)
+            self.clock.now = refreshed.stored_at
+            storage.replace_fundamental_snapshot(
+                refreshed,
+                scope=self.scope,
+            )
+
+            with self.assertRaises(StorageConflictError):
+                storage.replace_fundamental_snapshot(
+                    old,
+                    scope=self.scope,
+                )
+            with self.assertRaises(StorageError):
+                storage.replace_fundamental_snapshot(
+                    refreshed,
+                    scope=other_scope,
+                )
+            loaded = storage.get_fundamental_snapshot(
+                refreshed.cache_key,
+                scope=self.scope,
+                as_of=self.clock.now,
+            )
+            parent_count = storage._connection.execute(
+                "SELECT count(*) FROM jarvis_fundamental_snapshots"
+            ).fetchone()[0]
+
+        self.assertEqual(loaded, refreshed)
+        self.assertEqual(parent_count, 1)
+
     def test_matches_in_memory_repository_observable_contract(self):
         older = build_entry(max_periods=12)
         newer = build_entry(

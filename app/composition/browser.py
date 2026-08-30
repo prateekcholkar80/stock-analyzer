@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 from app.audit.prompt_audit import (
@@ -9,12 +10,14 @@ from app.composition.conversation import LazyJarvisResearchPresenter
 from app.composition.research import compose_jarvis_swing_research
 from app.conversation.browser import BrowserConversationCoordinator
 from app.conversation.config import JarvisConversationConfig
+from app.models.fundamentals import ProviderConnectionScope
 from app.workflow.browser_runner import (
     AsyncBrowserOperationRunner,
     BrowserOperationResultStore,
     BrowserResearchContextStore,
     InMemoryBrowserOperationResultStore,
     JarvisBrowserOperationHandler,
+    BrowserFundamentalEvidenceExecutor,
 )
 from app.workflow.operations import (
     BrowserOperationRegistry,
@@ -47,6 +50,12 @@ def compose_jarvis_browser_operations(
     context_store: BrowserResearchContextStore | None = None,
     prompt_audit_config: PromptAuditConfig | None = None,
     prompt_audit_sink: PromptAuditSink | None = None,
+    fundamental_evidence_executor: (
+        BrowserFundamentalEvidenceExecutor | None
+    ) = None,
+    provider_scope_resolver: (
+        Callable[[str], ProviderConnectionScope] | None
+    ) = None,
     max_workers: int = 2,
     **research_dependencies: Any,
 ) -> JarvisBrowserApplication:
@@ -64,6 +73,12 @@ def compose_jarvis_browser_operations(
     if prompt_audit_config is not None and prompt_audit_sink is not None:
         raise ValueError(
             "provide either prompt audit configuration or an audit sink"
+        )
+    if (fundamental_evidence_executor is None) != (
+        provider_scope_resolver is None
+    ):
+        raise ValueError(
+            "browser fundamental composition requires executor and resolver"
         )
     if "prompt_audit_sink" in research_dependencies:
         raise ValueError(
@@ -101,6 +116,8 @@ def compose_jarvis_browser_operations(
         research.judge_follow_up_executor,
         user_name=resolved_config.user_name,
         context_store=context_store,
+        fundamental_evidence_executor=fundamental_evidence_executor,
+        provider_scope_resolver=provider_scope_resolver,
     )
     runner = AsyncBrowserOperationRunner(
         resolved_registry,

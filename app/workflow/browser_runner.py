@@ -15,6 +15,14 @@ from app.exceptions import (
     IntentRecognitionError,
     LLMError,
     MarketDataError,
+    FundamentalGatewayError,
+)
+from app.gateways.fundamentals import (
+    FundamentalCompanyOverviewRequest,
+    FundamentalFinancialsRequest,
+    FundamentalIssuerLocator,
+    FundamentalIssuerResolutionRequest,
+    FundamentalShareholdingRequest,
 )
 from app.logging_config import get_logger
 from app.models.browser_operations import (
@@ -34,6 +42,7 @@ from app.models.interaction import (
     JarvisSwingAnalysisResponse,
 )
 from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
+from app.models.fundamentals import ProviderConnectionScope
 from app.models.presentation import (
     JarvisMultiTimeframeResearchExplanation,
     JarvisResearchExplanation,
@@ -43,6 +52,10 @@ from app.models.storage import (
     MultiTimeframeEndToEndSwingAnalysisResult,
 )
 from app.models.workflow import WorkflowEventState, WorkflowStage
+from app.services.fundamental_evidence import (
+    FundamentalEvidenceLoadResult,
+    FundamentalIssuerLoadResult,
+)
 from app.workflow.events import WorkflowEventEmitter
 from app.workflow.operations import BrowserOperationRegistry
 
@@ -170,6 +183,25 @@ class BrowserJudgeFollowUpExecutor(Protocol):
 
 
 @runtime_checkable
+class BrowserFundamentalEvidenceExecutor(Protocol):
+    def resolve_issuer(
+        self,
+        request: FundamentalIssuerResolutionRequest,
+        *,
+        refresh_requested: bool = False,
+    ) -> FundamentalIssuerLoadResult:
+        ...
+
+    def load(
+        self,
+        request,
+        *,
+        refresh_requested: bool = False,
+    ) -> FundamentalEvidenceLoadResult:
+        ...
+
+
+@runtime_checkable
 class BrowserResearchContextStore(Protocol):
     def replace(
         self,
@@ -238,6 +270,12 @@ class JarvisBrowserOperationHandler:
         *,
         user_name: str,
         context_store: BrowserResearchContextStore | None = None,
+        fundamental_evidence_executor: (
+            BrowserFundamentalEvidenceExecutor | None
+        ) = None,
+        provider_scope_resolver: (
+            Callable[[str], ProviderConnectionScope] | None
+        ) = None,
         clock: RunnerClock | None = None,
     ) -> None:
         if not isinstance(research_executor, BrowserSwingResearchExecutor):
@@ -253,11 +291,31 @@ class JarvisBrowserOperationHandler:
         )
         if not isinstance(resolved_context_store, BrowserResearchContextStore):
             raise ValueError("browser handler requires a research context store")
+        if (fundamental_evidence_executor is None) != (
+            provider_scope_resolver is None
+        ):
+            raise ValueError(
+                "browser handler fundamental execution requires executor "
+                "and scope resolver"
+            )
+        if fundamental_evidence_executor is not None and not isinstance(
+            fundamental_evidence_executor,
+            BrowserFundamentalEvidenceExecutor,
+        ):
+            raise ValueError(
+                "browser handler requires a fundamental evidence executor"
+            )
+        if provider_scope_resolver is not None and not callable(
+            provider_scope_resolver
+        ):
+            raise ValueError("browser handler requires a provider scope resolver")
         self._research_executor = research_executor
         self._presenter = presenter
         self._follow_up_executor = follow_up_executor
         self._user_name = _required_text("user name", user_name)
         self._contexts = resolved_context_store
+        self._fundamental_evidence = fundamental_evidence_executor
+        self._provider_scope_resolver = provider_scope_resolver
         self._clock = clock or _ist_now
 
     def execute(
@@ -323,6 +381,13 @@ class JarvisBrowserOperationHandler:
             )
         if response.result is None:
             raise ValueError("completed research response is missing analysis")
+        fundamental_evidence: tuple[FundamentalEvidenceLoadResult, ...] = ()
+        if request.fundamentals_requested:
+            fundamental_evidence = self._load_fundamental_evidence(
+                request,
+                response.result,
+                token,
+            )
         approved_context = None
         if (
             response.multi_timeframe_review is not None
@@ -361,6 +426,7 @@ class JarvisBrowserOperationHandler:
                         isinstance(exc, LLMError) and exc.context.retryable
                     ),
                 ),
+                fundamental_evidence=fundamental_evidence,
             )
         if not isinstance(
             explanation,
@@ -378,7 +444,148 @@ class JarvisBrowserOperationHandler:
             completed_at=self._clock(),
             research_response=response,
             research_explanation=explanation,
+            fundamental_evidence=fundamental_evidence,
         )
+
+    def _load_fundamental_evidence(
+        self,
+        operation: BrowserOperationRequest,
+        result: (
+            EndToEndSwingAnalysisResult
+            | MultiTimeframeEndToEndSwingAnalysisResult
+        ),
+        token: BrowserCancellationToken,
+    ) -> tuple[FundamentalEvidenceLoadResult, ...]:
+        executor = self._fundamental_evidence
+        resolver = self._provider_scope_resolver
+        if executor is None or resolver is None:
+            raise BrowserOperationHandledFailure(
+                BrowserOperationFailure(
+                    code="fundamentals.unconfigured",
+                    message=(
+                        "Fundamental research was requested, but no provider "
+                        "connection is configured. The technical analysis "
+                        "was not altered."
+                    ),
+                    retryable=False,
+                )
+            )
+        token.raise_if_requested()
+        try:
+            connection = resolver(operation.session_id)
+        except Exception as exc:
+            raise BrowserOperationHandledFailure(
+                BrowserOperationFailure(
+                    code="fundamentals.connection_unavailable",
+                    message=(
+                        "Fundamental research was requested, but the provider "
+                        "connection could not be resolved safely."
+                    ),
+                    retryable=False,
+                )
+            ) from exc
+        if not isinstance(connection, ProviderConnectionScope):
+            raise ValueError("provider scope resolver returned an invalid scope")
+
+        series = result.fetch.stored.series
+        requested_at = self._clock()
+        resolution_request = FundamentalIssuerResolutionRequest(
+            request_id=f"{operation.operation_id}.fundamental.resolve",
+            operation_id=operation.operation_id,
+            connection=connection,
+            requested_at=requested_at,
+            locator=FundamentalIssuerLocator(
+                exchange=series.exchange,
+                symbol=series.symbol,
+            ),
+        )
+        try:
+            resolution = executor.resolve_issuer(
+                resolution_request,
+                refresh_requested=operation.refresh_requested,
+            )
+        except FundamentalGatewayError as exc:
+            raise BrowserOperationHandledFailure(
+                BrowserOperationFailure(
+                    code="fundamentals.unavailable",
+                    message=(
+                        "Fundamental research could not resolve the provider "
+                        "company identity safely. No identity was guessed."
+                    ),
+                    retryable=exc.context.retryable,
+                )
+            ) from exc
+        if not isinstance(resolution, FundamentalIssuerLoadResult):
+            raise ValueError("fundamental executor returned invalid issuer data")
+        if resolution.issuer is None:
+            raise BrowserOperationHandledFailure(
+                BrowserOperationFailure(
+                    code="fundamentals.issuer_unresolved",
+                    message=(
+                        "Fundamental research was requested, but the provider "
+                        "could not unambiguously match the resolved NSE "
+                        "instrument. No company identity was guessed."
+                    ),
+                    retryable=False,
+                )
+            )
+        issuer = resolution.issuer
+        as_of_date = (
+            series.candles[-1].timestamp.date()
+            if series.candles
+            else requested_at.date()
+        )
+        requests = (
+            FundamentalCompanyOverviewRequest(
+                request_id=f"{operation.operation_id}.fundamental.overview",
+                operation_id=operation.operation_id,
+                connection=connection,
+                requested_at=requested_at,
+                issuer=issuer,
+                as_of_date=as_of_date,
+            ),
+            FundamentalFinancialsRequest(
+                request_id=f"{operation.operation_id}.fundamental.financials",
+                operation_id=operation.operation_id,
+                connection=connection,
+                requested_at=requested_at,
+                issuer=issuer,
+                as_of_date=as_of_date,
+            ),
+            FundamentalShareholdingRequest(
+                request_id=f"{operation.operation_id}.fundamental.shareholding",
+                operation_id=operation.operation_id,
+                connection=connection,
+                requested_at=requested_at,
+                issuer=issuer,
+                as_of_date=as_of_date,
+            ),
+        )
+        loaded = []
+        try:
+            for request in requests:
+                token.raise_if_requested()
+                evidence = executor.load(
+                    request,
+                    refresh_requested=operation.refresh_requested,
+                )
+                if not isinstance(evidence, FundamentalEvidenceLoadResult):
+                    raise ValueError(
+                        "fundamental executor returned an invalid result"
+                    )
+                loaded.append(evidence)
+        except FundamentalGatewayError as exc:
+            raise BrowserOperationHandledFailure(
+                BrowserOperationFailure(
+                    code="fundamentals.unavailable",
+                    message=(
+                        "Fundamental research could not be retrieved safely. "
+                        "No provider facts were invented or substituted."
+                    ),
+                    retryable=exc.context.retryable,
+                )
+            ) from exc
+        return tuple(loaded)
 
     def _execute_follow_up(
         self,

@@ -49,6 +49,8 @@ class PendingConfirmation(TechnicalModel):
     to_date: datetime | None = None
     chosen_symbol: str | None = Field(default=None, min_length=1)
     exchange: str | None = Field(default=None, min_length=1)
+    fundamentals_requested: bool = False
+    refresh_requested: bool = False
 
     @field_validator("original_command", "chosen_symbol", "exchange")
     @classmethod
@@ -68,5 +70,9 @@ class PendingConfirmation(TechnicalModel):
             raise ValueError(
                 "a ticker-guess confirmation requires a chosen symbol "
                 "and exchange"
+            )
+        if self.refresh_requested and not self.fundamentals_requested:
+            raise ValueError(
+                "fundamental refresh confirmation requires fundamental research"
             )
         return self

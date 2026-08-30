@@ -528,6 +528,86 @@ class DuckDBJarvisStorage:
                     "Unable to persist DuckDB fundamental snapshot"
                 ) from exc
 
+    def replace_fundamental_snapshot(
+        self,
+        stored: StoredFundamentalSnapshot,
+        *,
+        scope: FundamentalRepositoryScope,
+    ) -> StoredFundamentalSnapshot:
+        """Transactionally install newer evidence for one scoped cache key."""
+
+        value = StoredFundamentalSnapshot.model_validate(stored)
+        caller_scope = FundamentalRepositoryScope.model_validate(scope)
+        summary = fundamental_snapshot_summary(value)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_fundamental_locked(as_of=now)
+                if value.cache_key.repository_scope != caller_scope:
+                    raise StorageError(
+                        "fundamental replacement scope does not match cache key"
+                    )
+                if value.stored_at > now:
+                    raise StorageError(
+                        "fundamental snapshot storage time is in the future"
+                    )
+                if value.is_expired(as_of=now):
+                    raise StorageError(
+                        "expired fundamental snapshot cannot be saved"
+                    )
+
+                existing = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_fundamental_snapshots "
+                    "WHERE cache_entry_id = ?",
+                    [value.cache_key.cache_entry_id],
+                ).fetchone()
+                if existing is None:
+                    persisted = value
+                    self._insert_fundamental_parent(persisted, summary)
+                else:
+                    current = StoredFundamentalSnapshot.model_validate_json(
+                        existing[1]
+                    )
+                    if current.storage_fingerprint != existing[0]:
+                        raise StorageError(
+                            "DuckDB fundamental snapshot fingerprint is "
+                            "inconsistent"
+                        )
+                    if existing[0] == value.storage_fingerprint:
+                        persisted = current
+                    else:
+                        if value.retrieved_at <= current.retrieved_at:
+                            raise StorageConflictError(
+                                "fundamental replacement is not newer than "
+                                "cached data"
+                            )
+                        self._delete_fundamental_entry_locked(
+                            value.cache_key.cache_entry_id
+                        )
+                        persisted = value
+                        self._insert_fundamental_parent(persisted, summary)
+
+                self._persist_fundamental_details(persisted)
+                self._connection.execute("COMMIT")
+                return StoredFundamentalSnapshot.model_validate_json(
+                    persisted.model_dump_json(exclude_computed_fields=True)
+                )
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to replace DuckDB fundamental snapshot"
+                ) from exc
+
     def get_fundamental_snapshot(
         self,
         key: FundamentalSnapshotCacheKey,

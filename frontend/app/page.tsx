@@ -1,9 +1,18 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 
 import { TechnicalChart } from "@/components/TechnicalChart";
 import { ExecutiveBriefing } from "@/components/ExecutiveBriefing";
+import { HolographicAgent } from "@/components/HolographicAgent";
 import type {
   Dashboard,
   DashboardQuote,
@@ -30,6 +39,14 @@ import {
   shouldSubmitVoiceTranscript,
   type VoiceCaptureState,
 } from "@/lib/voice-capture";
+import {
+  ProviderSessionClientError,
+  createProviderSessionClient,
+  type ProviderSessionLifecycle,
+  type ProviderSessionTarget,
+} from "@/lib/provider-session";
+import { AGENT_VISUALS, type AgentVisualSpec } from "@/lib/agent-visuals";
+import { NeuralAudioEngine } from "@/lib/neural-audio";
 
 import {
   MATRIX_STEPS,
@@ -37,6 +54,7 @@ import {
   matchesBull,
   matchesDaily,
   matchesEvidence,
+  matchesBriefing,
   matchesJudge,
   matchesMarket,
   matchesWeekly,
@@ -82,6 +100,19 @@ type AgentTone = "cyan" | "amber" | "rose" | "violet";
 type CreatedSession = { session: Session; access_token: string };
 
 const API_BASE = process.env.NEXT_PUBLIC_JARVIS_API_URL?.replace(/\/$/, "") ?? "http://127.0.0.1:8000";
+const TIJORI_CONNECTION_ID = process.env.NEXT_PUBLIC_JARVIS_TIJORI_CONNECTION_ID?.trim() ?? "";
+const TIJORI_ACCOUNT_REFERENCE_HASH = process.env.NEXT_PUBLIC_JARVIS_TIJORI_ACCOUNT_REFERENCE_HASH?.trim() || null;
+const TIJORI_TARGET: ProviderSessionTarget | null = TIJORI_CONNECTION_ID
+  ? {
+    provider_connection_id: TIJORI_CONNECTION_ID,
+    provider: "tijori",
+    account_reference_hash: TIJORI_ACCOUNT_REFERENCE_HASH,
+  }
+  : null;
+const RECOVERABLE_INSTRUMENT_FAILURES = new Set([
+  "instrument.not_found",
+  "instrument.ambiguous",
+]);
 
 function requestId() {
   return `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -115,21 +146,54 @@ async function readSse(response: Response, onEvent: (event: string, data: unknow
   }
 }
 
-function AgentCard({ id, label, specialty, tone, status }: {
-  id: string; label: string; specialty: string; tone: AgentTone; status: ProgressStatus;
+function AgentCard({ id, label, specialty, tone, status, visual, statusLabel }: {
+  id: string;
+  label: string;
+  specialty: string;
+  tone: AgentTone;
+  status: ProgressStatus;
+  visual?: AgentVisualSpec;
+  statusLabel?: string;
 }) {
-  const stateLabel = {
+  const stateLabel = statusLabel ?? ({
     standby: "Standby",
     active: "Processing",
     complete: "Complete",
     failed: "Failed",
-  }[status];
+  }[status]);
   return (
-    <article className={`agent-card ${tone} ${status}`}>
-      <div className="agent-glyph" aria-hidden="true"><span>{id}</span></div>
+    <article className={`agent-card ${tone} ${status} ${visual ? "holographic" : ""}`}>
+      {visual
+        ? <HolographicAgent spec={visual} status={status} />
+        : <div className="agent-glyph" aria-hidden="true"><span>{id}</span></div>}
       <div><p className="eyebrow">{specialty}</p><h3>{label}</h3></div>
       <span className={`agent-state ${status}`}>{stateLabel}</span>
     </article>
+  );
+}
+
+type CommunicationDirection = "to-agent" | "to-jarvis" | "bidirectional";
+
+function CommunicationLink({
+  agent,
+  status,
+  direction,
+  label,
+  style,
+}: {
+  agent: "research" | "daily" | "weekly" | "fundamental" | "bull" | "bear" | "judge";
+  status: ProgressStatus;
+  direction: CommunicationDirection;
+  label: string;
+  style?: CSSProperties;
+}) {
+  return (
+    <span className={`communication-link link-${agent} ${status} ${direction}`} style={style}>
+      <span className="communication-track" />
+      <i className="signal-packet packet-primary" />
+      <i className="signal-packet packet-return" />
+      <em>{label}</em>
+    </span>
   );
 }
 
@@ -310,8 +374,17 @@ export default function Home() {
   const [voicePreferencesLoaded, setVoicePreferencesLoaded] = useState(false);
   const [voiceInputEnabled, setVoiceInputEnabled] = useState(false);
   const [voiceInputPreferencesLoaded, setVoiceInputPreferencesLoaded] = useState(false);
+  const [soundEffectsEnabled, setSoundEffectsEnabled] = useState(false);
+  const [providerLifecycle, setProviderLifecycle] = useState<ProviderSessionLifecycle | null>(null);
+  const [providerCommand, setProviderCommand] = useState<"status" | "provision" | "revoke" | null>(null);
+  const [providerNotice, setProviderNotice] = useState<string | null>(
+    TIJORI_TARGET
+      ? null
+      : "Tijori connection controls are not configured for this browser build.",
+  );
   const conversationAbort = useRef<AbortController | null>(null);
   const workflowAbort = useRef<AbortController | null>(null);
+  const neuralAudioRef = useRef<NeuralAudioEngine | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -323,7 +396,36 @@ export default function Home() {
   const captureStateRef = useRef<VoiceCaptureState>("idle");
   const silenceElapsedRef = useRef(0);
   const conversationRef = useRef<ConversationSnapshot | null>(null);
+  const commandDeckRef = useRef<HTMLElement | null>(null);
+  const reactorCoreRef = useRef<HTMLButtonElement | null>(null);
+  const researchNodeRefs = useRef<Record<"research" | "daily" | "weekly" | "fundamental", HTMLDivElement | null>>({
+    research: null,
+    daily: null,
+    weekly: null,
+    fundamental: null,
+  });
+  const [researchLinkGeometry, setResearchLinkGeometry] = useState<Partial<Record<"research" | "daily" | "weekly" | "fundamental", CSSProperties>>>({});
+  const debateNodeRefs = useRef<Record<"bull" | "bear" | "judge", HTMLDivElement | null>>({
+    bull: null,
+    bear: null,
+    judge: null,
+  });
+  const [debateLinkGeometry, setDebateLinkGeometry] = useState<Partial<Record<"bull" | "bear" | "judge", CSSProperties>>>({});
   const authHeaders = useMemo(() => ({ "X-Jarvis-Session-Token": token }), [token]);
+  const providerClient = useMemo(() => (
+    session && token && TIJORI_TARGET
+      ? createProviderSessionClient({
+        apiBase: API_BASE,
+        sessionId: session.session_id,
+        accessToken: token,
+      })
+      : null
+  ), [session, token]);
+
+  useEffect(() => {
+    neuralAudioRef.current = new NeuralAudioEngine();
+    return () => { void neuralAudioRef.current?.dispose(); };
+  }, []);
 
   useEffect(() => {
     const formatter = new Intl.DateTimeFormat("en-IN", {
@@ -335,6 +437,60 @@ export default function Home() {
     updateClock();
     const timer = window.setInterval(updateClock, 30_000);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let animationFrame = 0;
+    const updateGeometry = () => {
+      window.cancelAnimationFrame(animationFrame);
+      animationFrame = window.requestAnimationFrame(() => {
+        const core = reactorCoreRef.current?.getBoundingClientRect();
+        if (!core) return;
+        const targetX = core.left + core.width / 2;
+        const targetY = core.top + core.height / 2;
+        const next: Partial<Record<"research" | "daily" | "weekly" | "fundamental", CSSProperties>> = {};
+        for (const key of ["research", "daily", "weekly", "fundamental"] as const) {
+          const node = researchNodeRefs.current[key]?.getBoundingClientRect();
+          if (!node) continue;
+          const deltaX = targetX - node.right;
+          const deltaY = targetY - node.top;
+          next[key] = {
+            width: `${Math.hypot(deltaX, deltaY).toFixed(1)}px`,
+            transform: `rotate(${Math.atan2(deltaY, deltaX).toFixed(5)}rad)`,
+          };
+        }
+        setResearchLinkGeometry(next);
+        const debateNext: Partial<Record<"bull" | "bear" | "judge", CSSProperties>> = {};
+        for (const key of ["bull", "bear", "judge"] as const) {
+          const node = debateNodeRefs.current[key]?.getBoundingClientRect();
+          if (!node) continue;
+          const deltaX = targetX - node.left;
+          const deltaY = targetY - node.top;
+          debateNext[key] = {
+            width: `${Math.hypot(deltaX, deltaY).toFixed(1)}px`,
+            transform: `rotate(${Math.atan2(deltaY, deltaX).toFixed(5)}rad)`,
+          };
+        }
+        setDebateLinkGeometry(debateNext);
+      });
+    };
+
+    const observer = new ResizeObserver(updateGeometry);
+    if (commandDeckRef.current) observer.observe(commandDeckRef.current);
+    if (reactorCoreRef.current) observer.observe(reactorCoreRef.current);
+    for (const node of Object.values(researchNodeRefs.current)) {
+      if (node) observer.observe(node);
+    }
+    for (const node of Object.values(debateNodeRefs.current)) {
+      if (node) observer.observe(node);
+    }
+    window.addEventListener("resize", updateGeometry);
+    updateGeometry();
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      window.removeEventListener("resize", updateGeometry);
+      observer.disconnect();
+    };
   }, []);
 
   useEffect(() => {
@@ -392,6 +548,87 @@ export default function Home() {
   useEffect(() => {
     conversationRef.current = conversation;
   }, [conversation]);
+
+  const refreshProviderStatus = useCallback(async () => {
+    if (!providerClient || !TIJORI_TARGET) return;
+    setProviderCommand("status");
+    setProviderNotice(null);
+    try {
+      setProviderLifecycle(await providerClient.status(TIJORI_TARGET));
+    } catch (reason) {
+      setProviderLifecycle(null);
+      setProviderNotice(
+        reason instanceof ProviderSessionClientError
+          ? reason.message
+          : "The provider connection status is unavailable.",
+      );
+    } finally {
+      setProviderCommand(null);
+    }
+  }, [providerClient]);
+
+  useEffect(() => {
+    if (!providerClient || !TIJORI_TARGET) return;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) void refreshProviderStatus();
+    });
+    return () => { cancelled = true; };
+  }, [providerClient, refreshProviderStatus]);
+
+  const connectProvider = useCallback(async () => {
+    if (!providerClient || !TIJORI_TARGET || providerCommand) return;
+    const replacing = providerLifecycle?.status === "expired" || providerLifecycle?.status === "revoked";
+    const confirmed = window.confirm(
+      replacing
+        ? "Reconnect Tijori? Jarvis will open a headed Tijori login window and securely replace the expired or revoked local session."
+        : "Connect Tijori? Jarvis will open a headed Tijori login window. Sign in directly with Tijori; Jarvis will never ask for or receive your credentials.",
+    );
+    if (!confirmed) return;
+    setProviderCommand("provision");
+    setProviderNotice("Waiting for you to complete the Tijori login window…");
+    try {
+      const lifecycle = await providerClient.provision(TIJORI_TARGET, {
+        idempotencyKey: requestId(),
+        replaceExisting: replacing,
+      });
+      setProviderLifecycle(lifecycle);
+      setProviderNotice("Tijori research connection is ready.");
+    } catch (reason) {
+      setProviderNotice(
+        reason instanceof ProviderSessionClientError
+          ? reason.message
+          : "Tijori connection could not be completed.",
+      );
+    } finally {
+      setProviderCommand(null);
+    }
+  }, [providerClient, providerCommand, providerLifecycle]);
+
+  const revokeProvider = useCallback(async () => {
+    if (!providerClient || !TIJORI_TARGET || providerCommand) return;
+    const confirmed = window.confirm(
+      "Revoke the local Tijori session? Jarvis will securely delete the saved session artifact. You will need to sign in again for future fundamental refreshes.",
+    );
+    if (!confirmed) return;
+    setProviderCommand("revoke");
+    setProviderNotice("Securely revoking the local Tijori session…");
+    try {
+      const lifecycle = await providerClient.revoke(TIJORI_TARGET, {
+        idempotencyKey: requestId(),
+      });
+      setProviderLifecycle(lifecycle);
+      setProviderNotice("Tijori research connection has been securely revoked.");
+    } catch (reason) {
+      setProviderNotice(
+        reason instanceof ProviderSessionClientError
+          ? reason.message
+          : "Tijori connection could not be revoked.",
+      );
+    } finally {
+      setProviderCommand(null);
+    }
+  }, [providerClient, providerCommand]);
 
   useEffect(() => {
     let disposed = false;
@@ -485,26 +722,44 @@ export default function Home() {
             ? current
             : [...current, activity].sort((a, b) => a.sequence - b.sequence));
           setNotice(activity.message);
+          neuralAudioRef.current?.play(
+            matchesJudge(activity) || matchesBriefing(activity)
+              ? "verdict"
+              : matchesEvidence(activity)
+                ? "evidence"
+                : "dispatch",
+          );
         }
         if (event === "terminal") {
           const terminal = data as OperationTerminal;
           setOperationStatus(terminal.status);
           if (terminal.status === "completed") {
+            neuralAudioRef.current?.play("complete");
             fetchDashboard(operationId).catch((reason) => setError(reason.message));
           } else {
+            neuralAudioRef.current?.play("fault");
             setActiveOperation(null);
-            setError(
-              terminal.failure?.message
-                ?? (terminal.status === "cancelled"
-                  ? "Research operation was cancelled."
-                  : "Research operation failed without a safe explanation."),
-            );
+            if (
+              terminal.failure
+              && RECOVERABLE_INSTRUMENT_FAILURES.has(terminal.failure.code)
+            ) {
+              setError(null);
+              setNotice("Jarvis is matching the company to a verified NSE instrument…");
+            } else {
+              setError(
+                terminal.failure?.message
+                  ?? (terminal.status === "cancelled"
+                    ? "Research operation was cancelled."
+                    : "Research operation failed without a safe explanation."),
+              );
+            }
           }
         }
         });
       })
       .catch((reason) => {
         if (reason.name !== "AbortError") {
+          neuralAudioRef.current?.play("fault");
           setError(reason.message);
           setOperationStatus("failed");
         }
@@ -566,10 +821,13 @@ export default function Home() {
           if (!["greeting", "listening"].includes(item.to_state)) {
             setNotice(item.message);
           }
+          if (item.to_state === "awaiting_confirmation") setError(null);
         }
         if (event === "conversation-terminal") {
           const snapshot = data as ConversationSnapshot;
           setConversation(snapshot);
+          if (snapshot.display_message) setNotice(snapshot.display_message);
+          if (snapshot.state === "awaiting_confirmation") setError(null);
           void playSpokenMessage(snapshot.spoken_message);
         }
       }))
@@ -582,6 +840,7 @@ export default function Home() {
   const sendUtterance = useCallback(async (text: string, channel: "text" | "voice" = "text") => {
     const normalized = text.trim();
     if (!session || !token || !normalized) return;
+    if (/^hey[\s,]+jarvis\b/i.test(normalized)) neuralAudioRef.current?.play("activation");
     setError(null);
     try {
       const response = await fetch(`${API_BASE}/api/v1/sessions/${session.session_id}/conversation/turns`, {
@@ -605,6 +864,7 @@ export default function Home() {
         streamWorkflow(operationId);
       }
     } catch (reason) {
+      neuralAudioRef.current?.play("fault");
       setError(reason instanceof Error ? reason.message : "Request failed.");
     }
   }, [authHeaders, playSpokenMessage, session, streamWorkflow, token]);
@@ -737,6 +997,9 @@ export default function Home() {
   };
 
   const progress = (matches: WorkflowMatcher) => workflowProgress(activities, matches);
+  const evidenceState = progress(matchesEvidence);
+  const judgeState = progress(matchesJudge);
+  const briefingState = progress(matchesBriefing);
   const agentStates = {
     research: progress(matchesMarket),
     daily: progress(matchesDaily),
@@ -745,6 +1008,82 @@ export default function Home() {
     bear: progress(matchesBear),
     judge: progress((item) => matchesEvidence(item) || matchesJudge(item)),
   };
+  const researchLink = agentStates.research.status === "active"
+    ? {
+      status: "active" as const,
+      direction: "bidirectional" as const,
+      label: "Preparing market data",
+    }
+    : agentStates.research.status === "complete"
+      ? {
+        // Keep the acknowledgement visible while downstream agents work. This
+        // is presentation-only and never blocks the workflow event stream.
+        status: "active" as const,
+        direction: "to-jarvis" as const,
+        label: "Market data ready",
+      }
+      : agentStates.research.status === "failed"
+        ? {
+          status: "failed" as const,
+          direction: "to-jarvis" as const,
+          label: "Data fault",
+        }
+        : {
+          status: "standby" as const,
+          direction: "to-agent" as const,
+          label: "Dispatch",
+        };
+  const evidenceReturning = evidenceState.status === "active" || judgeState.status === "active";
+  const judgeBriefing = briefingState.status === "active";
+  const fundamentalStatus: ProgressStatus = providerCommand
+    ? "active"
+    : providerLifecycle?.status === "ready"
+      ? "complete"
+      : providerLifecycle?.status === "expired"
+        ? "failed"
+        : "standby";
+  const fundamentalStatusLabel = providerCommand
+    ? "Connecting"
+    : providerLifecycle?.status === "ready"
+      ? "Provider ready"
+      : providerLifecycle?.status === "expired"
+        ? "Reconnect"
+        : "Standby";
+  const fundamentalLink = providerCommand === "provision"
+    ? {
+      status: "active" as const,
+      direction: "to-agent" as const,
+      label: "Secure connection",
+    }
+    : providerCommand === "status"
+      ? {
+        status: "active" as const,
+        direction: "bidirectional" as const,
+        label: "Provider check",
+      }
+      : providerCommand === "revoke"
+        ? {
+          status: "active" as const,
+          direction: "to-agent" as const,
+          label: "Revoke access",
+        }
+        : providerLifecycle?.status === "ready"
+          ? {
+            status: "active" as const,
+            direction: "to-jarvis" as const,
+            label: "Provider ready",
+          }
+          : providerLifecycle?.status === "expired"
+            ? {
+              status: "failed" as const,
+              direction: "to-jarvis" as const,
+              label: "Session expired",
+            }
+            : {
+              status: "standby" as const,
+              direction: "to-agent" as const,
+              label: providerLifecycle?.status === "revoked" ? "Access revoked" : "Disconnected",
+            };
   const recentActivities = activities.slice(-8).reverse();
   const state = conversation?.state ?? "dormant";
   const decisionView = dashboard
@@ -769,24 +1108,129 @@ export default function Home() {
         </div>
       </header>
 
-      <section className="command-deck" aria-label="Jarvis research command center">
+      <section ref={commandDeckRef} className="command-deck" aria-label="Jarvis research command center">
         <aside className="agent-column left-agents">
           <p className="section-label">Research division</p>
-          <AgentCard id="R" label="Research Analyst" specialty="Market intelligence" tone="cyan" status={agentStates.research.status} />
-          <AgentCard id="D" label="Daily Analyst" specialty="Tactical structure" tone="violet" status={agentStates.daily.status} />
-          <AgentCard id="W" label="Weekly Analyst" specialty="Strategic structure" tone="violet" status={agentStates.weekly.status} />
+          <div ref={(node) => { researchNodeRefs.current.research = node; }} className="research-agent-node node-research">
+            <AgentCard id="R" label="Market Data Analyst" specialty="Instrument & broker data" tone="cyan" status={agentStates.research.status} visual={AGENT_VISUALS.research} />
+            <CommunicationLink
+              agent="research"
+              status={researchLink.status}
+              direction="bidirectional"
+              label={researchLink.label}
+              style={researchLinkGeometry.research}
+            />
+          </div>
+          <div ref={(node) => { researchNodeRefs.current.daily = node; }} className="research-agent-node node-daily">
+            <AgentCard id="D" label="Daily Analyst" specialty="Tactical structure" tone="violet" status={agentStates.daily.status} visual={AGENT_VISUALS.daily} />
+            <CommunicationLink
+              agent="daily"
+              status={evidenceReturning ? "active" : agentStates.daily.status}
+              direction="bidirectional"
+              label={evidenceReturning ? "Daily evidence" : "Dispatch"}
+              style={researchLinkGeometry.daily}
+            />
+          </div>
+          <div ref={(node) => { researchNodeRefs.current.weekly = node; }} className="research-agent-node node-weekly">
+            <AgentCard id="W" label="Weekly Analyst" specialty="Strategic structure" tone="amber" status={agentStates.weekly.status} visual={AGENT_VISUALS.weekly} />
+            <CommunicationLink
+              agent="weekly"
+              status={evidenceReturning ? "active" : agentStates.weekly.status}
+              direction="bidirectional"
+              label={evidenceReturning ? "Weekly evidence" : "Dispatch"}
+              style={researchLinkGeometry.weekly}
+            />
+          </div>
+          <div ref={(node) => { researchNodeRefs.current.fundamental = node; }} className="fundamental-agent-dock research-agent-node node-fundamental">
+            <AgentCard
+              id="F"
+              label="Fundamental Analyst"
+              specialty="Company fundamentals"
+              tone="cyan"
+              status={fundamentalStatus}
+              statusLabel={fundamentalStatusLabel}
+              visual={AGENT_VISUALS.financial}
+            />
+            <CommunicationLink
+              agent="fundamental"
+              status={fundamentalLink.status}
+              direction="bidirectional"
+              label={fundamentalLink.label}
+              style={researchLinkGeometry.fundamental}
+            />
+            <section className="provider-session-panel" aria-label="Fundamental Analyst data-provider connection">
+              <div className="provider-session-summary">
+                <span className={`provider-dot ${providerLifecycle?.status ?? "unconfigured"}`} aria-hidden="true" />
+                <div>
+                  <p>Data provider · Tijori</p>
+                  <strong>{providerCommand ?? providerLifecycle?.status ?? "unconfigured"}</strong>
+                </div>
+                {providerLifecycle?.expires_at && (
+                  <small>
+                    Expires {new Date(providerLifecycle.expires_at).toLocaleString("en-IN", {
+                      timeZone: "Asia/Kolkata",
+                    })} IST
+                  </small>
+                )}
+              </div>
+              {providerNotice && <p className="provider-session-notice" role="status">{providerNotice}</p>}
+              <div className="provider-session-actions">
+                <button
+                  type="button"
+                  onClick={() => void refreshProviderStatus()}
+                  disabled={!providerClient || Boolean(providerCommand)}
+                >
+                  Check status
+                </button>
+                {providerLifecycle?.status !== "ready" && (
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => void connectProvider()}
+                    disabled={!providerClient || Boolean(providerCommand)}
+                  >
+                    {providerLifecycle?.status === "expired" || providerLifecycle?.status === "revoked"
+                      ? "Reconnect"
+                      : "Connect"}
+                  </button>
+                )}
+                {providerLifecycle?.status === "ready" && (
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => void revokeProvider()}
+                    disabled={Boolean(providerCommand)}
+                  >
+                    Revoke securely
+                  </button>
+                )}
+              </div>
+            </section>
+          </div>
         </aside>
 
         <section className="reactor-zone">
           <div className={`reactor ${state} ${activeOperation ? "engaged" : ""}`}>
-            <div className="orbit orbit-one"><i /><i /><i /></div>
-            <div className="orbit orbit-two"><i /><i /><i /><i /></div>
+            <div className="orbit orbit-one"><i /><i /><i /><i /><i /></div>
+            <div className="orbit orbit-two"><i /><i /><i /><i /><i /><i /></div>
+            <div className="orbit orbit-three"><i /><i /><i /><i /><i /><i /><i /></div>
             <button
+              ref={reactorCoreRef}
               className="reactor-core"
               onClick={state === "dormant" ? () => void sendText("Hey Jarvis") : undefined}
               aria-label={state === "dormant" ? "Wake Jarvis" : `Jarvis is ${state}`}
             >
-              <span className="core-letter">J</span><span className="core-state">{state}</span>
+              <span className="intelligence-core-sigil" aria-hidden="true">
+                <i className="core-neural-ring" />
+                <i className="core-energy-orb" />
+                <i className="core-neural-node core-node-one" />
+                <i className="core-neural-node core-node-two" />
+                <i className="core-neural-node core-node-three" />
+                <i className="core-neural-node core-node-four" />
+                <i className="core-neural-node core-node-five" />
+                <i className="core-neural-node core-node-six" />
+              </span>
+              <span className="core-state">{state}</span>
             </button>
           </div>
           <div className="jarvis-message" aria-live="polite">
@@ -805,6 +1249,22 @@ export default function Home() {
             <button type="submit" disabled={!command.trim() || !session}>Transmit</button>
           </form>
           <div className="voice-toggles">
+            <button
+              type="button"
+              className={`sound-switch ${soundEffectsEnabled ? "enabled" : "disabled"}`}
+              role="switch"
+              aria-checked={soundEffectsEnabled}
+              onClick={() => {
+                const enabled = !soundEffectsEnabled;
+                setSoundEffectsEnabled(enabled);
+                void neuralAudioRef.current?.setEnabled(enabled);
+              }}
+            >
+              <span className="switch-led" aria-hidden="true" />
+              <span>Neural audio</span>
+              <span className="switch-track" aria-hidden="true"><i /></span>
+              <b>{soundEffectsEnabled ? "ON" : "OFF"}</b>
+            </button>
             <label className="voice-toggle">
               <input
                 type="checkbox"
@@ -826,9 +1286,24 @@ export default function Home() {
 
         <aside className="agent-column right-agents">
           <p className="section-label">Debate chamber</p>
-          <AgentCard id="♉" label="Bull" specialty="Constructive advocate" tone="amber" status={agentStates.bull.status} />
-          <AgentCard id="♙" label="Bear" specialty="Risk advocate" tone="rose" status={agentStates.bear.status} />
-          <AgentCard id="J" label="Senior Judge" specialty="Evidence synthesis" tone="cyan" status={agentStates.judge.status} />
+          <div ref={(node) => { debateNodeRefs.current.bull = node; }} className="debate-agent-node node-bull">
+            <AgentCard id="♉" label="Bull" specialty="Constructive advocate" tone="amber" status={agentStates.bull.status} visual={AGENT_VISUALS.bull} />
+            <CommunicationLink agent="bull" status={agentStates.bull.status} direction="bidirectional" label="Bull debate" style={debateLinkGeometry.bull} />
+          </div>
+          <div ref={(node) => { debateNodeRefs.current.bear = node; }} className="debate-agent-node node-bear">
+            <AgentCard id="♙" label="Bear" specialty="Risk advocate" tone="rose" status={agentStates.bear.status} visual={AGENT_VISUALS.bear} />
+            <CommunicationLink agent="bear" status={agentStates.bear.status} direction="bidirectional" label="Bear debate" style={debateLinkGeometry.bear} />
+          </div>
+          <div ref={(node) => { debateNodeRefs.current.judge = node; }} className="debate-agent-node node-judge">
+            <AgentCard id="J" label="Senior Judge" specialty="Evidence synthesis" tone="cyan" status={agentStates.judge.status} visual={AGENT_VISUALS.judge} />
+            <CommunicationLink
+              agent="judge"
+              status={judgeBriefing ? "active" : agentStates.judge.status}
+              direction={judgeBriefing ? "to-jarvis" : "bidirectional"}
+              label={judgeBriefing ? "Verdict" : "Synthesis"}
+              style={debateLinkGeometry.judge}
+            />
+          </div>
         </aside>
       </section>
 

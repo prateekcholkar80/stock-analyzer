@@ -2,7 +2,7 @@ import threading
 import time
 import unittest
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
@@ -15,6 +15,7 @@ warnings.filterwarnings(
 from fastapi.testclient import TestClient
 
 from app.api.http import create_jarvis_http_app
+from app.api.models import ProviderSessionTargetRequest
 from app.api.session_auth import InMemoryBrowserSessionAuthorizer
 from app.conversation.browser import BrowserConversationCoordinator
 from app.conversation.config import JarvisConversationConfig
@@ -26,11 +27,22 @@ from app.exceptions import (
     TTSConfigurationError,
     TTSProviderUnavailableError,
 )
+from app.fundamentals.session_provisioning import (
+    ProviderSessionLifecycle,
+    ProviderSessionRevocationReason,
+    ProviderSessionStatus,
+)
+from app.fundamentals.provider_connections import (
+    InMemoryProviderConnectionRegistry,
+    ProviderConnectionResolutionError,
+)
 from app.models.browser_operations import (
     BrowserOperationOutput,
     BrowserOperationStatus,
 )
 from app.models.interaction import JarvisSwingAnalysisResponse
+from app.models.fundamentals import ProviderConnectionScope
+from app.services.provider_sessions import ProviderSessionCommandError
 from app.models.debate import JudgeFollowUpAnswer
 from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.stt.gateway import Transcription
@@ -118,6 +130,42 @@ class _ApiHandler:
         )
 
 
+class _ProviderSessions:
+    def __init__(self):
+        self.calls = []
+
+    def status(self, *, request):
+        self.calls.append(("status", request))
+        return ProviderSessionLifecycle(
+            connection=request.connection,
+            status=ProviderSessionStatus.UNCONFIGURED,
+            checked_at=request.requested_at,
+        )
+
+    def provision(self, *, request):
+        self.calls.append(("provision", request))
+        return ProviderSessionLifecycle(
+            connection=request.connection,
+            status=ProviderSessionStatus.READY,
+            checked_at=request.requested_at,
+            session_reference_hash="b" * 64,
+            provisioned_at=request.requested_at,
+            expires_at=request.requested_at + timedelta(hours=12),
+        )
+
+    def revoke(self, *, request):
+        self.calls.append(("revoke", request))
+        return ProviderSessionLifecycle(
+            connection=request.connection,
+            status=ProviderSessionStatus.REVOKED,
+            checked_at=request.requested_at,
+            session_reference_hash="b" * 64,
+            provisioned_at=request.requested_at - timedelta(hours=1),
+            revoked_at=request.requested_at,
+            revocation_reason=request.reason,
+        )
+
+
 class JarvisHttpApiTests(unittest.TestCase):
     def setUp(self):
         self.registry = InMemoryBrowserOperationRegistry()
@@ -130,6 +178,23 @@ class JarvisHttpApiTests(unittest.TestCase):
             max_workers=1,
         )
         self.authorizer = InMemoryBrowserSessionAuthorizer()
+        self.provider_sessions = _ProviderSessions()
+        self.resolved_scopes = []
+        self.connection_registry = InMemoryProviderConnectionRegistry()
+        self.connection_registry.register_connection(
+            ProviderConnectionScope(
+                tenant_id="tenant.prateek",
+                provider_connection_id="provider.tijori.prateek",
+                provider="tijori",
+                account_reference_hash="a" * 64,
+            )
+        )
+
+        def resolve_scope(session_id, target: ProviderSessionTargetRequest):
+            self.resolved_scopes.append((session_id, target))
+            return self.connection_registry(session_id, target)
+
+        self.resolve_scope = resolve_scope
         self.conversation = BrowserConversationCoordinator(
             self.runner,
             JarvisConversationConfig(user_name="Prateek"),
@@ -142,6 +207,10 @@ class JarvisHttpApiTests(unittest.TestCase):
             create_jarvis_http_app(
                 self.runner,
                 conversation=self.conversation,
+                provider_sessions=self.provider_sessions,
+                provider_connection_scope_resolver=self.resolve_scope,
+                browser_session_ownership=self.connection_registry,
+                tenant_identity_resolver=lambda request: "tenant.prateek",
                 authorizer=self.authorizer,
                 session_id_factory=lambda: next(session_ids),
                 operation_id_factory=lambda: next(operation_ids),
@@ -169,6 +238,14 @@ class JarvisHttpApiTests(unittest.TestCase):
             "kind": "swing_analysis",
             "input_channel": "text",
             "message": "Analyze Reliance for me",
+        }
+
+    @staticmethod
+    def _provider_target():
+        return {
+            "provider_connection_id": "provider.tijori.prateek",
+            "provider": "tijori",
+            "account_reference_hash": "a" * 64,
         }
 
     def _wait_for_status(self, session_id, token, operation_id, expected):
@@ -231,6 +308,199 @@ class JarvisHttpApiTests(unittest.TestCase):
             self.assertEqual(client.get("/health").status_code, 200)
 
         self.assertEqual(calls, ["shutdown"])
+
+    def test_provider_session_routes_require_browser_authorization(self):
+        session_id, token = self._session()
+        path = f"/api/v1/sessions/{session_id}/provider-session/status"
+
+        missing = self.client.post(path, json={"target": self._provider_target()})
+        authorized = self.client.post(
+            path,
+            json={"target": self._provider_target()},
+            headers=self._headers(token),
+        )
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(authorized.status_code, 200)
+        self.assertEqual(authorized.json()["status"], "unconfigured")
+        self.assertNotIn("tenant.session-1", authorized.text)
+        self.assertNotIn("account_reference_hash", authorized.text)
+        self.assertEqual(self.resolved_scopes[0][0], session_id)
+
+    def test_provider_session_provision_and_revoke_are_typed_and_scoped(self):
+        session_id, token = self._session()
+        base = f"/api/v1/sessions/{session_id}/provider-session"
+        headers = self._headers(token)
+        provision = self.client.post(
+            f"{base}/provision",
+            json={
+                "idempotency_key": "provider.provision.1",
+                "target": self._provider_target(),
+                "user_interaction_authorized": True,
+            },
+            headers=headers,
+        )
+        revoke = self.client.post(
+            f"{base}/revoke",
+            json={
+                "idempotency_key": "provider.revoke.1",
+                "target": self._provider_target(),
+                "reason": "user_requested",
+            },
+            headers=headers,
+        )
+        insecure = self.client.post(
+            f"{base}/revoke",
+            json={
+                "idempotency_key": "provider.revoke.insecure",
+                "target": self._provider_target(),
+                "reason": "user_requested",
+                "secure_delete_required": False,
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(provision.status_code, 200)
+        self.assertEqual(provision.json()["status"], "ready")
+        self.assertEqual(revoke.status_code, 200)
+        self.assertEqual(revoke.json()["status"], "revoked")
+        self.assertEqual(insecure.status_code, 422)
+        provision_request = self.provider_sessions.calls[0][1]
+        revoke_request = self.provider_sessions.calls[1][1]
+        self.assertTrue(provision_request.user_interaction_authorized)
+        self.assertTrue(revoke_request.secure_delete_required)
+        self.assertEqual(
+            revoke_request.reason,
+            ProviderSessionRevocationReason.USER_REQUESTED,
+        )
+        self.assertEqual(
+            provision_request.connection.tenant_id,
+            "tenant.prateek",
+        )
+
+    def test_browser_session_close_removes_provider_connection_access(self):
+        session_id, token = self._session()
+        headers = self._headers(token)
+        target = ProviderSessionTargetRequest(**self._provider_target())
+        self.assertEqual(
+            self.connection_registry(session_id, target).tenant_id,
+            "tenant.prateek",
+        )
+
+        closed = self.client.delete(
+            f"/api/v1/sessions/{session_id}",
+            headers=headers,
+        )
+
+        self.assertEqual(closed.status_code, 200)
+        with self.assertRaises(ProviderConnectionResolutionError):
+            self.connection_registry(session_id, target)
+
+    def test_provider_scope_mismatch_and_command_failure_do_not_disclose(self):
+        session_id, token = self._session()
+        path = f"/api/v1/sessions/{session_id}/provider-session/status"
+        headers = self._headers(token)
+
+        def mismatched_scope(session_id, target):
+            return ProviderConnectionScope(
+                tenant_id="tenant.other",
+                provider_connection_id="provider.other",
+                provider=target.provider,
+                account_reference_hash=target.account_reference_hash,
+            )
+
+        mismatch_client = TestClient(
+            create_jarvis_http_app(
+                self.runner,
+                provider_sessions=self.provider_sessions,
+                provider_connection_scope_resolver=mismatched_scope,
+                authorizer=self.authorizer,
+            )
+        )
+        mismatch = mismatch_client.post(
+            path,
+            json={"target": self._provider_target()},
+            headers=headers,
+        )
+        original_status = self.provider_sessions.status
+        self.provider_sessions.status = lambda *, request: (
+            _ for _ in ()
+        ).throw(ProviderSessionCommandError())
+        failed = self.client.post(
+            path,
+            json={"target": self._provider_target()},
+            headers=headers,
+        )
+        self.provider_sessions.status = original_status
+
+        self.assertEqual(mismatch.status_code, 404)
+        self.assertNotIn("tenant.other", mismatch.text)
+        self.assertEqual(failed.status_code, 502)
+        self.assertNotIn("session-secret", failed.text)
+
+    def test_provider_session_dependencies_must_be_supplied_together(self):
+        with self.assertRaises(ValueError):
+            create_jarvis_http_app(
+                self.runner,
+                provider_sessions=self.provider_sessions,
+            )
+        with self.assertRaises(ValueError):
+            create_jarvis_http_app(
+                self.runner,
+                browser_session_ownership=self.connection_registry,
+            )
+
+    def test_tenant_identity_failure_does_not_create_browser_session(self):
+        failing_authorizer = InMemoryBrowserSessionAuthorizer()
+        app = create_jarvis_http_app(
+            self.runner,
+            browser_session_ownership=self.connection_registry,
+            tenant_identity_resolver=lambda request: (_ for _ in ()).throw(
+                RuntimeError("identity-secret")
+            ),
+            authorizer=failing_authorizer,
+            session_id_factory=lambda: "session-identity-failure",
+        )
+
+        response = TestClient(app).post("/api/v1/sessions")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("identity-secret", response.text)
+        self.assertIsNone(self.runner.get_session("session-identity-failure"))
+
+    def test_close_revokes_access_even_when_ownership_unbind_fails(self):
+        class FailingUnbindRegistry:
+            def bind_browser_session(self, *, browser_session_id, tenant_id):
+                return None
+
+            def unbind_browser_session(self, browser_session_id):
+                raise RuntimeError("ownership-secret")
+
+        authorizer = InMemoryBrowserSessionAuthorizer()
+        client = TestClient(
+            create_jarvis_http_app(
+                self.runner,
+                browser_session_ownership=FailingUnbindRegistry(),
+                tenant_identity_resolver=lambda request: "tenant.prateek",
+                authorizer=authorizer,
+                session_id_factory=lambda: "session-unbind-failure",
+            )
+        )
+        opened = client.post("/api/v1/sessions").json()
+        headers = self._headers(opened["access_token"])
+
+        closed = client.delete(
+            "/api/v1/sessions/session-unbind-failure",
+            headers=headers,
+        )
+        retried = client.get(
+            "/api/v1/sessions/session-unbind-failure/operations/unknown",
+            headers=headers,
+        )
+
+        self.assertEqual(closed.status_code, 503)
+        self.assertNotIn("ownership-secret", closed.text)
+        self.assertEqual(retried.status_code, 401)
 
     def test_submit_is_idempotent_and_result_and_events_are_retrievable(self):
         session_id, token = self._session()

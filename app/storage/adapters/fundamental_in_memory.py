@@ -108,6 +108,51 @@ class InMemoryFundamentalSnapshotRepository:
                 )
             return self._save_locked(value)
 
+    def replace_fundamental_snapshot(
+        self,
+        stored: StoredFundamentalSnapshot,
+        *,
+        scope: FundamentalRepositoryScope,
+    ) -> StoredFundamentalSnapshot:
+        """Atomically install newer evidence for one exactly scoped key.
+
+        This operation exists for an explicit provider refresh. It preserves
+        the active entry when validation or freshness checks fail, and inserts
+        normally when expiry cleanup has already removed the prior entry.
+        """
+
+        value = StoredFundamentalSnapshot.model_validate(stored)
+        caller_scope = FundamentalRepositoryScope.model_validate(scope)
+        now = self._now()
+        with self._lock:
+            self._purge_expired_locked(as_of=now)
+            if value.cache_key.repository_scope != caller_scope:
+                raise StorageError(
+                    "fundamental replacement scope does not match cache key"
+                )
+            if value.stored_at > now:
+                raise StorageError(
+                    "fundamental snapshot storage time is in the future"
+                )
+            if value.is_expired(as_of=now):
+                raise StorageError(
+                    "expired fundamental snapshot cannot be saved"
+                )
+
+            cache_entry_id = value.cache_key.cache_entry_id
+            existing = self._entries.get(cache_entry_id)
+            if existing is None:
+                self._entries[cache_entry_id] = _copy(value)
+                return _copy(value)
+            if existing.storage_fingerprint == value.storage_fingerprint:
+                return _copy(existing)
+            if value.retrieved_at <= existing.retrieved_at:
+                raise StorageConflictError(
+                    "fundamental replacement is not newer than cached data"
+                )
+            self._entries[cache_entry_id] = _copy(value)
+            return _copy(value)
+
     def get_fundamental_snapshot(
         self,
         key: FundamentalSnapshotCacheKey,

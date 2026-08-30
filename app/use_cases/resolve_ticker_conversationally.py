@@ -103,6 +103,14 @@ class ResolveTickerConversationally:
         )
         if not shortlist:
             return TickerConversationalResolutionResult(outcome="not_found")
+        if len(shortlist) == 1:
+            candidate = shortlist[0].instrument
+            return TickerConversationalResolutionResult(
+                outcome="resolved_needs_confirmation",
+                chosen_symbol=candidate.symbol,
+                exchange=intent.exchange,
+                candidate_display_names=(candidate.display_name,),
+            )
 
         choice = resolve_via_llm(
             gateway=self._resolver_gateway,

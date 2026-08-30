@@ -35,6 +35,15 @@ def _relaxo():
     )
 
 
+def _torrent_pharma():
+    return ResolvedInstrument(
+        exchange="NSE",
+        symbol_token="3518",
+        symbol="TORNTPHARM-EQ",
+        display_name="TORNTPHARM",
+    )
+
+
 class FakeAngelIdentitySource:
     def __init__(self, instruments):
         self.instruments = tuple(instruments)
@@ -80,6 +89,24 @@ def _valid_amfi_payload():
     buffer = io.BytesIO()
     frame.to_excel(buffer, index=False, engine="openpyxl")
     return buffer.getvalue()
+
+
+def _torrent_amfi_catalog(tmp_path):
+    frame = pd.DataFrame(
+        {
+            "Sr No": [1],
+            "Company Name": ["Torrent Pharmaceuticals Limited"],
+            "NSE Symbol": ["TORNTPHARM"],
+            "Category": ["Large Cap"],
+        }
+    )
+    buffer = io.BytesIO()
+    frame.to_excel(buffer, index=False, engine="openpyxl")
+    payload = buffer.getvalue()
+    return AmfiMarketCapCatalog(
+        AmfiMarketCapConfig(cache_path=tmp_path / "torrent-amfi.json"),
+        downloader=lambda *a: payload,
+    )
 
 
 def _valid_nse_payload():
@@ -146,6 +173,25 @@ class ResolveTickerConversationallyTests(unittest.TestCase):
         self.assertEqual(result.outcome, "resolved_needs_confirmation")
         self.assertEqual(result.chosen_symbol, "RELIANCE-EQ")
         self.assertEqual(result.exchange, "NSE")
+
+    def test_resolves_unique_torrent_pharma_candidate_without_an_llm_call(self):
+        gateway = FakeGateway(
+            [{"chosen_symbols": ("TORNTPHARM-EQ",), "is_ambiguous": False}]
+        )
+        use_case = ResolveTickerConversationally(
+            interpreter=self.interpreter,
+            angel_identity_source=FakeAngelIdentitySource((_torrent_pharma(),)),
+            amfi_catalog=_torrent_amfi_catalog(self.tmp_path),
+            nse_sector_catalog=self.nse_catalog,
+            resolver_gateway=gateway,
+        )
+
+        result = use_case.attempt("Analyze Torrent Pharma for me")
+
+        self.assertEqual(result.outcome, "resolved_needs_confirmation")
+        self.assertEqual(result.chosen_symbol, "TORNTPHARM-EQ")
+        self.assertEqual(result.exchange, "NSE")
+        self.assertEqual(gateway.calls, [])
 
     def test_ambiguous_when_llm_cannot_decide(self):
         use_case = self._use_case(

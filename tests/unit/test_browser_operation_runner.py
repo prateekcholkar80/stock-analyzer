@@ -1,7 +1,8 @@
 import threading
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from app.exceptions import IntentRecognitionError, MarketDataError
@@ -18,6 +19,15 @@ from app.models.conversation import InputChannel
 from app.models.interaction import JarvisSwingAnalysisResponse
 from app.models.llm import JarvisLLMFailureResponse, LLMFailureCode
 from app.models.workflow import WorkflowEventState, WorkflowStage
+from app.services.fundamental_cache_policy import FundamentalCachePolicy
+from app.services.fundamental_evidence import (
+    FundamentalEvidenceLoadResult,
+    FundamentalEvidenceSource,
+)
+from app.storage.adapters.fundamental_in_memory import (
+    InMemoryFundamentalSnapshotRepository,
+)
+from app.services.fundamental_evidence import FundamentalEvidenceCoordinator
 from app.workflow.browser_runner import (
     AsyncBrowserOperationRunner,
     BrowserOperationHandledFailure,
@@ -31,6 +41,14 @@ from tests.unit.test_jarvis_conversation import (
     _completed_response,
     _multi_timeframe_response,
 )
+from tests.unit.test_fundamental_in_memory_repository import (
+    MutableClock,
+    build_entry,
+)
+from tests.unit.test_fundamental_evidence_coordinator import (
+    FakeFundamentalGateway,
+)
+from tests.unit.test_fundamental_gateway import build_connection
 
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -38,6 +56,33 @@ IST = ZoneInfo("Asia/Kolkata")
 
 def _now():
     return datetime.now(IST)
+
+
+class _AdvancingClock:
+    def __init__(self):
+        self.now = _now()
+
+    def __call__(self):
+        self.now += timedelta(seconds=3)
+        return self.now
+
+
+def _completed_response_with_series():
+    response = _completed_response()
+    result = response.result.model_copy(
+        update={
+            "fetch": SimpleNamespace(
+                stored=SimpleNamespace(
+                    series=SimpleNamespace(
+                        exchange="NSE",
+                        symbol="TCS-EQ",
+                        candles=(),
+                    )
+                )
+            )
+        }
+    )
+    return response.model_copy(update={"result": result})
 
 
 def _request(
@@ -118,6 +163,22 @@ class _SimpleHandler:
 
 
 class BrowserOperationOutputTests(unittest.TestCase):
+    @staticmethod
+    def _cached_fundamental_result():
+        stored = build_entry()
+        clock = MutableClock(stored.stored_at)
+        repository = InMemoryFundamentalSnapshotRepository(clock=clock)
+        repository.save_fundamental_snapshot(stored)
+        decision = FundamentalCachePolicy(repository, clock=clock).decide(
+            stored.request
+        )
+        return FundamentalEvidenceLoadResult(
+            source=FundamentalEvidenceSource.CACHE,
+            decision=decision,
+            retrieval=stored.retrieval,
+            stored_snapshot=stored,
+        )
+
     def test_requires_kind_specific_payload(self):
         response = _completed_response()
         explanation = RecordingPresenter().explain(
@@ -148,8 +209,172 @@ class BrowserOperationOutputTests(unittest.TestCase):
                 ),
             )
 
+    def test_swing_output_retains_unique_fundamental_evidence(self):
+        response = _completed_response()
+        explanation = RecordingPresenter().explain(
+            response.result,
+            user_name="Prateek",
+        )
+        fundamental = self._cached_fundamental_result()
+
+        output = BrowserOperationOutput(
+            operation_id="operation-1",
+            session_id="session-1",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            completed_at=_now(),
+            research_response=response,
+            research_explanation=explanation,
+            fundamental_evidence=(fundamental,),
+        )
+
+        self.assertEqual(output.fundamental_evidence, (fundamental,))
+        with self.assertRaisesRegex(ValueError, "capabilities must be unique"):
+            BrowserOperationOutput(
+                operation_id="operation-1",
+                session_id="session-1",
+                kind=BrowserOperationKind.SWING_ANALYSIS,
+                completed_at=_now(),
+                research_response=response,
+                research_explanation=explanation,
+                fundamental_evidence=(fundamental, fundamental),
+            )
+
 
 class JarvisBrowserOperationHandlerTests(unittest.TestCase):
+    def test_technical_only_analysis_never_invokes_fundamental_executor(self):
+        gateway = FakeFundamentalGateway()
+        repository = InMemoryFundamentalSnapshotRepository()
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=gateway,
+            repository=repository,
+        )
+        handler = JarvisBrowserOperationHandler(
+            _ResearchExecutor(_completed_response()),
+            RecordingPresenter(),
+            RecordingJudgeFollowUpExecutor(),
+            user_name="Prateek",
+            fundamental_evidence_executor=coordinator,
+            provider_scope_resolver=lambda session_id: build_connection(),
+        )
+        from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
+        from app.workflow.browser_runner import BrowserCancellationToken
+
+        output = handler.execute(
+            _request(),
+            event_emitter=WorkflowEventEmitter(
+                "operation-1",
+                InMemoryWorkflowEventSink(),
+            ),
+            cancellation_token=BrowserCancellationToken(),
+        )
+
+        self.assertEqual(gateway.calls, [])
+        self.assertEqual(output.fundamental_evidence, ())
+
+    def test_requested_fundamentals_dispatch_all_capabilities_and_retain_results(self):
+        clock = _AdvancingClock()
+        gateway = FakeFundamentalGateway()
+        repository = InMemoryFundamentalSnapshotRepository(clock=clock)
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=gateway,
+            repository=repository,
+            clock=clock,
+        )
+        handler = JarvisBrowserOperationHandler(
+            _ResearchExecutor(_completed_response_with_series()),
+            RecordingPresenter(),
+            RecordingJudgeFollowUpExecutor(),
+            user_name="Prateek",
+            fundamental_evidence_executor=coordinator,
+            provider_scope_resolver=lambda session_id: build_connection(),
+            clock=clock,
+        )
+        from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
+        from app.workflow.browser_runner import BrowserCancellationToken
+        request = _request().model_copy(
+            update={
+                "fundamentals_requested": True,
+                "refresh_requested": True,
+            }
+        )
+
+        output = handler.execute(
+            request,
+            event_emitter=WorkflowEventEmitter(
+                "operation-1",
+                InMemoryWorkflowEventSink(),
+            ),
+            cancellation_token=BrowserCancellationToken(),
+        )
+
+        self.assertEqual(
+            gateway.calls,
+            [
+                "resolve_issuer",
+                "overview",
+                "financials",
+                "shareholding",
+            ],
+        )
+        self.assertEqual(len(output.fundamental_evidence), 3)
+        self.assertTrue(
+            all(
+                item.decision.reason == "explicit_refresh"
+                for item in output.fundamental_evidence
+            )
+        )
+
+    def test_repeated_fundamental_analysis_reuses_identity_and_evidence_cache(self):
+        clock = _AdvancingClock()
+        gateway = FakeFundamentalGateway()
+        repository = InMemoryFundamentalSnapshotRepository(clock=clock)
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=gateway,
+            repository=repository,
+            clock=clock,
+        )
+        handler = JarvisBrowserOperationHandler(
+            _ResearchExecutor(_completed_response_with_series()),
+            RecordingPresenter(),
+            RecordingJudgeFollowUpExecutor(),
+            user_name="Prateek",
+            fundamental_evidence_executor=coordinator,
+            provider_scope_resolver=lambda session_id: build_connection(),
+            clock=clock,
+        )
+        from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
+        from app.workflow.browser_runner import BrowserCancellationToken
+        request = _request().model_copy(
+            update={"fundamentals_requested": True}
+        )
+
+        first = handler.execute(
+            request,
+            event_emitter=WorkflowEventEmitter(
+                "operation-1",
+                InMemoryWorkflowEventSink(),
+            ),
+            cancellation_token=BrowserCancellationToken(),
+        )
+        gateway.calls.clear()
+        second = handler.execute(
+            request,
+            event_emitter=WorkflowEventEmitter(
+                "operation-1",
+                InMemoryWorkflowEventSink(),
+            ),
+            cancellation_token=BrowserCancellationToken(),
+        )
+
+        self.assertEqual(len(first.fundamental_evidence), 3)
+        self.assertEqual(gateway.calls, [])
+        self.assertTrue(
+            all(
+                item.source is FundamentalEvidenceSource.CACHE
+                for item in second.fundamental_evidence
+            )
+        )
+
     def test_intent_failure_becomes_candid_safe_browser_failure(self):
         handler = JarvisBrowserOperationHandler(
             _ResearchExecutor(

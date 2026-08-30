@@ -19,7 +19,9 @@ class FundamentalSnapshotRepository(Protocol):
     Implementations must purge expired entries opportunistically before reads
     and writes. Expired rows must never be returned, even when physical purge
     has not yet completed. Saving identical content is idempotent; saving
-    different content under the same cache key must raise StorageConflictError.
+    different content under the same cache key must raise StorageConflictError
+    unless the caller uses the explicitly scoped atomic replacement operation
+    with evidence retrieved later than the active row.
     """
 
     @property
@@ -32,6 +34,20 @@ class FundamentalSnapshotRepository(Protocol):
         stored: StoredFundamentalSnapshot,
     ) -> StoredFundamentalSnapshot:
         """Save an unexpired snapshot or return its identical existing row."""
+        ...
+
+    def replace_fundamental_snapshot(
+        self,
+        stored: StoredFundamentalSnapshot,
+        *,
+        scope: FundamentalRepositoryScope,
+    ) -> StoredFundamentalSnapshot:
+        """Atomically replace one scoped row with strictly newer evidence.
+
+        Implementations must preserve the active row if validation,
+        authorization, freshness, or persistence fails. When no active row
+        remains after expiry cleanup, the new row may be inserted.
+        """
         ...
 
     def get_fundamental_snapshot(

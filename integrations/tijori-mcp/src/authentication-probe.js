@@ -1,3 +1,5 @@
+import { verifyPersistedAuthenticatedSession } from './authentication-transition.js';
+
 const PROBE_URL = 'https://www.tijorifinance.com/';
 const ALLOWED_HOST = 'tijorifinance.com';
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -26,13 +28,19 @@ const CHALLENGE_SELECTOR = [
 
 export async function probeAuthentication(
   browserRunner,
-  { timeoutMs = DEFAULT_TIMEOUT_MS } = {},
+  {
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    persistedSessionVerifier = verifyPersistedAuthenticatedSession,
+  } = {},
 ) {
   if (browserRunner === null || typeof browserRunner?.run !== 'function') {
     throw new TypeError('Authentication probe requires a browser runner');
   }
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 30_000) {
     throw new TypeError('Authentication probe timeout is outside safe bounds');
+  }
+  if (typeof persistedSessionVerifier !== 'function') {
+    throw new TypeError('Authentication probe requires a persisted-session verifier');
   }
 
   try {
@@ -57,15 +65,22 @@ export async function probeAuthentication(
         return 'authentication_required';
       }
 
-      const [challengeCount, loginCount, authenticatedCount] = await Promise.all([
-        boundedCount(page, CHALLENGE_SELECTOR),
-        boundedCount(page, LOGIN_SELECTOR),
-        boundedCount(page, AUTHENTICATED_SELECTOR),
+      const [challengeCount, visibleLoginCount, visibleAuthenticatedCount] = await Promise.all([
+        boundedVisibleCount(page, CHALLENGE_SELECTOR),
+        boundedVisibleCount(page, LOGIN_SELECTOR),
+        boundedVisibleCount(page, AUTHENTICATED_SELECTOR),
       ]);
       if (challengeCount > 0) return 'unavailable';
-      if (loginCount > 0) return 'authentication_required';
-      if (authenticatedCount > 0) return 'authenticated';
-      return 'unavailable';
+      if (visibleLoginCount > 0) return 'authentication_required';
+      if (visibleAuthenticatedCount > 0) return 'authenticated';
+      const persistedResult = await persistedSessionVerifier({
+        page,
+        context: page.context(),
+      });
+      return persistedResult?.authenticated === true
+        && persistedResult.status === 'authenticated'
+        ? 'authenticated'
+        : 'unavailable';
     });
     return probeResult(status);
   } catch {
@@ -93,9 +108,15 @@ function safeUrl(value) {
   }
 }
 
-async function boundedCount(page, selector) {
-  const count = await page.locator(selector).count();
-  return Number.isInteger(count) && count >= 0 ? Math.min(count, 100) : 0;
+async function boundedVisibleCount(page, selector) {
+  const locator = page.locator(selector);
+  const count = await locator.count();
+  if (!Number.isInteger(count) || count < 0) return 0;
+  const bounded = Math.min(count, 100);
+  const visibility = await Promise.all(
+    Array.from({ length: bounded }, (_, index) => locator.nth(index).isVisible()),
+  );
+  return visibility.filter((visible) => visible === true).length;
 }
 
 function probeResult(status) {

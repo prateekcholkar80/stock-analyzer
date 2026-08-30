@@ -12,6 +12,7 @@ from app.models.presentation import (
     JarvisResearchExplanation,
 )
 from app.models.technical import TechnicalModel
+from app.services.fundamental_evidence import FundamentalEvidenceLoadResult
 from app.models.workflow import JarvisWorkflowEvent
 
 
@@ -106,6 +107,8 @@ class BrowserOperationRequest(TechnicalModel):
     kind: BrowserOperationKind
     input_channel: InputChannel
     message: str = Field(min_length=1, max_length=2_000)
+    fundamentals_requested: bool = False
+    refresh_requested: bool = False
     requested_at: datetime
 
     @field_validator("message")
@@ -123,6 +126,14 @@ class BrowserOperationRequest(TechnicalModel):
             raise ValueError("browser operation request time must be in IST")
         return value
 
+    @model_validator(mode="after")
+    def require_fundamentals_for_refresh(self) -> Self:
+        if self.refresh_requested and not self.fundamentals_requested:
+            raise ValueError(
+                "fundamental refresh requires fundamental research"
+            )
+        return self
+
     @property
     def idempotent_payload(self) -> tuple[object, ...]:
         return (
@@ -131,6 +142,8 @@ class BrowserOperationRequest(TechnicalModel):
             self.kind,
             self.input_channel,
             self.message,
+            self.fundamentals_requested,
+            self.refresh_requested,
         )
 
 
@@ -244,6 +257,10 @@ class BrowserOperationOutput(TechnicalModel):
     ) = None
     judge_follow_up: JudgeFollowUpAnswer | None = None
     presentation_failure: BrowserOperationFailure | None = None
+    fundamental_evidence: tuple[FundamentalEvidenceLoadResult, ...] = Field(
+        default=(),
+        max_length=3,
+    )
 
     @field_validator("completed_at")
     @classmethod
@@ -270,6 +287,13 @@ class BrowserOperationOutput(TechnicalModel):
                 )
             if self.judge_follow_up is not None:
                 raise ValueError("swing output cannot contain a follow-up")
+            capabilities = tuple(
+                item.retrieval.capability for item in self.fundamental_evidence
+            )
+            if len(capabilities) != len(set(capabilities)):
+                raise ValueError(
+                    "swing output fundamental capabilities must be unique"
+                )
         else:
             if self.judge_follow_up is None:
                 raise ValueError("follow-up output requires a Judge answer")
@@ -283,6 +307,10 @@ class BrowserOperationOutput(TechnicalModel):
             ):
                 raise ValueError(
                     "follow-up output cannot contain swing-analysis fields"
+                )
+            if self.fundamental_evidence:
+                raise ValueError(
+                    "follow-up output cannot contain fundamental evidence"
                 )
         return self
 

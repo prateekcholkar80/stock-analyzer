@@ -20,6 +20,7 @@ from app.exceptions import (
     BrowserOperationConflictError,
     BrowserSessionNotFoundError,
 )
+from app.intents.fundamentals import FundamentalRefreshIntentInterpreter
 from app.models.browser_conversation import (
     BrowserConversationSnapshot,
     BrowserConversationTurn,
@@ -144,6 +145,7 @@ class BrowserConversationCoordinator:
         self._config = config
         self._wake_detector = detector
         self._ticker_resolution_executor = ticker_resolution_executor
+        self._fundamental_intent = FundamentalRefreshIntentInterpreter()
         self._records: dict[str, _ConversationRecord] = {}
         self._lock = RLock()
 
@@ -331,13 +333,19 @@ class BrowserConversationCoordinator:
                     input_channel=utterance.channel,
                 )
 
+            fundamental_routing = self._fundamental_intent.interpret(command)
+            dispatch_command = fundamental_routing.research_text or command
             return self._dispatch(
                 record,
                 utterance,
                 key,
                 operation_id_factory,
                 at,
-                command,
+                dispatch_command,
+                fundamentals_requested=(
+                    fundamental_routing.fundamentals_requested
+                ),
+                refresh_requested=fundamental_routing.refresh_requested,
             )
 
     def _dispatch(
@@ -348,6 +356,9 @@ class BrowserConversationCoordinator:
         operation_id_factory: Callable[[], str],
         at: datetime,
         command: str,
+        *,
+        fundamentals_requested: bool,
+        refresh_requested: bool,
     ) -> BrowserConversationTurn:
         """Submit a resolved command as a new operation. Called while
         holding self._lock, either from handle() for a fresh command or
@@ -368,6 +379,8 @@ class BrowserConversationCoordinator:
                 kind=kind,
                 input_channel=utterance.channel,
                 message=command,
+                fundamentals_requested=fundamentals_requested,
+                refresh_requested=refresh_requested,
                 requested_at=at,
             )
         )
@@ -456,6 +469,8 @@ class BrowserConversationCoordinator:
             operation_id_factory,
             at,
             command,
+            fundamentals_requested=pending.fundamentals_requested,
+            refresh_requested=pending.refresh_requested,
         )
 
     def sleep(
@@ -620,6 +635,10 @@ class BrowserConversationCoordinator:
                 original_command=command,
                 chosen_symbol=result.chosen_symbol,
                 exchange=result.exchange,
+                fundamentals_requested=(
+                    operation.request.fundamentals_requested
+                ),
+                refresh_requested=operation.request.refresh_requested,
             )
             message = f'Did you mean "{result.chosen_symbol}"? Reply yes or no.'
             self._transition_locked(
@@ -643,6 +662,8 @@ class BrowserConversationCoordinator:
         record.pending_confirmation = PendingConfirmation(
             kind="catalog_refresh",
             original_command=command,
+            fundamentals_requested=operation.request.fundamentals_requested,
+            refresh_requested=operation.request.refresh_requested,
         )
         message = (
             "I'm having trouble matching that company against my "

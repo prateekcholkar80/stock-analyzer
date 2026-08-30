@@ -62,6 +62,36 @@ def _request(
 
 
 class BrowserOperationModelTests(unittest.TestCase):
+    def test_fundamental_routing_flags_are_strict_and_idempotent(self):
+        technical = _request()
+        fundamentals = technical.model_copy(
+            update={"fundamentals_requested": True}
+        )
+        refresh = technical.model_copy(
+            update={
+                "fundamentals_requested": True,
+                "refresh_requested": True,
+            }
+        )
+
+        self.assertFalse(technical.fundamentals_requested)
+        self.assertFalse(technical.refresh_requested)
+        self.assertNotEqual(
+            technical.idempotent_payload,
+            fundamentals.idempotent_payload,
+        )
+        self.assertNotEqual(
+            fundamentals.idempotent_payload,
+            refresh.idempotent_payload,
+        )
+        with self.assertRaisesRegex(ValidationError, "requires fundamental"):
+            BrowserOperationRequest(
+                **technical.model_dump(
+                    exclude={"schema_version", "refresh_requested"}
+                ),
+                refresh_requested=True,
+            )
+
     def test_rejects_non_ist_and_inconsistent_terminal_payloads(self):
         with self.assertRaisesRegex(ValidationError, "must be in IST"):
             _session(at=datetime(2026, 8, 23, 9, 0))
