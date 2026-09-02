@@ -47,6 +47,14 @@ import {
 } from "@/lib/provider-session";
 import { AGENT_VISUALS, type AgentVisualSpec } from "@/lib/agent-visuals";
 import { NeuralAudioEngine } from "@/lib/neural-audio";
+import {
+  fetchBenchmarkingFinancials,
+  fetchStructuredFinancialDocument,
+  type BenchmarkingFinancialsDocumentResponse,
+  type BenchmarkingFinancialsReference,
+  type StructuredDocumentReference,
+  type StructuredFinancialDocumentResponse,
+} from "@/lib/financial-documents";
 
 import {
   MATRIX_STEPS,
@@ -98,8 +106,16 @@ type OperationTerminal = {
 type OperationStatus = "standby" | "queued" | "running" | "completed" | "failed" | "cancelled";
 type AgentTone = "cyan" | "amber" | "rose" | "violet";
 type CreatedSession = { session: Session; access_token: string };
+type OperationResultResponse = {
+  schema_version: "jarvis.http_operation_result.v1";
+  output: {
+    structured_document_references?: StructuredDocumentReference[];
+    benchmarking_financials_reference?: BenchmarkingFinancialsReference | null;
+  } | null;
+};
 
 const API_BASE = process.env.NEXT_PUBLIC_JARVIS_API_URL?.replace(/\/$/, "") ?? "http://127.0.0.1:8000";
+const SESSION_BOOTSTRAP_RETRY_MS = 2_000;
 const TIJORI_CONNECTION_ID = process.env.NEXT_PUBLIC_JARVIS_TIJORI_CONNECTION_ID?.trim() ?? "";
 const TIJORI_ACCOUNT_REFERENCE_HASH = process.env.NEXT_PUBLIC_JARVIS_TIJORI_ACCOUNT_REFERENCE_HASH?.trim() || null;
 const TIJORI_TARGET: ProviderSessionTarget | null = TIJORI_CONNECTION_ID
@@ -113,6 +129,14 @@ const RECOVERABLE_INSTRUMENT_FAILURES = new Set([
   "instrument.not_found",
   "instrument.ambiguous",
 ]);
+const FINANCIAL_DOCUMENT_LABELS: Record<StructuredDocumentReference["document_type"], string> = {
+  growth_table: "Growth table",
+  balance_sheet: "Balance sheet",
+  profit_and_loss: "Profit & loss",
+  cash_flow: "Cash flow",
+  ratios: "Ratios",
+  quarterly_results: "Quarterly results",
+};
 
 function requestId() {
   return `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -367,6 +391,12 @@ export default function Home() {
   const [displayOperation, setDisplayOperation] = useState<string | null>(null);
   const [operationStatus, setOperationStatus] = useState<OperationStatus>("standby");
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
+  const [structuredDocuments, setStructuredDocuments] = useState<StructuredDocumentReference[]>([]);
+  const [benchmarkingReference, setBenchmarkingReference] = useState<BenchmarkingFinancialsReference | null>(null);
+  const [selectedFinancialDocument, setSelectedFinancialDocument] = useState<StructuredFinancialDocumentResponse | null>(null);
+  const [selectedBenchmarking, setSelectedBenchmarking] = useState<BenchmarkingFinancialsDocumentResponse | null>(null);
+  const [financialDocumentLoading, setFinancialDocumentLoading] = useState<string | null>(null);
+  const [financialDocumentError, setFinancialDocumentError] = useState<string | null>(null);
   const [notice, setNotice] = useState("Establishing secure research link…");
   const [error, setError] = useState<string | null>(null);
   const [istClock, setIstClock] = useState("--:--");
@@ -633,6 +663,9 @@ export default function Home() {
   useEffect(() => {
     let disposed = false;
     let created: CreatedSession | null = null;
+    let bootstrapInFlight = false;
+    let bootstrapAttempts = 0;
+    let bootstrapRetry: number | null = null;
 
     const closeCreatedSession = (value: CreatedSession | null) => {
       if (!value) return;
@@ -655,36 +688,58 @@ export default function Home() {
 
     window.addEventListener("pagehide", handlePageHide);
     window.addEventListener("pageshow", handlePageShow);
-    fetch(`${API_BASE}/api/v1/sessions`, { method: "POST" })
-      .then(async (response) => {
-        if (!response.ok) throw new Error("Jarvis research core is offline.");
-        return response.json() as Promise<CreatedSession>;
-      })
-      .then((body) => {
-        if (disposed) {
-          closeCreatedSession(body);
-          return;
-        }
-        created = body;
-        setSession(body.session);
-        setToken(body.access_token);
-        setConversation({
-          session_id: body.session.session_id,
-          state: "dormant",
-          active_operation_id: null,
-          display_message: "Jarvis is in standby.",
-          spoken_message: null,
+
+    const bootstrapSession = () => {
+      if (disposed || created || bootstrapInFlight) return;
+      bootstrapInFlight = true;
+      bootstrapAttempts += 1;
+      if (bootstrapAttempts > 1) {
+        setNotice("Re-establishing secure research link…");
+      }
+      void fetch(`${API_BASE}/api/v1/sessions`, { method: "POST" })
+        .then(async (response) => {
+          if (!response.ok) throw new Error("Jarvis research core is offline.");
+          return response.json() as Promise<CreatedSession>;
+        })
+        .then((body) => {
+          if (disposed) {
+            closeCreatedSession(body);
+            return;
+          }
+          created = body;
+          setSession(body.session);
+          setToken(body.access_token);
+          setConversation({
+            session_id: body.session.session_id,
+            state: "dormant",
+            active_operation_id: null,
+            display_message: "Jarvis is in standby.",
+            spoken_message: null,
+          });
+          setError(null);
+          setNotice("Neural link secure. Wake phrase required.");
+        })
+        .catch((reason) => {
+          if (!disposed) {
+            setError(reason instanceof Error ? reason.message : "Jarvis is offline.");
+            setNotice("Research core unavailable · retrying automatically");
+          }
+        })
+        .finally(() => {
+          bootstrapInFlight = false;
+          if (!disposed && !created) {
+            bootstrapRetry = window.setTimeout(
+              bootstrapSession,
+              SESSION_BOOTSTRAP_RETRY_MS,
+            );
+          }
         });
-        setNotice("Neural link secure. Wake phrase required.");
-      })
-      .catch((reason) => {
-        if (!disposed) {
-          setError(reason instanceof Error ? reason.message : "Jarvis is offline.");
-          setNotice("Research core unavailable");
-        }
-      });
+    };
+
+    bootstrapSession();
     return () => {
       disposed = true;
+      if (bootstrapRetry !== null) window.clearTimeout(bootstrapRetry);
       window.removeEventListener("pagehide", handlePageHide);
       window.removeEventListener("pageshow", handlePageShow);
       conversationAbort.current?.abort();
@@ -693,16 +748,78 @@ export default function Home() {
     };
   }, []);
 
-  const fetchDashboard = useCallback(async (operationId: string) => {
+  const fetchCompletedOperation = useCallback(async (operationId: string) => {
     if (!session || !token) return;
-    const response = await fetch(
-      `${API_BASE}/api/v1/sessions/${session.session_id}/operations/${operationId}/dashboard`,
-      { headers: authHeaders },
-    );
-    if (!response.ok) throw new Error("Jarvis completed, but the dashboard projection is unavailable.");
-    setDashboard(await response.json());
+    const operationBase = `${API_BASE}/api/v1/sessions/${session.session_id}/operations/${operationId}`;
+    const [dashboardResponse, resultResponse] = await Promise.all([
+      fetch(`${operationBase}/dashboard`, { headers: authHeaders }),
+      fetch(`${operationBase}/result`, { headers: authHeaders }),
+    ]);
+    if (!dashboardResponse.ok) {
+      throw new Error("Jarvis completed, but the dashboard projection is unavailable.");
+    }
+    if (!resultResponse.ok) {
+      throw new Error("Jarvis completed, but the financial-document inventory is unavailable.");
+    }
+    const [nextDashboard, operationResult] = await Promise.all([
+      dashboardResponse.json() as Promise<Dashboard>,
+      resultResponse.json() as Promise<OperationResultResponse>,
+    ]);
+    setDashboard(nextDashboard);
+    setStructuredDocuments(operationResult.output?.structured_document_references ?? []);
+    setBenchmarkingReference(operationResult.output?.benchmarking_financials_reference ?? null);
     setActiveOperation(null);
   }, [authHeaders, session, token]);
+
+  const inspectFinancialDocument = useCallback(async (
+    reference: StructuredDocumentReference,
+  ) => {
+    if (!session || !token || !displayOperation) return;
+    setFinancialDocumentLoading(reference.cache_entry_id);
+    setFinancialDocumentError(null);
+    try {
+      const resolved = await fetchStructuredFinancialDocument({
+        apiBase: API_BASE,
+        sessionId: session.session_id,
+        operationId: displayOperation,
+        cacheEntryId: reference.cache_entry_id,
+        accessToken: token,
+      });
+      setSelectedFinancialDocument(resolved);
+    } catch (reason) {
+      setFinancialDocumentError(
+        reason instanceof Error
+          ? reason.message
+          : "The financial document is currently unavailable.",
+      );
+    } finally {
+      setFinancialDocumentLoading(null);
+    }
+  }, [displayOperation, session, token]);
+
+  const inspectBenchmarkingFinancials = useCallback(async () => {
+    if (!session || !token || !displayOperation || !benchmarkingReference) return;
+    setFinancialDocumentLoading(benchmarkingReference.cache_entry_id);
+    setFinancialDocumentError(null);
+    try {
+      const resolved = await fetchBenchmarkingFinancials({
+        apiBase: API_BASE,
+        sessionId: session.session_id,
+        operationId: displayOperation,
+        cacheEntryId: benchmarkingReference.cache_entry_id,
+        accessToken: token,
+      });
+      setSelectedBenchmarking(resolved);
+    } catch (reason) {
+      setFinancialDocumentError(
+        reason instanceof Error
+          ? reason.message
+          : "The benchmarking matrix is currently unavailable.",
+      );
+    } finally {
+      setFinancialDocumentLoading(null);
+    }
+  }, [benchmarkingReference, displayOperation, session, token]);
 
   const streamWorkflow = useCallback((operationId: string) => {
     if (!session || !token) return;
@@ -735,7 +852,7 @@ export default function Home() {
           setOperationStatus(terminal.status);
           if (terminal.status === "completed") {
             neuralAudioRef.current?.play("complete");
-            fetchDashboard(operationId).catch((reason) => setError(reason.message));
+            fetchCompletedOperation(operationId).catch((reason) => setError(reason.message));
           } else {
             neuralAudioRef.current?.play("fault");
             setActiveOperation(null);
@@ -764,7 +881,7 @@ export default function Home() {
           setOperationStatus("failed");
         }
       });
-  }, [authHeaders, fetchDashboard, session, token]);
+  }, [authHeaders, fetchCompletedOperation, session, token]);
 
   const playSpokenMessage = useCallback(async (message: string | null | undefined) => {
     if (!shouldPlaySpokenMessage(voiceEnabled, message) || !session || !token) return;
@@ -857,6 +974,11 @@ export default function Home() {
       const operationId = turn.operation?.request.operation_id;
       if (operationId) {
         setDashboard(null);
+        setStructuredDocuments([]);
+        setBenchmarkingReference(null);
+        setSelectedFinancialDocument(null);
+        setSelectedBenchmarking(null);
+        setFinancialDocumentError(null);
         setActivities([]);
         setActiveOperation(operationId);
         setDisplayOperation(operationId);
@@ -1035,8 +1157,11 @@ export default function Home() {
         };
   const evidenceReturning = evidenceState.status === "active" || judgeState.status === "active";
   const judgeBriefing = briefingState.status === "active";
+  const fundamentalDocumentCount = structuredDocuments.length + (benchmarkingReference ? 1 : 0);
   const fundamentalStatus: ProgressStatus = providerCommand
     ? "active"
+    : fundamentalDocumentCount > 0
+      ? "complete"
     : providerLifecycle?.status === "ready"
       ? "complete"
       : providerLifecycle?.status === "expired"
@@ -1044,6 +1169,8 @@ export default function Home() {
         : "standby";
   const fundamentalStatusLabel = providerCommand
     ? "Connecting"
+    : fundamentalDocumentCount > 0
+      ? `${fundamentalDocumentCount} documents ready`
     : providerLifecycle?.status === "ready"
       ? "Provider ready"
       : providerLifecycle?.status === "expired"
@@ -1067,6 +1194,12 @@ export default function Home() {
           direction: "to-agent" as const,
           label: "Revoke access",
         }
+        : fundamentalDocumentCount > 0
+          ? {
+            status: "active" as const,
+            direction: "to-jarvis" as const,
+            label: "Financial evidence ready",
+          }
         : providerLifecycle?.status === "ready"
           ? {
             status: "active" as const,
@@ -1174,6 +1307,62 @@ export default function Home() {
                 )}
               </div>
               {providerNotice && <p className="provider-session-notice" role="status">{providerNotice}</p>}
+              {fundamentalDocumentCount > 0 && (
+                <details className="financial-document-inventory">
+                  <summary>
+                    Completed financial documents
+                    <b>{fundamentalDocumentCount}</b>
+                  </summary>
+                  <ul>
+                    {structuredDocuments.map((document) => (
+                      <li key={document.cache_entry_id}>
+                        <span>
+                          <strong>{FINANCIAL_DOCUMENT_LABELS[document.document_type]}</strong>
+                          <small>{document.reporting_basis.replaceAll("_", " ")}</small>
+                        </span>
+                        <em className={document.source.toLowerCase()}>{document.source}</em>
+                        <time dateTime={document.expires_at}>
+                          expires {new Date(document.expires_at).toLocaleDateString("en-IN", {
+                            timeZone: "Asia/Kolkata",
+                          })}
+                        </time>
+                        <button
+                          type="button"
+                          onClick={() => void inspectFinancialDocument(document)}
+                          disabled={financialDocumentLoading !== null}
+                        >
+                          {financialDocumentLoading === document.cache_entry_id
+                            ? "Loading"
+                            : "Inspect"}
+                        </button>
+                      </li>
+                    ))}
+                    {benchmarkingReference && (
+                      <li key={benchmarkingReference.cache_entry_id}>
+                        <span>
+                          <strong>Peer benchmarking</strong>
+                          <small>Financial comparison matrix</small>
+                        </span>
+                        <em className={benchmarkingReference.source.toLowerCase()}>{benchmarkingReference.source}</em>
+                        <time dateTime={benchmarkingReference.expires_at}>
+                          expires {new Date(benchmarkingReference.expires_at).toLocaleDateString("en-IN", {
+                            timeZone: "Asia/Kolkata",
+                          })}
+                        </time>
+                        <button
+                          type="button"
+                          onClick={() => void inspectBenchmarkingFinancials()}
+                          disabled={financialDocumentLoading !== null}
+                        >
+                          {financialDocumentLoading === benchmarkingReference.cache_entry_id
+                            ? "Loading"
+                            : "Inspect"}
+                        </button>
+                      </li>
+                    )}
+                  </ul>
+                </details>
+              )}
               <div className="provider-session-actions">
                 <button
                   type="button"
@@ -1376,6 +1565,119 @@ export default function Home() {
               <em>{decisionView?.confidenceLabel}</em>
             </div>
           </div>
+          {financialDocumentError && (
+            <p className="financial-document-error" role="alert">{financialDocumentError}</p>
+          )}
+          {selectedFinancialDocument && (
+            <article className="financial-document-inspector glass-panel">
+              <header>
+                <div>
+                  <p className="eyebrow">Fundamental Analyst · validated cached document</p>
+                  <h2>{FINANCIAL_DOCUMENT_LABELS[selectedFinancialDocument.document.document_type]}</h2>
+                  <p>
+                    {selectedFinancialDocument.document.issuer.legal_name} · {selectedFinancialDocument.document.reporting_basis.replaceAll("_", " ")} · {selectedFinancialDocument.document.source_unit}
+                  </p>
+                </div>
+                <button type="button" onClick={() => setSelectedFinancialDocument(null)}>Close</button>
+              </header>
+              <div className="financial-table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Financial line item</th>
+                      {selectedFinancialDocument.document.periods
+                        .slice()
+                        .sort((left, right) => left.display_order - right.display_order)
+                        .map((period) => <th key={period.period_key}>{period.source_label}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedFinancialDocument.document.rows
+                      .slice()
+                      .sort((left, right) => left.display_order - right.display_order)
+                      .map((row) => {
+                        const cells = new Map(row.cells.map((cell) => [cell.period_key, cell]));
+                        return (
+                          <tr className={`row-${row.row_kind}`} key={row.row_key}>
+                            <th style={{ paddingLeft: `${14 + row.depth * 18}px` }}>{row.original_label}</th>
+                            {selectedFinancialDocument.document.periods
+                              .slice()
+                              .sort((left, right) => left.display_order - right.display_order)
+                              .map((period) => {
+                                const cell = cells.get(period.period_key);
+                                return <td key={period.period_key}>{cell?.source_value ?? "—"}</td>;
+                              })}
+                          </tr>
+                        );
+                      })}
+                  </tbody>
+                </table>
+              </div>
+              <footer>
+                <span>{selectedFinancialDocument.document.rows.length} rows · {selectedFinancialDocument.document.periods.length} periods</span>
+                <span>Validated · fully expanded · expires {new Date(selectedFinancialDocument.document.expires_at).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" })}</span>
+              </footer>
+            </article>
+          )}
+          {selectedBenchmarking && (
+            <article className="financial-document-inspector glass-panel">
+              <header>
+                <div>
+                  <p className="eyebrow">Fundamental Analyst · validated cached matrix</p>
+                  <h2>Peer benchmarking</h2>
+                  <p>
+                    {selectedBenchmarking.document.issuer.legal_name} · Financials · observed {new Date(`${selectedBenchmarking.document.observation_date}T00:00:00+05:30`).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" })}
+                  </p>
+                </div>
+                <button type="button" onClick={() => setSelectedBenchmarking(null)}>Close</button>
+              </header>
+              <div className="financial-table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Benchmark metric</th>
+                      {selectedBenchmarking.document.companies
+                        .slice()
+                        .sort((left, right) => left.display_order - right.display_order)
+                        .map((company) => (
+                          <th className={company.is_subject ? "subject-company" : undefined} key={company.company_key}>
+                            {company.legal_name}{company.is_subject ? " · Subject" : ""}
+                          </th>
+                        ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedBenchmarking.document.rows
+                      .slice()
+                      .sort((left, right) => left.display_order - right.display_order)
+                      .map((row) => {
+                        const cells = new Map(row.cells.map((cell) => [cell.company_key, cell]));
+                        return (
+                          <tr className={`row-${row.row_kind}`} key={row.row_key}>
+                            <th style={{ paddingLeft: `${14 + row.depth * 18}px` }}>{row.original_label}</th>
+                            {selectedBenchmarking.document.companies
+                              .slice()
+                              .sort((left, right) => left.display_order - right.display_order)
+                              .map((company) => {
+                                const cell = cells.get(company.company_key);
+                                return (
+                                  <td className={cell?.is_best ? "best-benchmark" : undefined} key={company.company_key}>
+                                    {cell?.source_value ?? "—"}
+                                  </td>
+                                );
+                              })}
+                          </tr>
+                        );
+                      })}
+                  </tbody>
+                </table>
+              </div>
+              <footer>
+                <span>{selectedBenchmarking.document.rows.length} metrics · {selectedBenchmarking.document.companies.length} companies</span>
+                <span>Validated · complete matrix · expires {new Date(selectedBenchmarking.document.expires_at).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" })}</span>
+              </footer>
+            </article>
+          )}
           {dashboard.interpretation && <SwingProtocol interpretation={dashboard.interpretation} />}
           <TimeframeResult
             panel={dashboard.daily}

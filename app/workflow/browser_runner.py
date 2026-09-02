@@ -23,9 +23,11 @@ from app.gateways.fundamentals import (
     FundamentalIssuerLocator,
     FundamentalIssuerResolutionRequest,
     FundamentalShareholdingRequest,
+    FundamentalStructuredDocumentRequest,
 )
 from app.logging_config import get_logger
 from app.models.browser_operations import (
+    BrowserBenchmarkingFinancialsReference,
     BrowserOperationFailure,
     BrowserOperationKind,
     BrowserOperationOutput,
@@ -33,6 +35,7 @@ from app.models.browser_operations import (
     BrowserOperationSnapshot,
     BrowserOperationStatus,
     BrowserSessionSnapshot,
+    BrowserStructuredDocumentReference,
     WorkflowEventBatch,
     WorkflowEventReplayCursor,
 )
@@ -40,9 +43,14 @@ from app.models.debate import AgenticDebateResult, JudgeFollowUpAnswer
 from app.models.interaction import (
     JarvisCommandStatus,
     JarvisSwingAnalysisResponse,
+    SwingAnalysisCommand,
 )
 from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
 from app.models.fundamentals import ProviderConnectionScope
+from app.models.financial_documents import (
+    FinancialDocumentType,
+    FinancialReportingBasis,
+)
 from app.models.presentation import (
     JarvisMultiTimeframeResearchExplanation,
     JarvisResearchExplanation,
@@ -53,8 +61,10 @@ from app.models.storage import (
 )
 from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.services.fundamental_evidence import (
+    BenchmarkingFinancialsLoadResult,
     FundamentalEvidenceLoadResult,
     FundamentalIssuerLoadResult,
+    StructuredDocumentLoadResult,
 )
 from app.workflow.events import WorkflowEventEmitter
 from app.workflow.operations import BrowserOperationRegistry
@@ -152,6 +162,9 @@ class BrowserSwingResearchExecutor(Protocol):
         operation_id: str | None = None,
         event_emitter: WorkflowEventEmitter | None = None,
         manage_terminal_events: bool = True,
+        instrument_resolved_callback: (
+            Callable[[SwingAnalysisCommand], None] | None
+        ) = None,
     ) -> JarvisSwingAnalysisResponse:
         ...
 
@@ -353,17 +366,63 @@ class JarvisBrowserOperationHandler:
         token: BrowserCancellationToken,
     ) -> BrowserOperationOutput:
         self._contexts.clear(request.session_id)
-        try:
-            response = self._research_executor.execute(
-                request.message,
-                operation_id=request.operation_id,
-                event_emitter=emitter,
-                manage_terminal_events=False,
+        fundamental_evidence: tuple[FundamentalEvidenceLoadResult, ...] = ()
+        structured_document_references: tuple[
+            BrowserStructuredDocumentReference,
+            ...,
+        ] = ()
+        benchmarking_financials_reference: (
+            BrowserBenchmarkingFinancialsReference | None
+        ) = None
+        fundamental_future: Future | None = None
+        fundamental_pool = (
+            ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="jarvis-fundamental",
             )
-        except ApplicationError as exc:
-            raise BrowserOperationHandledFailure(
-                _safe_research_failure(exc)
-            ) from exc
+            if request.fundamentals_requested
+            else None
+        )
+
+        def start_fundamental_analysis(command: SwingAnalysisCommand) -> None:
+            nonlocal fundamental_future
+            if fundamental_pool is None:
+                return
+            if fundamental_future is not None:
+                raise RuntimeError("fundamental analysis was already started")
+            fundamental_future = fundamental_pool.submit(
+                self._load_fundamental_evidence,
+                request,
+                command,
+                token,
+            )
+
+        try:
+            try:
+                response = self._research_executor.execute(
+                    request.message,
+                    operation_id=request.operation_id,
+                    event_emitter=emitter,
+                    manage_terminal_events=False,
+                    instrument_resolved_callback=(
+                        start_fundamental_analysis
+                        if request.fundamentals_requested
+                        else None
+                    ),
+                )
+            except ApplicationError as exc:
+                raise BrowserOperationHandledFailure(
+                    _safe_research_failure(exc)
+                ) from exc
+            if fundamental_future is not None:
+                (
+                    fundamental_evidence,
+                    structured_document_references,
+                    benchmarking_financials_reference,
+                ) = fundamental_future.result()
+        finally:
+            if fundamental_pool is not None:
+                fundamental_pool.shutdown(wait=True)
         if not isinstance(response, JarvisSwingAnalysisResponse):
             raise ValueError("research executor returned an invalid response")
         if response.operation_id != request.operation_id:
@@ -381,13 +440,6 @@ class JarvisBrowserOperationHandler:
             )
         if response.result is None:
             raise ValueError("completed research response is missing analysis")
-        fundamental_evidence: tuple[FundamentalEvidenceLoadResult, ...] = ()
-        if request.fundamentals_requested:
-            fundamental_evidence = self._load_fundamental_evidence(
-                request,
-                response.result,
-                token,
-            )
         approved_context = None
         if (
             response.multi_timeframe_review is not None
@@ -427,6 +479,12 @@ class JarvisBrowserOperationHandler:
                     ),
                 ),
                 fundamental_evidence=fundamental_evidence,
+                structured_document_references=(
+                    structured_document_references
+                ),
+                benchmarking_financials_reference=(
+                    benchmarking_financials_reference
+                ),
             )
         if not isinstance(
             explanation,
@@ -445,17 +503,22 @@ class JarvisBrowserOperationHandler:
             research_response=response,
             research_explanation=explanation,
             fundamental_evidence=fundamental_evidence,
+            structured_document_references=structured_document_references,
+            benchmarking_financials_reference=(
+                benchmarking_financials_reference
+            ),
         )
 
     def _load_fundamental_evidence(
         self,
         operation: BrowserOperationRequest,
-        result: (
-            EndToEndSwingAnalysisResult
-            | MultiTimeframeEndToEndSwingAnalysisResult
-        ),
+        command: SwingAnalysisCommand,
         token: BrowserCancellationToken,
-    ) -> tuple[FundamentalEvidenceLoadResult, ...]:
+    ) -> tuple[
+        tuple[FundamentalEvidenceLoadResult, ...],
+        tuple[BrowserStructuredDocumentReference, ...],
+        BrowserBenchmarkingFinancialsReference | None,
+    ]:
         executor = self._fundamental_evidence
         resolver = self._provider_scope_resolver
         if executor is None or resolver is None:
@@ -487,7 +550,6 @@ class JarvisBrowserOperationHandler:
         if not isinstance(connection, ProviderConnectionScope):
             raise ValueError("provider scope resolver returned an invalid scope")
 
-        series = result.fetch.stored.series
         requested_at = self._clock()
         resolution_request = FundamentalIssuerResolutionRequest(
             request_id=f"{operation.operation_id}.fundamental.resolve",
@@ -495,8 +557,11 @@ class JarvisBrowserOperationHandler:
             connection=connection,
             requested_at=requested_at,
             locator=FundamentalIssuerLocator(
-                exchange=series.exchange,
-                symbol=series.symbol,
+                exchange=command.exchange,
+                symbol=_fundamental_provider_symbol(
+                    command.exchange,
+                    command.symbol,
+                ),
             ),
         )
         try:
@@ -530,11 +595,11 @@ class JarvisBrowserOperationHandler:
                 )
             )
         issuer = resolution.issuer
-        as_of_date = (
-            series.candles[-1].timestamp.date()
-            if series.candles
-            else requested_at.date()
-        )
+        # Tijori supplies current provider-standardized evidence and does not
+        # establish historical point-in-time availability.  The latest market
+        # candle may legitimately predate today on weekends or holidays, so it
+        # must not be reused as a fundamental evidence cutoff.
+        as_of_date = None
         requests = (
             FundamentalCompanyOverviewRequest(
                 request_id=f"{operation.operation_id}.fundamental.overview",
@@ -562,6 +627,8 @@ class JarvisBrowserOperationHandler:
             ),
         )
         loaded = []
+        structured_references = []
+        benchmarking_reference = None
         try:
             for request in requests:
                 token.raise_if_requested()
@@ -574,6 +641,236 @@ class JarvisBrowserOperationHandler:
                         "fundamental executor returned an invalid result"
                     )
                 loaded.append(evidence)
+            structured_requests = (
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental.growth_table"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.GROWTH_TABLE,
+                    reporting_basis=FinancialReportingBasis.NOT_APPLICABLE,
+                ),
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental."
+                        "balance_sheet.consolidated"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.BALANCE_SHEET,
+                    reporting_basis=FinancialReportingBasis.CONSOLIDATED,
+                ),
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental."
+                        "balance_sheet.standalone"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.BALANCE_SHEET,
+                    reporting_basis=FinancialReportingBasis.STANDALONE,
+                ),
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental."
+                        "profit_and_loss.consolidated"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.PROFIT_AND_LOSS,
+                    reporting_basis=FinancialReportingBasis.CONSOLIDATED,
+                ),
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental."
+                        "profit_and_loss.standalone"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.PROFIT_AND_LOSS,
+                    reporting_basis=FinancialReportingBasis.STANDALONE,
+                ),
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental."
+                        "cash_flow.consolidated"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.CASH_FLOW,
+                    reporting_basis=FinancialReportingBasis.CONSOLIDATED,
+                ),
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental."
+                        "cash_flow.standalone"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.CASH_FLOW,
+                    reporting_basis=FinancialReportingBasis.STANDALONE,
+                ),
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental."
+                        "ratios.consolidated"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.RATIOS,
+                    reporting_basis=FinancialReportingBasis.CONSOLIDATED,
+                ),
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental."
+                        "ratios.standalone"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.RATIOS,
+                    reporting_basis=FinancialReportingBasis.STANDALONE,
+                ),
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental."
+                        "quarterly_results.consolidated"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.QUARTERLY_RESULTS,
+                    reporting_basis=FinancialReportingBasis.CONSOLIDATED,
+                ),
+                FundamentalStructuredDocumentRequest(
+                    request_id=(
+                        f"{operation.operation_id}.fundamental."
+                        "quarterly_results.standalone"
+                    ),
+                    operation_id=operation.operation_id,
+                    connection=connection,
+                    requested_at=requested_at,
+                    issuer=issuer,
+                    as_of_date=as_of_date,
+                    document_type=FinancialDocumentType.QUARTERLY_RESULTS,
+                    reporting_basis=FinancialReportingBasis.STANDALONE,
+                ),
+            )
+            for structured_request in structured_requests:
+                token.raise_if_requested()
+                structured_document = executor.load_structured_document(
+                    structured_request,
+                    refresh_requested=operation.refresh_requested,
+                )
+                if not isinstance(
+                    structured_document,
+                    StructuredDocumentLoadResult,
+                ):
+                    raise ValueError(
+                        "fundamental executor returned an invalid structured "
+                        "document result"
+                    )
+                stored_document = structured_document.stored_document
+                if stored_document is None:
+                    continue
+                document = stored_document.result.document
+                if document is None:
+                    raise ValueError(
+                        "stored structured result is missing its document"
+                    )
+                structured_references.append(
+                    BrowserStructuredDocumentReference(
+                        cache_entry_id=(
+                            stored_document.cache_key.cache_entry_id
+                        ),
+                        document_id=document.document_id,
+                        document_type=document.document_type,
+                        reporting_basis=document.reporting_basis,
+                        exchange=document.issuer.exchange,
+                        symbol=document.issuer.symbol,
+                        source=structured_document.source,
+                        document_fingerprint=(
+                            stored_document.document_fingerprint
+                        ),
+                        retrieved_at=stored_document.retrieved_at,
+                        stored_at=stored_document.stored_at,
+                        expires_at=stored_document.expires_at,
+                        all_sections_expanded=(
+                            document.all_sections_expanded
+                        ),
+                    )
+                )
+            token.raise_if_requested()
+            benchmarking = executor.load_benchmarking_financials(
+                requests[0],
+                refresh_requested=operation.refresh_requested,
+            )
+            if not isinstance(
+                benchmarking,
+                BenchmarkingFinancialsLoadResult,
+            ):
+                raise ValueError(
+                    "fundamental executor returned an invalid Benchmarking "
+                    "Financials result"
+                )
+            stored_benchmarking = benchmarking.stored_document
+            if stored_benchmarking is not None:
+                document = stored_benchmarking.result.document
+                if document is None:
+                    raise ValueError(
+                        "stored Benchmarking Financials result is missing "
+                        "its document"
+                    )
+                benchmarking_reference = (
+                    BrowserBenchmarkingFinancialsReference(
+                        cache_entry_id=(
+                            stored_benchmarking.cache_key.cache_entry_id
+                        ),
+                        document_id=document.document_id,
+                        exchange=document.issuer.exchange,
+                        symbol=document.issuer.symbol,
+                        source=benchmarking.source,
+                        document_fingerprint=(
+                            stored_benchmarking.document_fingerprint
+                        ),
+                        observation_date=document.observation_date,
+                        retrieved_at=stored_benchmarking.retrieved_at,
+                        stored_at=stored_benchmarking.stored_at,
+                        expires_at=stored_benchmarking.expires_at,
+                        all_rows_captured=document.all_rows_captured,
+                        company_count=len(document.companies),
+                        row_count=len(document.rows),
+                    )
+                )
         except FundamentalGatewayError as exc:
             raise BrowserOperationHandledFailure(
                 BrowserOperationFailure(
@@ -585,7 +882,11 @@ class JarvisBrowserOperationHandler:
                     retryable=exc.context.retryable,
                 )
             ) from exc
-        return tuple(loaded)
+        return (
+            tuple(loaded),
+            tuple(structured_references),
+            benchmarking_reference,
+        )
 
     def _execute_follow_up(
         self,
@@ -848,6 +1149,16 @@ def _required_text(label: str, value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"browser {label} must not be blank")
     return value.strip()
+
+
+def _fundamental_provider_symbol(exchange: str, symbol: str) -> str:
+    """Translate only Angel One's NSE cash-series suffix for provider lookup."""
+
+    normalized_exchange = _required_text("exchange", exchange).upper()
+    normalized_symbol = _required_text("symbol", symbol).upper()
+    if normalized_exchange == "NSE" and normalized_symbol.endswith("-EQ"):
+        return normalized_symbol[:-3]
+    return normalized_symbol
 
 
 def _safe_research_failure(exc: ApplicationError) -> BrowserOperationFailure:

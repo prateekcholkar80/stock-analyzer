@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   APPROVED_TOOL_NAMES,
+  MAX_JSON_NODES,
   failureResult,
   serializeToolResult,
   successResult,
@@ -132,7 +133,7 @@ test('rejects excessive strings, keys, depth, and node count', () => {
 
   let nested = {};
   let cursor = nested;
-  for (let index = 0; index < 9; index += 1) {
+  for (let index = 0; index < 17; index += 1) {
     cursor.next = {};
     cursor = cursor.next;
   }
@@ -142,19 +143,57 @@ test('rejects excessive strings, keys, depth, and node count', () => {
   );
   assert.throws(
     () => successResult('search_company', {
-      values: Array.from({ length: 10_001 }, () => null),
+      values: Array.from({ length: MAX_JSON_NODES }, () => null),
     }),
     /structure limits/,
   );
 
   const oversized = {};
-  for (let index = 0; index < 110; index += 1) {
+  for (let index = 0; index < 810; index += 1) {
     oversized[`field_${index}`] = 'x'.repeat(9_999);
   }
   assert.throws(
     () => successResult('search_company', oversized),
     /response size limit/,
   );
+});
+
+test('accepts a bounded fully expanded 20,000-cell financial document', () => {
+  const periods = Array.from({ length: 40 }, (_, index) => ({
+    period_key: `period_${index}`,
+    source_label: `MAR'${String(index + 1).padStart(2, '0')}`,
+    display_order: index,
+  }));
+  const rows = Array.from({ length: 500 }, (_, rowIndex) => ({
+    row_key: `row_${rowIndex}`,
+    original_label: `Financial statement line ${rowIndex}`,
+    parent_row_key: rowIndex === 0 ? null : 'row_0',
+    depth: rowIndex === 0 ? 0 : 1,
+    row_kind: rowIndex === 0 ? 'section' : 'metric',
+    display_order: rowIndex,
+    values: periods.map((period, periodIndex) => ({
+      period_key: period.period_key,
+      source_value: String((rowIndex + 1) * (periodIndex + 1)),
+      normalized_value: (rowIndex + 1) * (periodIndex + 1),
+      source_unit: 'INR crore',
+      normalized_unit: 'INR crore',
+      availability_status: 'available',
+    })),
+  }));
+
+  const result = successResult('get_financials', {
+    document: {
+      schema_version: 'tijori.financial_document.v1',
+      document_type: 'balance_sheet',
+      reporting_basis: 'consolidated',
+      periods,
+      rows,
+    },
+  });
+
+  assert.equal(result.payload.document.rows.length, 500);
+  assert.equal(result.payload.document.rows[499].values.length, 40);
+  assert.doesNotThrow(() => serializeToolResult(result));
 });
 
 test('does not mutate caller-owned input during normalization', () => {

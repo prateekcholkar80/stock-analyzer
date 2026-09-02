@@ -68,6 +68,38 @@ test('validates and normalizes company-overview arguments', () => {
   assert.equal(Object.isFrozen(result.issuer), true);
 });
 
+test('accepts structured company-overview document requests', () => {
+  assert.deepEqual(
+    validateToolArguments('get_company_overview', {
+      issuer,
+      document_type: 'peer_comparison',
+    }),
+    {
+      issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+      as_of_date: null,
+      document_type: 'peer_comparison',
+    },
+  );
+  assert.deepEqual(
+    validateToolArguments('get_company_overview', {
+      issuer,
+      document_type: 'benchmarking_financials',
+    }),
+    {
+      issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+      as_of_date: null,
+      document_type: 'benchmarking_financials',
+    },
+  );
+  assert.throws(
+    () => validateToolArguments('get_company_overview', {
+      issuer,
+      document_type: 'benchmarking',
+    }),
+    /document_type contains an unsupported value/,
+  );
+});
+
 test('applies safe financial defaults and accepts supported selections', () => {
   assert.deepEqual(validateToolArguments('get_financials', { issuer }), {
     issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
@@ -85,6 +117,141 @@ test('applies safe financial defaults and accepts supported selections', () => {
   });
   assert.deepEqual(selected.statements, ['segment', 'kpi_schedule']);
   assert.deepEqual(selected.period_types, ['ltm']);
+});
+
+test('accepts explicit Growth Table document scenarios independently', () => {
+  assert.deepEqual(validateToolArguments('get_financials', {
+    issuer,
+    document_type: 'growth_table',
+    reporting_basis: 'not_applicable',
+  }), {
+    issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+    as_of_date: null,
+    document_type: 'growth_table',
+    reporting_basis: 'not_applicable',
+  });
+});
+
+test('accepts explicit Balance Sheet scenarios for both reporting bases', () => {
+  for (const reportingBasis of ['consolidated', 'standalone']) {
+    assert.deepEqual(validateToolArguments('get_financials', {
+      issuer,
+      as_of_date: '2026-08-30',
+      document_type: 'balance_sheet',
+      reporting_basis: reportingBasis,
+    }), {
+      issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+      as_of_date: '2026-08-30',
+      document_type: 'balance_sheet',
+      reporting_basis: reportingBasis,
+    });
+  }
+});
+
+test('accepts explicit Profit and Loss scenarios for both reporting bases', () => {
+  for (const reportingBasis of ['consolidated', 'standalone']) {
+    assert.deepEqual(validateToolArguments('get_financials', {
+      issuer,
+      as_of_date: '2026-08-30',
+      document_type: 'profit_and_loss',
+      reporting_basis: reportingBasis,
+    }), {
+      issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+      as_of_date: '2026-08-30',
+      document_type: 'profit_and_loss',
+      reporting_basis: reportingBasis,
+    });
+  }
+});
+
+test('accepts explicit Cash Flow scenarios for both reporting bases', () => {
+  for (const reportingBasis of ['consolidated', 'standalone']) {
+    assert.deepEqual(validateToolArguments('get_financials', {
+      issuer,
+      as_of_date: '2026-08-30',
+      document_type: 'cash_flow',
+      reporting_basis: reportingBasis,
+    }), {
+      issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+      as_of_date: '2026-08-30',
+      document_type: 'cash_flow',
+      reporting_basis: reportingBasis,
+    });
+  }
+});
+
+test('accepts explicit Ratios scenarios for both reporting bases', () => {
+  for (const reportingBasis of ['consolidated', 'standalone']) {
+    assert.deepEqual(validateToolArguments('get_financials', {
+      issuer,
+      as_of_date: '2026-08-30',
+      document_type: 'ratios',
+      reporting_basis: reportingBasis,
+    }), {
+      issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+      as_of_date: '2026-08-30',
+      document_type: 'ratios',
+      reporting_basis: reportingBasis,
+    });
+  }
+});
+
+test('accepts explicit Quarterly Results scenarios for both reporting bases', () => {
+  for (const reportingBasis of ['consolidated', 'standalone']) {
+    assert.deepEqual(validateToolArguments('get_financials', {
+      issuer,
+      as_of_date: '2026-08-30',
+      document_type: 'quarterly_results',
+      reporting_basis: reportingBasis,
+    }), {
+      issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+      as_of_date: '2026-08-30',
+      document_type: 'quarterly_results',
+      reporting_basis: reportingBasis,
+    });
+  }
+});
+
+test('rejects incomplete, unsupported, or mixed financial document dimensions', () => {
+  assert.throws(
+    () => validateToolArguments('get_financials', {
+      issuer, document_type: 'growth_table',
+    }),
+    /require document_type and reporting_basis/,
+  );
+  assert.throws(
+    () => validateToolArguments('get_financials', {
+      issuer, reporting_basis: 'consolidated',
+    }),
+    /require document_type and reporting_basis/,
+  );
+  assert.throws(
+    () => validateToolArguments('get_financials', {
+      issuer, document_type: 'reverse_dcf', reporting_basis: 'consolidated',
+    }),
+    /document_type contains an unsupported value/,
+  );
+  assert.throws(
+    () => validateToolArguments('get_financials', {
+      issuer, document_type: 'growth_table', reporting_basis: 'consolidated',
+    }),
+    /requires the not_applicable reporting basis exclusively/,
+  );
+  assert.throws(
+    () => validateToolArguments('get_financials', {
+      issuer, document_type: 'balance_sheet', reporting_basis: 'not_applicable',
+    }),
+    /requires the not_applicable reporting basis exclusively/,
+  );
+  assert.throws(
+    () => validateToolArguments('get_financials', {
+      issuer,
+      document_type: 'growth_table',
+      reporting_basis: 'consolidated',
+      max_periods: 12,
+    }),
+    /cannot mix legacy statement selections/,
+  );
 });
 
 test('applies shareholding defaults and validates explicit bounds', () => {

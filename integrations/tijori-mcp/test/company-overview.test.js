@@ -91,6 +91,154 @@ test('normalizes only approved overview facts with research-grade provenance', a
   assert.equal(provider.observed.calls, 1);
 });
 
+test('routes peer-comparison document requests to the structured extractor', async () => {
+  const observed = {};
+  const snapshot = {
+    headers: [
+      'Peer Name', 'Latest Price', 'PE', 'PEG', 'Market Cap(Cr)',
+      'Prom Holding(%)', 'YoY Qtly Sales(%)', 'ROCE (%)', 'ROE (%)',
+    ],
+    rows: [
+      {
+        name: 'Tata Consultancy Services',
+        href: '/company/tata-consultancy-services',
+        values: ['₹3,100', '24', '1.5', '1,100 Cr', '71%', '5%', '40%', '35%'],
+      },
+      {
+        name: 'Infosys',
+        href: '/company/infosys',
+        values: ['₹1,500', '22', '1.4', '700 Cr', '15%', '4%', '35%', '30%'],
+      },
+    ],
+  };
+  const page = {
+    async goto(url, options) {
+      observed.url = url;
+      observed.options = options;
+      return { url: () => url };
+    },
+    async waitForSelector(selector, options) {
+      observed.selector = selector;
+      observed.selectorOptions = options;
+    },
+    async evaluate() {
+      return snapshot;
+    },
+  };
+  const handler = createCompanyOverviewHandler({
+    browserRunner: { run: async (task) => task(page) },
+    clock: () => NOW,
+  });
+
+  const result = await handler({
+    issuer: ISSUER,
+    document_type: 'peer_comparison',
+  });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.document.document_type, 'peer_comparison');
+  assert.equal(result.payload.document.peers.length, 2);
+  assert.equal(result.payload.document.peers[0].is_subject, true);
+  assert.equal(observed.url, `${'https://www.tijorifinance.com'}/company/${ISSUER.provider_slug}/`);
+  assert.equal(observed.selector, '#competitors #peers_table');
+});
+
+test('routes benchmarking-financials requests to the complete matrix extractor', async () => {
+  const observed = {};
+  const snapshot = {
+    companies: [
+      {
+        legal_name: 'Tata Consultancy Services',
+        href: '/company/tata-consultancy-services/',
+      },
+      { legal_name: 'Infosys', href: '/company/infosys/' },
+    ],
+    rows: [
+      {
+        provider_row_id: 'financial',
+        parent_provider_row_id: null,
+        depth: 0,
+        provider_section: 'bch_financial',
+        provider_hidden: false,
+        has_children: true,
+        label: 'Financials',
+        values: [
+          { source_value: '', is_best: false },
+          { source_value: '', is_best: false },
+        ],
+      },
+      {
+        provider_row_id: '284',
+        parent_provider_row_id: 'financial',
+        depth: 1,
+        provider_section: 'bch_financial',
+        provider_hidden: true,
+        has_children: false,
+        label: '5 yr Average ROE',
+        values: [
+          { source_value: '35 %', is_best: true },
+          { source_value: '30 %', is_best: false },
+        ],
+      },
+    ],
+  };
+  const page = {
+    async goto(url, options) {
+      observed.url = url;
+      observed.options = options;
+      return { url: () => url };
+    },
+    async waitForSelector(selector, options) {
+      observed.selector = selector;
+      observed.selectorOptions = options;
+    },
+    async evaluate() {
+      return snapshot;
+    },
+  };
+  const handler = createCompanyOverviewHandler({
+    browserRunner: { run: async (task) => task(page) },
+    clock: () => NOW,
+  });
+
+  const result = await handler({
+    issuer: ISSUER,
+    document_type: 'benchmarking_financials',
+  });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.document.document_type, 'benchmarking_financials');
+  assert.equal(result.payload.document.reporting_basis, 'not_applicable');
+  assert.equal(result.payload.document.extraction.provider_hidden_row_count, 1);
+  assert.equal(
+    observed.url,
+    `${'https://www.tijorifinance.com'}/company/${ISSUER.provider_slug}/benchmarking/`,
+  );
+  assert.match(observed.selector, /#benchmarking-financial/);
+});
+
+test('fails closed when the benchmarking matrix is incomplete', async () => {
+  const page = {
+    async goto(url) { return { url: () => url }; },
+    async waitForSelector() {},
+    async evaluate() {
+      return { companies: [], rows: [] };
+    },
+  };
+  const handler = createCompanyOverviewHandler({
+    browserRunner: { run: async (task) => task(page) },
+    clock: () => NOW,
+  });
+
+  const result = await handler({
+    issuer: ISSUER,
+    document_type: 'benchmarking_financials',
+  });
+
+  assert.equal(result.status, 'unavailable');
+  assert.equal(result.payload, null);
+});
+
 test('accepts only today as an explicit as-of date', async () => {
   const provider = fixture({ ratios: [{ label: 'P/E', value: '30' }] });
   const handler = handlerFor(provider);
@@ -100,9 +248,22 @@ test('accepts only today as an explicit as-of date', async () => {
   assert.equal(provider.observed.calls, 1);
 });
 
+test('retains a resolved issuer exchange when provider metadata omits it', async () => {
+  const provider = fixture({
+    metadata: { company_id: 123, symbol: 'TCS' },
+    ratios: [{ label: 'P/E', value: '30' }],
+  });
+
+  const result = await handlerFor(provider)({ issuer: ISSUER });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.exchange, 'NSE');
+  assert.match(result.payload.limitations.at(-1), /omitted its exchange field/i);
+});
+
 test('rejects incomplete or conflicting provider identity', async () => {
   for (const metadata of [
-    { company_id: 123, symbol: 'TCS' },
+    { company_id: 123, exchange: 'NSE' },
     { company_id: 123, exchange: 'BSE', symbol: 'TCS' },
     { company_id: 999, exchange: 'NSE', symbol: 'TCS' },
     { company_id: 123, exchange: 'NSE', symbol: 'INFY' },

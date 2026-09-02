@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import StrEnum
 from typing import Literal, Self
 
@@ -6,13 +6,20 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from app.models.conversation import InputChannel
 from app.models.debate import JudgeFollowUpAnswer
+from app.models.financial_documents import (
+    FinancialDocumentType,
+    FinancialReportingBasis,
+)
 from app.models.interaction import JarvisSwingAnalysisResponse
 from app.models.presentation import (
     JarvisMultiTimeframeResearchExplanation,
     JarvisResearchExplanation,
 )
 from app.models.technical import TechnicalModel
-from app.services.fundamental_evidence import FundamentalEvidenceLoadResult
+from app.services.fundamental_evidence import (
+    FundamentalEvidenceLoadResult,
+    FundamentalEvidenceSource,
+)
 from app.models.workflow import JarvisWorkflowEvent
 
 
@@ -233,6 +240,125 @@ class BrowserOperationSnapshot(TechnicalModel):
         return self
 
 
+class BrowserStructuredDocumentReference(TechnicalModel):
+    """Safe browser reference to one validated cached financial document."""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    schema_version: Literal["jarvis.browser_structured_document_ref.v1"] = (
+        "jarvis.browser_structured_document_ref.v1"
+    )
+    cache_entry_id: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=_ID_PATTERN,
+    )
+    document_id: str = Field(
+        min_length=1,
+        max_length=240,
+        pattern=_ID_PATTERN,
+    )
+    document_type: FinancialDocumentType
+    reporting_basis: FinancialReportingBasis
+    exchange: str = Field(min_length=1, max_length=32, pattern=_ID_PATTERN)
+    symbol: str = Field(min_length=1, max_length=100, pattern=_ID_PATTERN)
+    source: FundamentalEvidenceSource
+    document_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    retrieved_at: datetime
+    stored_at: datetime
+    expires_at: datetime
+    all_sections_expanded: Literal[True]
+
+    @field_validator("exchange", "symbol", mode="before")
+    @classmethod
+    def normalize_market_identity(cls, value: str) -> str:
+        return value.upper()
+
+    @field_validator("retrieved_at", "stored_at", "expires_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "structured document reference timestamps require timezone"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_freshness_window(self) -> Self:
+        if self.expires_at <= self.retrieved_at:
+            raise ValueError(
+                "structured document reference expiry must follow retrieval"
+            )
+        if self.stored_at >= self.expires_at:
+            raise ValueError(
+                "structured document reference must identify an active cache"
+            )
+        return self
+
+
+class BrowserBenchmarkingFinancialsReference(TechnicalModel):
+    """Safe browser reference to one cached Financial benchmark matrix."""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    schema_version: Literal[
+        "jarvis.browser_benchmarking_financials_ref.v1"
+    ] = "jarvis.browser_benchmarking_financials_ref.v1"
+    cache_entry_id: str = Field(
+        pattern=r"^benchmarking_financials:[a-f0-9]{64}$"
+    )
+    document_id: str = Field(
+        min_length=1,
+        max_length=240,
+        pattern=_ID_PATTERN,
+    )
+    document_type: Literal["benchmarking_financials"] = (
+        "benchmarking_financials"
+    )
+    reporting_basis: Literal["not_applicable"] = "not_applicable"
+    exchange: str = Field(min_length=1, max_length=32, pattern=_ID_PATTERN)
+    symbol: str = Field(min_length=1, max_length=100, pattern=_ID_PATTERN)
+    source: FundamentalEvidenceSource
+    document_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    observation_date: date
+    retrieved_at: datetime
+    stored_at: datetime
+    expires_at: datetime
+    all_rows_captured: Literal[True]
+    company_count: int = Field(ge=2, le=30)
+    row_count: int = Field(ge=1, le=300)
+
+    @field_validator("exchange", "symbol", mode="before")
+    @classmethod
+    def normalize_market_identity(cls, value: str) -> str:
+        return value.upper()
+
+    @field_validator("retrieved_at", "stored_at", "expires_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "Benchmarking Financials reference timestamps require timezone"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_freshness_window(self) -> Self:
+        if self.expires_at <= self.retrieved_at:
+            raise ValueError(
+                "Benchmarking Financials reference expiry must follow retrieval"
+            )
+        if self.stored_at < self.retrieved_at:
+            raise ValueError(
+                "Benchmarking Financials reference cannot predate retrieval"
+            )
+        if self.stored_at >= self.expires_at:
+            raise ValueError(
+                "Benchmarking Financials reference must identify active cache"
+            )
+        return self
+
+
 class BrowserOperationOutput(TechnicalModel):
     """Immutable result fetched after one browser operation completes."""
 
@@ -261,6 +387,13 @@ class BrowserOperationOutput(TechnicalModel):
         default=(),
         max_length=3,
     )
+    structured_document_references: tuple[
+        BrowserStructuredDocumentReference,
+        ...,
+    ] = Field(default=(), max_length=11)
+    benchmarking_financials_reference: (
+        BrowserBenchmarkingFinancialsReference | None
+    ) = None
 
     @field_validator("completed_at")
     @classmethod
@@ -294,6 +427,31 @@ class BrowserOperationOutput(TechnicalModel):
                 raise ValueError(
                     "swing output fundamental capabilities must be unique"
                 )
+            scenarios = tuple(
+                (item.document_type, item.reporting_basis)
+                for item in self.structured_document_references
+            )
+            if len(scenarios) != len(set(scenarios)):
+                raise ValueError(
+                    "swing output structured document scenarios must be unique"
+                )
+            cache_entries = tuple(
+                item.cache_entry_id
+                for item in self.structured_document_references
+            )
+            if len(cache_entries) != len(set(cache_entries)):
+                raise ValueError(
+                    "swing output structured cache references must be unique"
+                )
+            if (
+                self.benchmarking_financials_reference is not None
+                and self.benchmarking_financials_reference.cache_entry_id
+                in cache_entries
+            ):
+                raise ValueError(
+                    "Benchmarking and financial document cache references "
+                    "must be distinct"
+                )
         else:
             if self.judge_follow_up is None:
                 raise ValueError("follow-up output requires a Judge answer")
@@ -311,6 +469,14 @@ class BrowserOperationOutput(TechnicalModel):
             if self.fundamental_evidence:
                 raise ValueError(
                     "follow-up output cannot contain fundamental evidence"
+                )
+            if self.structured_document_references:
+                raise ValueError(
+                    "follow-up output cannot contain structured documents"
+                )
+            if self.benchmarking_financials_reference is not None:
+                raise ValueError(
+                    "follow-up output cannot contain Benchmarking Financials"
                 )
         return self
 

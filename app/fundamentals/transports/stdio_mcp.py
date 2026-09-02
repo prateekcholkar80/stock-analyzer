@@ -41,8 +41,12 @@ _CLIENT_NAME = "jarvis-tijori-transport"
 _CLIENT_VERSION = "1.0.0"
 _SESSION_ENVIRONMENT_KEY = "JARVIS_TIJORI_SESSION_FILE"
 _CONTRACT_ENVIRONMENT_KEY = "JARVIS_TIJORI_PROVIDER_CONTRACT_VERSION"
-_MAX_JSON_DEPTH = 10
-_MAX_JSON_NODES = 20_000
+# MCP tool schemas can legitimately nest unions, array items, and object
+# properties more deeply than provider evidence payloads. Byte and node caps
+# remain the primary allocation bounds; this ceiling still rejects recursive
+# or adversarial structures well before Python recursion becomes a concern.
+_MAX_JSON_DEPTH = 16
+_MAX_JSON_NODES = 250_000
 _ERROR_KIND_BY_CODE = {
     -32001: TijoriTransportFailureKind.AUTHENTICATION,
     -32003: TijoriTransportFailureKind.ENTITLEMENT,
@@ -80,12 +84,12 @@ class TijoriStdioMcpSettings(FundamentalModel):
         max_length=80,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
     )
-    timeout_seconds: float = Field(default=15.0, ge=0.1, le=120.0)
+    timeout_seconds: float = Field(default=30.0, ge=0.1, le=120.0)
     terminate_grace_seconds: float = Field(default=1.0, ge=0.0, le=10.0)
     max_message_bytes: int = Field(
-        default=1_100_000,
+        default=8_500_000,
         ge=1_024,
-        le=2_000_000,
+        le=10_000_000,
     )
     max_concurrency: int = Field(default=3, ge=1, le=8)
     max_session_bytes: int = Field(

@@ -65,6 +65,30 @@ test('resolves a provider slug from complete company-page metadata', async () =>
   assert.equal(provider.observed.navigations.length, 1);
 });
 
+test('binds a missing provider exchange to one explicit locator exchange', async () => {
+  const provider = fixture({
+    metadata: {
+      'tata-consultancy-services': { ...tcs, exchange: undefined },
+    },
+  });
+  const handler = createResolveCompanyIdsHandler({ browserRunner: provider.runner });
+
+  const result = await handler({
+    locator: {
+      exchange: 'NSE',
+      symbol: 'TCS',
+      provider_slug: 'tata-consultancy-services',
+    },
+  });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.companies[0].exchange, 'NSE');
+  assert.deepEqual(
+    result.payload.companies[0].matched_on,
+    ['symbol', 'requested_exchange'],
+  );
+});
+
 test('resolves an exact symbol through bounded company search', async () => {
   const provider = fixture({
     searchPayload: [{

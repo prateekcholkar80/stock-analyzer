@@ -13,8 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.models import (
+    BrowserBenchmarkingFinancialsDocument,
+    BrowserBenchmarkingFinancialsDocumentResponse,
     BrowserConversationInputRequest,
     BrowserOperationResultResponse,
+    BrowserStructuredFinancialDocument,
+    BrowserStructuredFinancialDocumentResponse,
     CreateBrowserSessionResponse,
     ProviderSessionLifecycleResponse,
     ProviderSessionStatusRequest,
@@ -50,6 +54,7 @@ from app.exceptions import (
     TTSError,
     TTSProviderUnavailableError,
     TTSSynthesisError,
+    StorageError,
 )
 from app.models.browser_operations import (
     BrowserOperationOutput,
@@ -69,12 +74,21 @@ from app.models.browser_conversation import (
 from app.models.conversation import JarvisUtterance
 from app.models.dashboard import JarvisDashboardView
 from app.models.fundamentals import ProviderConnectionScope
+from app.models.financial_document_storage import (
+    StructuredDocumentRepositoryScope,
+)
 from app.presentation.dashboard import (
     DashboardProjectionError,
     JarvisDashboardProjector,
 )
 from app.stt.gateway import Transcription
 from app.services.provider_sessions import ProviderSessionCommandError
+from app.storage.financial_document_repositories import (
+    StructuredFinancialDocumentRepository,
+)
+from app.storage.benchmarking_financials_repositories import (
+    BenchmarkingFinancialsRepository,
+)
 from app.tts.gateway import SpeechSynthesis
 
 
@@ -240,6 +254,15 @@ def create_jarvis_http_app(
     | None = None,
     browser_session_ownership: BrowserSessionOwnershipRegistry | None = None,
     tenant_identity_resolver: Callable[[Request], str] | None = None,
+    structured_document_repository: (
+        StructuredFinancialDocumentRepository | None
+    ) = None,
+    benchmarking_financials_repository: (
+        BenchmarkingFinancialsRepository | None
+    ) = None,
+    structured_document_scope_resolver: (
+        Callable[[str], ProviderConnectionScope] | None
+    ) = None,
     dashboard_projector: JarvisDashboardProjector | None = None,
     authorizer: BrowserSessionAuthorizer | None = None,
     clock: ApiClock | None = None,
@@ -300,6 +323,44 @@ def create_jarvis_http_app(
         tenant_identity_resolver
     ):
         raise ValueError("Jarvis HTTP API requires a tenant identity resolver")
+    document_repositories_configured = any(
+        repository is not None
+        for repository in (
+            structured_document_repository,
+            benchmarking_financials_repository,
+        )
+    )
+    if document_repositories_configured != (
+        structured_document_scope_resolver is not None
+    ):
+        raise ValueError(
+            "Jarvis HTTP API document reads require repositories and a scope "
+            "resolver"
+        )
+    if structured_document_repository is not None and not isinstance(
+        structured_document_repository,
+        StructuredFinancialDocumentRepository,
+    ):
+        raise ValueError(
+            "Jarvis HTTP API requires structured document storage"
+        )
+    if (
+        benchmarking_financials_repository is not None
+        and not isinstance(
+            benchmarking_financials_repository,
+            BenchmarkingFinancialsRepository,
+        )
+    ):
+        raise ValueError(
+            "Jarvis HTTP API requires Benchmarking Financials storage"
+        )
+    if (
+        structured_document_scope_resolver is not None
+        and not callable(structured_document_scope_resolver)
+    ):
+        raise ValueError(
+            "Jarvis HTTP API requires a structured document scope resolver"
+        )
     resolved_authorizer = authorizer or InMemoryBrowserSessionAuthorizer()
     resolved_dashboard_projector = (
         dashboard_projector or JarvisDashboardProjector()
@@ -776,6 +837,181 @@ def create_jarvis_http_app(
                 content=response.model_dump(mode="json"),
             )
         raise HTTPException(status_code=500, detail="invalid operation state")
+
+    @app.get(
+        "/api/v1/sessions/{session_id}/operations/{operation_id}"
+        "/financial-documents/{cache_entry_id}",
+        response_model=BrowserStructuredFinancialDocumentResponse,
+    )
+    def get_structured_financial_document(
+        session_id: str,
+        operation_id: str,
+        cache_entry_id: str,
+        x_jarvis_session_token: str | None = Header(default=None),
+    ) -> BrowserStructuredFinancialDocumentResponse:
+        authorize(session_id, x_jarvis_session_token)
+        snapshot = owned_operation(session_id, operation_id)
+        if snapshot.status is not BrowserOperationStatus.COMPLETED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="financial documents are available after completion",
+            )
+        output = operations.get_result(operation_id)
+        if output is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="completed browser operation result is unavailable",
+            )
+        reference = next(
+            (
+                item
+                for item in output.structured_document_references
+                if item.cache_entry_id == cache_entry_id
+            ),
+            None,
+        )
+        if reference is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        if (
+            structured_document_repository is None
+            or structured_document_scope_resolver is None
+        ):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        try:
+            connection = structured_document_scope_resolver(session_id)
+            if not isinstance(connection, ProviderConnectionScope):
+                raise TypeError("invalid structured document scope")
+            stored = (
+                structured_document_repository
+                .get_structured_financial_document_by_cache_entry_id(
+                    cache_entry_id,
+                    scope=StructuredDocumentRepositoryScope(
+                        tenant_id=connection.tenant_id,
+                        provider_connection_id=(
+                            connection.provider_connection_id
+                        ),
+                        provider=connection.provider,
+                    ),
+                    as_of=resolved_clock(),
+                )
+            )
+        except (StorageError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="financial document storage is currently unavailable",
+            ) from exc
+        if stored is None:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="financial document cache entry is no longer active",
+            )
+        document = stored.result.document
+        if document is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="cached financial document is invalid",
+            )
+        try:
+            return BrowserStructuredFinancialDocumentResponse(
+                operation_id=operation_id,
+                reference=reference,
+                document=BrowserStructuredFinancialDocument.from_document(
+                    document
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="cached financial document failed integrity checks",
+            ) from exc
+
+    @app.get(
+        "/api/v1/sessions/{session_id}/operations/{operation_id}"
+        "/benchmarking-financials/{cache_entry_id}",
+        response_model=BrowserBenchmarkingFinancialsDocumentResponse,
+    )
+    def get_benchmarking_financials_document(
+        session_id: str,
+        operation_id: str,
+        cache_entry_id: str,
+        x_jarvis_session_token: str | None = Header(default=None),
+    ) -> BrowserBenchmarkingFinancialsDocumentResponse:
+        authorize(session_id, x_jarvis_session_token)
+        snapshot = owned_operation(session_id, operation_id)
+        if snapshot.status is not BrowserOperationStatus.COMPLETED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Benchmarking Financials are available after completion"
+                ),
+            )
+        output = operations.get_result(operation_id)
+        if output is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="completed browser operation result is unavailable",
+            )
+        reference = output.benchmarking_financials_reference
+        if reference is None or reference.cache_entry_id != cache_entry_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        if (
+            benchmarking_financials_repository is None
+            or structured_document_scope_resolver is None
+        ):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        try:
+            connection = structured_document_scope_resolver(session_id)
+            if not isinstance(connection, ProviderConnectionScope):
+                raise TypeError("invalid Benchmarking Financials scope")
+            stored = (
+                benchmarking_financials_repository
+                .get_benchmarking_financials_by_cache_entry_id(
+                    cache_entry_id,
+                    scope=StructuredDocumentRepositoryScope(
+                        tenant_id=connection.tenant_id,
+                        provider_connection_id=(
+                            connection.provider_connection_id
+                        ),
+                        provider=connection.provider,
+                    ),
+                    as_of=resolved_clock(),
+                )
+            )
+        except (StorageError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Benchmarking Financials storage is currently unavailable"
+                ),
+            ) from exc
+        if stored is None:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail=(
+                    "Benchmarking Financials cache entry is no longer active"
+                ),
+            )
+        document = stored.result.document
+        if document is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="cached Benchmarking Financials document is invalid",
+            )
+        try:
+            return BrowserBenchmarkingFinancialsDocumentResponse(
+                operation_id=operation_id,
+                reference=reference,
+                document=BrowserBenchmarkingFinancialsDocument.from_document(
+                    document
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "cached Benchmarking Financials failed integrity checks"
+                ),
+            ) from exc
 
     @app.post(
         "/api/v1/sessions/{session_id}/operations/{operation_id}/cancel",

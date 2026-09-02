@@ -1,6 +1,6 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
@@ -11,6 +11,7 @@ from app.exceptions import (
     BrowserSessionNotFoundError,
 )
 from app.models.browser_operations import (
+    BrowserBenchmarkingFinancialsReference,
     BrowserOperationFailure,
     BrowserOperationKind,
     BrowserOperationRequest,
@@ -26,6 +27,7 @@ from app.models.workflow import (
     WorkflowEventState,
     WorkflowStage,
 )
+from app.services.fundamental_evidence import FundamentalEvidenceSource
 from app.workflow.events import WorkflowEventEmitter
 from app.workflow.operations import InMemoryBrowserOperationRegistry
 
@@ -62,6 +64,63 @@ def _request(
 
 
 class BrowserOperationModelTests(unittest.TestCase):
+    def test_benchmarking_reference_is_bounded_and_browser_safe(self):
+        reference = BrowserBenchmarkingFinancialsReference(
+            cache_entry_id="benchmarking_financials:" + "a" * 64,
+            document_id=(
+                "tijori.NSE.COFORGE."
+                "benchmarking_financials.not_applicable"
+            ),
+            exchange="nse",
+            symbol="coforge",
+            source=FundamentalEvidenceSource.CACHE,
+            document_fingerprint="b" * 64,
+            observation_date=date(2026, 9, 1),
+            retrieved_at=T0,
+            stored_at=T0 + timedelta(seconds=1),
+            expires_at=T0 + timedelta(days=10),
+            all_rows_captured=True,
+            company_count=3,
+            row_count=26,
+        )
+
+        self.assertEqual(reference.exchange, "NSE")
+        self.assertEqual(reference.symbol, "COFORGE")
+        self.assertEqual(reference.document_type, "benchmarking_financials")
+        self.assertNotIn("rows", reference.model_dump())
+        self.assertNotIn("companies", reference.model_dump())
+
+    def test_benchmarking_reference_rejects_unsafe_or_expired_metadata(self):
+        values = {
+            "cache_entry_id": "benchmarking_financials:" + "a" * 64,
+            "document_id": (
+                "tijori.NSE.COFORGE."
+                "benchmarking_financials.not_applicable"
+            ),
+            "exchange": "NSE",
+            "symbol": "COFORGE",
+            "source": FundamentalEvidenceSource.PROVIDER,
+            "document_fingerprint": "b" * 64,
+            "observation_date": date(2026, 9, 1),
+            "retrieved_at": T0,
+            "stored_at": T0 + timedelta(seconds=1),
+            "expires_at": T0 + timedelta(days=10),
+            "all_rows_captured": True,
+            "company_count": 2,
+            "row_count": 1,
+        }
+        for changes in (
+            {"cache_entry_id": "benchmarking_financials:unsafe"},
+            {"company_count": 1},
+            {"stored_at": T0 - timedelta(seconds=1)},
+            {"expires_at": T0},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValidationError):
+                    BrowserBenchmarkingFinancialsReference(
+                        **(values | changes)
+                    )
+
     def test_fundamental_routing_flags_are_strict_and_idempotent(self):
         technical = _request()
         fundamentals = technical.model_copy(

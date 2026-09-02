@@ -88,7 +88,7 @@ test('returns bounded provider-derived company records', async () => {
   assert.equal(Object.isFrozen(result.payload.companies[0]), true);
 });
 
-test('respects exchange filters and result limits without inventing identity', async () => {
+test('uses one explicit exchange constraint when provider metadata omits it', async () => {
   const provider = fixture({
     searchPayload: [
       { name: 'First', slug: 'first-company', type: 'companies' },
@@ -97,7 +97,12 @@ test('respects exchange filters and result limits without inventing identity', a
     ],
     metadata: {
       'first-company': { ...tcsMetadata, company_id: 1, exchange: 'BSE' },
-      'second-company': { ...tcsMetadata, company_id: 2, symbol: 'TCS2' },
+      'second-company': {
+        ...tcsMetadata,
+        company_id: 2,
+        exchange: undefined,
+        symbol: 'TCS2',
+      },
       'third-company': { ...tcsMetadata, company_id: 3, symbol: 'TCS3' },
     },
   });
@@ -108,6 +113,11 @@ test('respects exchange filters and result limits without inventing identity', a
   assert.equal(result.status, 'success');
   assert.equal(result.payload.companies.length, 1);
   assert.equal(result.payload.companies[0].company_id, '2');
+  assert.equal(result.payload.companies[0].exchange, 'NSE');
+  assert.deepEqual(
+    result.payload.companies[0].matched_on,
+    ['provider_search', 'legal_name', 'requested_exchange'],
+  );
   assert.equal(provider.observed.navigations.length, 3);
 });
 
@@ -127,6 +137,12 @@ test('distinguishes no results from unusable provider identity metadata', async 
   })({ query: 'TCS' });
   assert.equal(incompleteResult.status, 'unavailable');
   assert.equal(incompleteResult.payload, null);
+
+  const ambiguousExchange = await createSearchCompanyHandler({
+    browserRunner: incomplete.runner,
+  })({ query: 'TCS', exchanges: ['NSE', 'BSE'] });
+  assert.equal(ambiguousExchange.status, 'unavailable');
+  assert.equal(ambiguousExchange.payload, null);
 });
 
 test('drops malformed rows, duplicate slugs, and duplicate identities', async () => {

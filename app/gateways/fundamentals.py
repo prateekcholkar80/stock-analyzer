@@ -16,6 +16,13 @@ from typing import Literal, Protocol, Self, runtime_checkable
 
 from pydantic import Field, computed_field, field_validator, model_validator
 
+from app.models.financial_documents import (
+    FinancialDocumentType,
+    FinancialReportingBasis,
+    StructuredBenchmarkingFinancialsDocument,
+    StructuredFinancialDocument,
+    StructuredPeerComparisonDocument,
+)
 from app.models.fundamentals import (
     FundamentalEvidenceSnapshot,
     FundamentalIssuerIdentity,
@@ -368,6 +375,16 @@ class FundamentalFinancialsRequest(FundamentalIssuerEvidenceRequest):
         return values
 
 
+class FundamentalStructuredDocumentRequest(FundamentalIssuerEvidenceRequest):
+    """Request one complete provider-neutral financial document scenario."""
+
+    capability: Literal[FundamentalCapability.FINANCIAL_STATEMENTS] = (
+        FundamentalCapability.FINANCIAL_STATEMENTS
+    )
+    document_type: FinancialDocumentType
+    reporting_basis: FinancialReportingBasis
+
+
 class FundamentalShareholdingRequest(FundamentalIssuerEvidenceRequest):
     capability: Literal[FundamentalCapability.SHAREHOLDING_HISTORY] = (
         FundamentalCapability.SHAREHOLDING_HISTORY
@@ -630,6 +647,178 @@ class FundamentalEvidenceRetrieval(FundamentalGatewayResponse):
         return sha256(payload.encode("utf-8")).hexdigest()
 
 
+class FundamentalStructuredDocumentResult(FundamentalGatewayResponse):
+    """All-or-nothing retrieval result for one structured document."""
+
+    capability: Literal[FundamentalCapability.FINANCIAL_STATEMENTS] = (
+        FundamentalCapability.FINANCIAL_STATEMENTS
+    )
+    issuer: FundamentalIssuerIdentity
+    document_type: FinancialDocumentType
+    reporting_basis: FinancialReportingBasis
+    status: FundamentalRetrievalStatus
+    document: StructuredFinancialDocument | None = None
+    limitations: tuple[str, ...] = ()
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not value or len(value) > 500 for value in values):
+            raise ValueError("document limitations must be non-blank and bounded")
+        return _require_unique_strings(values, "document limitations")
+
+    @model_validator(mode="after")
+    def validate_document_result(self) -> Self:
+        completed = self.status is FundamentalRetrievalStatus.COMPLETED
+        if completed and self.document is None:
+            raise ValueError("completed document retrieval requires a document")
+        if completed and self.limitations:
+            raise ValueError("completed document retrieval cannot be partial")
+        if not completed and self.document is not None:
+            raise ValueError("failed document retrieval cannot release a document")
+        if not completed and not self.limitations:
+            raise ValueError("failed document retrieval requires an explanation")
+        if self.document is not None:
+            if self.document.connection != self.connection:
+                raise ValueError("document and result connection scopes must match")
+            if self.document.issuer != self.issuer:
+                raise ValueError("document and result issuers must match")
+            if self.document.document_type is not self.document_type:
+                raise ValueError("document and result types must match")
+            if self.document.reporting_basis is not self.reporting_basis:
+                raise ValueError("document and result reporting bases must match")
+            if self.document.retrieved_at > self.completed_at:
+                raise ValueError("document cannot be retrieved after completion")
+        return self
+
+    @computed_field
+    @property
+    def result_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"result_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
+class FundamentalPeerComparisonResult(FundamentalGatewayResponse):
+    """All-or-nothing provider-neutral Peer Comparison result."""
+
+    capability: Literal[FundamentalCapability.COMPANY_OVERVIEW] = (
+        FundamentalCapability.COMPANY_OVERVIEW
+    )
+    issuer: FundamentalIssuerIdentity
+    status: FundamentalRetrievalStatus
+    document: StructuredPeerComparisonDocument | None = None
+    limitations: tuple[str, ...] = ()
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not value or len(value) > 500 for value in values):
+            raise ValueError(
+                "Peer Comparison limitations must be non-blank and bounded"
+            )
+        return _require_unique_strings(values, "Peer Comparison limitations")
+
+    @model_validator(mode="after")
+    def validate_peer_comparison_result(self) -> Self:
+        completed = self.status is FundamentalRetrievalStatus.COMPLETED
+        if completed and self.document is None:
+            raise ValueError(
+                "completed Peer Comparison requires a document"
+            )
+        if completed and self.limitations:
+            raise ValueError(
+                "completed Peer Comparison cannot contain limitations"
+            )
+        if not completed and self.document is not None:
+            raise ValueError(
+                "failed Peer Comparison cannot release a document"
+            )
+        if not completed and not self.limitations:
+            raise ValueError(
+                "failed Peer Comparison requires an explanation"
+            )
+        if self.document is not None:
+            if self.document.connection != self.connection:
+                raise ValueError(
+                    "Peer Comparison connection scopes must match"
+                )
+            if self.document.issuer != self.issuer:
+                raise ValueError("Peer Comparison issuers must match")
+            if self.document.retrieved_at > self.completed_at:
+                raise ValueError(
+                    "Peer Comparison cannot be retrieved after completion"
+                )
+        return self
+
+    @computed_field
+    @property
+    def result_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"result_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
+class FundamentalBenchmarkingFinancialsResult(FundamentalGatewayResponse):
+    """All-or-nothing provider-neutral Benchmarking Financials result."""
+
+    capability: Literal[FundamentalCapability.COMPANY_OVERVIEW] = (
+        FundamentalCapability.COMPANY_OVERVIEW
+    )
+    issuer: FundamentalIssuerIdentity
+    status: FundamentalRetrievalStatus
+    document: StructuredBenchmarkingFinancialsDocument | None = None
+    limitations: tuple[str, ...] = ()
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not value or len(value) > 500 for value in values):
+            raise ValueError(
+                "Benchmarking Financials limitations must be non-blank and bounded"
+            )
+        return _require_unique_strings(
+            values,
+            "Benchmarking Financials limitations",
+        )
+
+    @model_validator(mode="after")
+    def validate_benchmarking_financials_result(self) -> Self:
+        completed = self.status is FundamentalRetrievalStatus.COMPLETED
+        if completed and self.document is None:
+            raise ValueError(
+                "completed Benchmarking Financials requires a document"
+            )
+        if completed and self.limitations:
+            raise ValueError(
+                "completed Benchmarking Financials cannot contain limitations"
+            )
+        if not completed and self.document is not None:
+            raise ValueError(
+                "failed Benchmarking Financials cannot release a document"
+            )
+        if not completed and not self.limitations:
+            raise ValueError(
+                "failed Benchmarking Financials requires an explanation"
+            )
+        if self.document is not None:
+            if self.document.connection != self.connection:
+                raise ValueError(
+                    "Benchmarking Financials connection scopes must match"
+                )
+            if self.document.issuer != self.issuer:
+                raise ValueError("Benchmarking Financials issuers must match")
+            if self.document.retrieved_at > self.completed_at:
+                raise ValueError(
+                    "Benchmarking Financials cannot be retrieved after completion"
+                )
+        return self
+
+    @computed_field
+    @property
+    def result_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"result_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
 def validate_fundamental_response_binding(
     request: FundamentalGatewayRequest,
     response: FundamentalGatewayResponse,
@@ -646,6 +835,33 @@ def validate_fundamental_response_binding(
         raise ValueError("fundamental response capability does not match")
     if response.requested_at != request.requested_at:
         raise ValueError("fundamental response request time does not match")
+    if isinstance(request, FundamentalStructuredDocumentRequest):
+        if not isinstance(response, FundamentalStructuredDocumentResult):
+            raise ValueError("structured-document request requires its result type")
+        if response.issuer != request.issuer:
+            raise ValueError("structured-document response issuer does not match")
+        if response.document_type is not request.document_type:
+            raise ValueError("structured-document response type does not match")
+        if response.reporting_basis is not request.reporting_basis:
+            raise ValueError(
+                "structured-document response reporting basis does not match"
+            )
+    if isinstance(response, FundamentalPeerComparisonResult):
+        if not isinstance(request, FundamentalCompanyOverviewRequest):
+            raise ValueError(
+                "Peer Comparison response requires an overview request"
+            )
+        if response.issuer != request.issuer:
+            raise ValueError("Peer Comparison response issuer does not match")
+    if isinstance(response, FundamentalBenchmarkingFinancialsResult):
+        if not isinstance(request, FundamentalCompanyOverviewRequest):
+            raise ValueError(
+                "Benchmarking Financials response requires an overview request"
+            )
+        if response.issuer != request.issuer:
+            raise ValueError(
+                "Benchmarking Financials response issuer does not match"
+            )
 
 
 @runtime_checkable
@@ -698,4 +914,52 @@ class FundamentalEvidenceGateway(Protocol):
         *,
         request: FundamentalShareholdingRequest,
     ) -> FundamentalEvidenceRetrieval:
+        ...
+
+
+@runtime_checkable
+class FundamentalStructuredDocumentGateway(Protocol):
+    """Narrow boundary consumed by structured-document coordinators."""
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        ...
+
+    def retrieve_structured_financial_document(
+        self,
+        *,
+        request: FundamentalStructuredDocumentRequest,
+    ) -> FundamentalStructuredDocumentResult:
+        ...
+
+
+@runtime_checkable
+class FundamentalPeerComparisonGateway(Protocol):
+    """Narrow provider-neutral boundary for Peer Comparison retrieval."""
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        ...
+
+    def retrieve_peer_comparison(
+        self,
+        *,
+        request: FundamentalCompanyOverviewRequest,
+    ) -> FundamentalPeerComparisonResult:
+        ...
+
+
+@runtime_checkable
+class FundamentalBenchmarkingFinancialsGateway(Protocol):
+    """Narrow provider-neutral boundary for Financial benchmarking."""
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        ...
+
+    def retrieve_benchmarking_financials(
+        self,
+        *,
+        request: FundamentalCompanyOverviewRequest,
+    ) -> FundamentalBenchmarkingFinancialsResult:
         ...

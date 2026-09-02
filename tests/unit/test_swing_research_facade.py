@@ -105,6 +105,70 @@ class RecordingExecutor:
 
 
 class JarvisSwingResearchFacadeTests(unittest.TestCase):
+    def test_invokes_post_resolution_callback_before_command_handler(self):
+        command = _command()
+        resolver = RecordingRequestResolver(result=command)
+        handler = RecordingCommandHandler()
+        sequence = []
+
+        class SequencedHandler(RecordingCommandHandler):
+            def execute(self, *args, **kwargs):
+                sequence.append("handler")
+                return super().execute(*args, **kwargs)
+
+        handler = SequencedHandler()
+        facade = JarvisSwingResearchFacade(resolver, handler)
+
+        response = facade.execute(
+            "Analyze Reliance for a swing trade",
+            instrument_resolved_callback=lambda resolved: sequence.append(
+                ("resolved", resolved)
+            ),
+        )
+
+        self.assertEqual(response.status, JarvisCommandStatus.COMPLETED)
+        self.assertEqual(sequence, [("resolved", command), "handler"])
+
+    def test_resolution_callback_failure_skips_command_handler(self):
+        sink = InMemoryWorkflowEventSink()
+        handler = RecordingCommandHandler()
+        facade = JarvisSwingResearchFacade(
+            RecordingRequestResolver(result=_command()),
+            handler,
+            sink,
+        )
+
+        def fail(_command):
+            raise RuntimeError("independent branch failed")
+
+        with self.assertRaisesRegex(RuntimeError, "independent branch failed"):
+            facade.execute(
+                "Analyze Reliance for a swing trade",
+                instrument_resolved_callback=fail,
+            )
+
+        self.assertEqual(handler.calls, [])
+        self.assertEqual(
+            [event.stage for event in sink.events],
+            [
+                WorkflowStage.REQUEST_RECEIVED,
+                WorkflowStage.INSTRUMENT_RESOLVED,
+                WorkflowStage.FAILED,
+            ],
+        )
+
+    def test_rejects_non_callable_resolution_callback(self):
+        facade = JarvisSwingResearchFacade(
+            RecordingRequestResolver(result=_command()),
+            RecordingCommandHandler(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "callback must be callable"):
+            facade.execute(
+                "Analyze Reliance for a swing trade",
+                instrument_resolved_callback=object(),
+            )
+
     def test_routes_text_to_command_with_one_operation_id(self):
         as_of = datetime(2026, 8, 21, 15, 30, tzinfo=UTC)
         resolver = RecordingRequestResolver(result=_command(as_of))

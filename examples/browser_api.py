@@ -88,14 +88,15 @@ def _provider_session_http_dependencies(
             "Tijori browser-session configuration is missing or invalid"
         ) from exc
 
+    def fundamental_scope_resolver(browser_session_id: str):
+        return registry.resolve(browser_session_id, provider_target)
+
     return {
         "fundamental_evidence_coordinator": evidence,
-        "fundamental_provider_scope_resolver": (
-            lambda browser_session_id: registry.resolve(
-                browser_session_id,
-                provider_target,
-            )
-        ),
+        "fundamental_provider_scope_resolver": fundamental_scope_resolver,
+        "structured_document_repository": repository,
+        "benchmarking_financials_repository": repository,
+        "structured_document_scope_resolver": fundamental_scope_resolver,
         "provider_sessions": service,
         "provider_connection_scope_resolver": registry,
         "browser_session_ownership": registry,

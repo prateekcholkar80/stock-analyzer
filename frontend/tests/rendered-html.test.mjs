@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 async function render() {
@@ -29,4 +30,18 @@ test("server-renders the Jarvis investment console", async () => {
   assert.match(html, /IST · (?:<!-- -->)?--:--/i);
   assert.match(html, /Research, not guaranteed investment advice/i);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
+});
+
+test("completed operations expose financial-document references to the Fundamental Analyst", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+
+  assert.match(page, /fetch\(`\$\{operationBase\}\/result`/);
+  assert.match(page, /structured_document_references/);
+  assert.match(page, /setStructuredDocuments\(\[\]\)/);
+  assert.match(page, /Completed financial documents/);
+  assert.match(page, /FINANCIAL_DOCUMENT_LABELS\[document\.document_type\]/);
+  assert.match(page, /benchmarking_financials_reference/);
+  assert.match(page, /fetchBenchmarkingFinancials/);
+  assert.match(page, /Peer benchmarking/);
+  assert.match(page, /best-benchmark/);
 });

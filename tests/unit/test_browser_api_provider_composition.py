@@ -15,6 +15,12 @@ from app.services.fundamental_evidence import (
     FundamentalEvidenceSource,
 )
 from app.storage.adapters.duckdb import DuckDBJarvisStorage
+from app.storage.financial_document_repositories import (
+    StructuredFinancialDocumentRepository,
+)
+from app.storage.benchmarking_financials_repositories import (
+    BenchmarkingFinancialsRepository,
+)
 from tests.unit.test_fundamental_in_memory_repository import build_entry
 from examples.browser_api import _provider_session_http_dependencies
 
@@ -108,6 +114,28 @@ class BrowserApiProviderCompositionTests(unittest.TestCase):
             "fundamental_provider_scope_resolver"
         ]("session-prateek")
         self.assertEqual(fundamental_scope, scope)
+        self.assertIs(
+            dependencies["structured_document_repository"],
+            self.storage,
+        )
+        self.assertIsInstance(
+            dependencies["structured_document_repository"],
+            StructuredFinancialDocumentRepository,
+        )
+        self.assertIs(
+            dependencies["benchmarking_financials_repository"],
+            self.storage,
+        )
+        self.assertIsInstance(
+            dependencies["benchmarking_financials_repository"],
+            BenchmarkingFinancialsRepository,
+        )
+        self.assertEqual(
+            dependencies["structured_document_scope_resolver"](
+                "session-prateek"
+            ),
+            scope,
+        )
 
     def test_other_tenant_cannot_resolve_configured_local_connection(self):
         dependencies = _provider_session_http_dependencies(

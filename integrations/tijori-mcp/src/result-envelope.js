@@ -35,14 +35,18 @@ const PROHIBITED_KEYS = new Set([
   'token',
 ]);
 
-const MAX_PAYLOAD_BYTES = 1_000_000;
-const MAX_JSON_DEPTH = 8;
-const MAX_JSON_NODES = 10_000;
+// Complete, fully expanded financial statements can legitimately contain up
+// to 20,000 labelled cells. Keep the response bounded, but size the envelope
+// for the extractor contract rather than rejecting valid provider evidence.
+const MAX_PAYLOAD_BYTES = 8_000_000;
+const MAX_JSON_DEPTH = 16;
+const MAX_JSON_NODES = 250_000;
 const MAX_KEY_LENGTH = 160;
 const MAX_STRING_LENGTH = 10_000;
 
 export {
   APPROVED_TOOL_NAMES,
+  MAX_JSON_NODES,
   MAX_PAYLOAD_BYTES,
   TOOL_STATUSES,
 };

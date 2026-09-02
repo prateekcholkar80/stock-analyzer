@@ -17,12 +17,29 @@ const FINANCIAL_STATEMENTS = new Set([
   'adjustment',
 ]);
 const PERIOD_TYPES = new Set(['annual', 'quarterly', 'monthly', 'ytd', 'ltm']);
+const FINANCIAL_DOCUMENT_TYPES = new Set([
+  'growth_table',
+  'balance_sheet',
+  'profit_and_loss',
+  'cash_flow',
+  'ratios',
+  'quarterly_results',
+]);
+const FINANCIAL_REPORTING_BASES = new Set([
+  'consolidated',
+  'standalone',
+  'not_applicable',
+]);
 const DEFAULT_STATEMENTS = Object.freeze([
   'income_statement',
   'balance_sheet',
   'cash_flow',
 ]);
 const DEFAULT_PERIOD_TYPES = Object.freeze(['annual', 'quarterly']);
+const COMPANY_OVERVIEW_DOCUMENT_TYPES = new Set([
+  'peer_comparison',
+  'benchmarking_financials',
+]);
 
 export function validateToolArguments(toolName, candidate) {
   if (!APPROVED_TOOLS.has(toolName)) {
@@ -76,16 +93,75 @@ function validateResolveCompanyIds(value) {
 }
 
 function validateCompanyOverview(value) {
-  requireExactKeys(value, ['issuer'], ['as_of_date']);
-  return evidenceArguments(value);
+  requireExactKeys(value, ['issuer'], ['as_of_date', 'document_type']);
+  const normalized = evidenceArguments(value);
+  if (value.document_type === undefined) {
+    return normalized;
+  }
+  return {
+    ...normalized,
+    document_type: enumScalar(
+      value.document_type,
+      'document_type',
+      COMPANY_OVERVIEW_DOCUMENT_TYPES,
+    ),
+  };
 }
 
 function validateFinancials(value) {
   requireExactKeys(
     value,
     ['issuer'],
-    ['as_of_date', 'statements', 'period_types', 'max_periods'],
+    [
+      'as_of_date',
+      'statements',
+      'period_types',
+      'max_periods',
+      'document_type',
+      'reporting_basis',
+    ],
   );
+  const documentRequested = value.document_type !== undefined;
+  const basisSupplied = value.reporting_basis !== undefined;
+  if (documentRequested !== basisSupplied) {
+    throw new TypeError(
+      'Financial document requests require document_type and reporting_basis',
+    );
+  }
+  if (documentRequested) {
+    if (
+      value.statements !== undefined
+      || value.period_types !== undefined
+      || value.max_periods !== undefined
+    ) {
+      throw new TypeError(
+        'Financial document requests cannot mix legacy statement selections',
+      );
+    }
+    const documentType = enumScalar(
+      value.document_type,
+      'document_type',
+      FINANCIAL_DOCUMENT_TYPES,
+    );
+    const reportingBasis = enumScalar(
+      value.reporting_basis,
+      'reporting_basis',
+      FINANCIAL_REPORTING_BASES,
+    );
+    if (
+      (documentType === 'growth_table')
+      !== (reportingBasis === 'not_applicable')
+    ) {
+      throw new TypeError(
+        'Growth Table requires the not_applicable reporting basis exclusively',
+      );
+    }
+    return {
+      ...evidenceArguments(value),
+      document_type: documentType,
+      reporting_basis: reportingBasis,
+    };
+  }
   return {
     ...evidenceArguments(value),
     statements: enumArray(
@@ -100,6 +176,13 @@ function validateFinancials(value) {
     ),
     max_periods: boundedInteger(value.max_periods ?? 12, 'max_periods', 1, 40),
   };
+}
+
+function enumScalar(value, field, approved) {
+  if (typeof value !== 'string' || !approved.has(value)) {
+    throw new TypeError(`${field} contains an unsupported value`);
+  }
+  return value;
 }
 
 function validateShareholding(value) {

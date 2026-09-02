@@ -24,6 +24,7 @@ from app.models.fundamentals import ProviderConnectionScope
 
 NOW = datetime(2026, 8, 29, 10, 0, tzinfo=UTC)
 CONTENT = b'{"cookies":[],"origins":[]}'
+REPLACEMENT_CONTENT = b'{"cookies":[{"name":"new"}],"origins":[]}'
 INTERACTIVE_COMMAND = (Path("/usr/bin/node"), Path("/opt/jarvis/cli.js"))
 
 
@@ -255,6 +256,108 @@ class LocalFileProviderSessionProvisionerTests(unittest.TestCase):
         with self.assertRaises(LocalSessionProvisioningError):
             provisioner.provision(request=self.provision_request())
 
+        self.assertEqual(calls, [])
+
+    def test_replaces_only_an_expired_session_after_successful_login(self):
+        self.provisioned_at = NOW - timedelta(hours=13)
+        self.write_session()
+        calls = []
+
+        def runner(command, **options):
+            calls.append(command)
+            target = Path(options["env"]["JARVIS_TIJORI_SESSION_FILE"])
+            self.assertFalse(target.exists())
+            target.write_bytes(REPLACEMENT_CONTENT)
+            target.chmod(0o600)
+            os.utime(target, (NOW.timestamp(), NOW.timestamp()))
+            fingerprint = hashlib.sha256(REPLACEMENT_CONTENT).hexdigest()
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    '{"session_reference_hash":"'
+                    f'{fingerprint}","status":"ready"}}\n'
+                ),
+            )
+
+        provisioner = self.build(
+            interactive_command=INTERACTIVE_COMMAND,
+            process_runner=runner,
+        )
+        lifecycle = provisioner.provision(
+            request=self.provision_request(replace_existing=True)
+        )
+
+        self.assertEqual(lifecycle.status, ProviderSessionStatus.READY)
+        self.assertEqual(self.path.read_bytes(), REPLACEMENT_CONTENT)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(list(self.root.glob(".replacement-*.tmp")), [])
+
+    def test_failed_replacement_restores_the_expired_session(self):
+        self.provisioned_at = NOW - timedelta(hours=13)
+        self.write_session()
+
+        def runner(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="node", timeout=45)
+
+        provisioner = self.build(
+            interactive_command=INTERACTIVE_COMMAND,
+            process_runner=runner,
+        )
+        with self.assertRaises(LocalSessionProvisioningError):
+            provisioner.provision(
+                request=self.provision_request(replace_existing=True)
+            )
+
+        self.assertEqual(self.path.read_bytes(), CONTENT)
+        lifecycle = provisioner.inspect(request=self.inspect_request())
+        self.assertEqual(lifecycle.status, ProviderSessionStatus.EXPIRED)
+        self.assertEqual(list(self.root.glob(".replacement-*.tmp")), [])
+
+    def test_tampered_replacement_is_removed_before_old_session_is_restored(self):
+        self.provisioned_at = NOW - timedelta(hours=13)
+        self.write_session()
+
+        def runner(command, **options):
+            target = Path(options["env"]["JARVIS_TIJORI_SESSION_FILE"])
+            target.write_bytes(REPLACEMENT_CONTENT)
+            target.chmod(0o600)
+            os.utime(target, (NOW.timestamp(), NOW.timestamp()))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    '{"session_reference_hash":"'
+                    f'{"c" * 64}","status":"ready"}}\n'
+                ),
+            )
+
+        provisioner = self.build(
+            interactive_command=INTERACTIVE_COMMAND,
+            process_runner=runner,
+        )
+        with self.assertRaises(LocalSessionProvisioningError):
+            provisioner.provision(
+                request=self.provision_request(replace_existing=True)
+            )
+
+        self.assertEqual(self.path.read_bytes(), CONTENT)
+        self.assertEqual(list(self.root.glob(".replacement-*.tmp")), [])
+
+    def test_ready_session_cannot_be_replaced(self):
+        self.write_session()
+        calls = []
+        provisioner = self.build(
+            interactive_command=INTERACTIVE_COMMAND,
+            process_runner=lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+
+        with self.assertRaises(LocalSessionProvisioningError):
+            provisioner.provision(
+                request=self.provision_request(replace_existing=True)
+            )
+
+        self.assertEqual(self.path.read_bytes(), CONTENT)
         self.assertEqual(calls, [])
 
     def test_provisioning_fails_closed_for_process_and_response_tampering(self):

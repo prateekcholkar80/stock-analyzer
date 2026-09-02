@@ -1,5 +1,5 @@
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -36,7 +36,23 @@ from app.services.fundamental_evidence import (
     FundamentalEvidenceSource,
 )
 from app.storage.adapters.duckdb import DuckDBJarvisStorage
+from app.storage.financial_document_repositories import (
+    StructuredFinancialDocumentRepository,
+)
+from app.storage.peer_comparison_repositories import PeerComparisonRepository
+from app.storage.benchmarking_financials_repositories import (
+    BenchmarkingFinancialsRepository,
+)
+from tests.unit.test_financial_document_in_memory_repository import (
+    build_entry as build_structured_entry,
+)
 from tests.unit.test_fundamental_in_memory_repository import build_entry
+from tests.unit.test_peer_comparison_in_memory_repository import (
+    build_entry as build_peer_comparison_entry,
+)
+from tests.unit.test_benchmarking_financials_in_memory_repository import (
+    build_entry as build_benchmarking_financials_entry,
+)
 
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
@@ -146,6 +162,81 @@ class TijoriFundamentalCompositionTests(unittest.TestCase):
         self.assertIsInstance(coordinator, FundamentalEvidenceCoordinator)
         self.assertEqual(result.source, FundamentalEvidenceSource.CACHE)
         self.assertEqual(result.stored_snapshot, stored)
+
+    def test_reuses_same_open_duckdb_for_structured_document_cache(self):
+        database = Path(self.temporary.name) / "structured-fundamentals.duckdb"
+        stored = build_structured_entry()
+        clock = lambda: stored.stored_at + timedelta(hours=1)
+        with DuckDBJarvisStorage(database, clock=clock) as repository:
+            repository.save_structured_financial_document(stored)
+            coordinator = compose_tijori_fundamental_coordinator(
+                transport_settings=self.settings,
+                repository=repository,
+                clock=clock,
+                transport_builder=lambda settings: FakeTransport(),
+            )
+
+            loaded = coordinator.load_structured_document(stored.request)
+
+            self.assertIsInstance(
+                repository,
+                StructuredFinancialDocumentRepository,
+            )
+            self.assertIs(
+                coordinator._structured_document_repository,
+                repository,
+            )
+
+        self.assertIs(loaded.source, FundamentalEvidenceSource.CACHE)
+        self.assertEqual(loaded.stored_document, stored)
+
+    def test_reuses_same_open_duckdb_for_peer_comparison_cache(self):
+        database = Path(self.temporary.name) / "peer-comparisons.duckdb"
+        stored = build_peer_comparison_entry()
+        clock = lambda: stored.stored_at + timedelta(hours=1)
+        with DuckDBJarvisStorage(database, clock=clock) as repository:
+            repository.save_peer_comparison(stored)
+            coordinator = compose_tijori_fundamental_coordinator(
+                transport_settings=self.settings,
+                repository=repository,
+                clock=clock,
+                transport_builder=lambda settings: FakeTransport(),
+            )
+
+            loaded = coordinator.load_peer_comparison(stored.request)
+
+            self.assertIsInstance(repository, PeerComparisonRepository)
+            self.assertIs(coordinator._peer_comparison_repository, repository)
+
+        self.assertIs(loaded.source, FundamentalEvidenceSource.CACHE)
+        self.assertEqual(loaded.stored_document, stored)
+
+    def test_reuses_same_open_duckdb_for_benchmarking_financials_cache(self):
+        database = Path(self.temporary.name) / "benchmarking.duckdb"
+        stored = build_benchmarking_financials_entry()
+        clock = lambda: stored.stored_at + timedelta(hours=1)
+        with DuckDBJarvisStorage(database, clock=clock) as repository:
+            repository.save_benchmarking_financials(stored)
+            coordinator = compose_tijori_fundamental_coordinator(
+                transport_settings=self.settings,
+                repository=repository,
+                clock=clock,
+                transport_builder=lambda settings: FakeTransport(),
+            )
+
+            loaded = coordinator.load_benchmarking_financials(stored.request)
+
+            self.assertIsInstance(
+                repository,
+                BenchmarkingFinancialsRepository,
+            )
+            self.assertIs(
+                coordinator._benchmarking_financials_repository,
+                repository,
+            )
+
+        self.assertIs(loaded.source, FundamentalEvidenceSource.CACHE)
+        self.assertEqual(loaded.stored_document, stored)
 
     def test_coordinator_composition_rejects_invalid_repository_before_io(self):
         transport_builds = []

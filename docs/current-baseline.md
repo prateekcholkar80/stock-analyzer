@@ -6,9 +6,10 @@ natural-language routing, instrument resolution, workflow observability, and
 wake-activated conversation. It is the authoritative implementation baseline;
 `README.md` provides the shorter project-level view.
 
-Automated test count as of this writing: **1,874 Python tests** (`tests/unit` +
-`tests/integration`) plus **36 browser tests**, all passing without live broker
-or LLM credentials. The browser validation includes a production build.
+Automated test count as of this writing: **2,171 Python tests** (`tests/unit` +
+`tests/integration`), **224 local Tijori MCP tests**, and **51 frontend tests**,
+all passing without live broker, provider, or LLM credentials. The frontend
+validation includes a production build under the pinned Node 24 runtime.
 
 ## 1. Overview
 
@@ -1674,6 +1675,64 @@ fails during composition rather than on the first provider handshake.
 Five focused composition tests and all **194 fundamental/Tijori subsystem
 tests pass**. The local bridge baseline remains **111 passing Node tests**.
 
+### 3.27 Structured Fundamental Documents and Holographic Console
+
+The current fundamental boundary retains the five public read-only MCP tools
+while extending two of them with explicit structured-document scenarios.
+`get_financials` supports complete Growth Table, Balance Sheet, Profit and
+Loss, Cash Flow, Ratios, and Quarterly Results documents. All applicable
+statements are retrieved independently for consolidated and standalone
+reporting. `get_company_overview` supports complete Peer Comparison and
+Benchmarking Financials matrices.
+
+Each extractor is JSON-first. It reads bounded provider-embedded financial
+state, recursively preserves arbitrary row hierarchy and metadata, validates
+period/value coverage, and emits a fully labelled immutable document. This
+avoids dependence on whether a presentation row is visually expanded. Values
+retain their original label, period, unit, zero-versus-missing distinction,
+auxiliary cells, issuer identity, reporting basis, source location, retrieval
+time, schema version, and fingerprint. Raw HTML, screenshots, credentials,
+cookies, browser state, and provider error text are excluded.
+
+The Python adapter translates provider-specific payloads into the neutral
+`StructuredFinancialDocument` boundary. Separate neutral gateway result and
+repository contracts cover structured financial documents, Peer Comparison,
+and Benchmarking Financials. Reference in-memory adapters validate immutable
+idempotency, conflicts, tenant isolation, inclusive expiry, and atomic
+replacement. `DuckDBJarvisStorage` implements the same contracts durably with
+indexed tenant, connection, issuer, document-type, reporting-basis,
+fingerprint, and expiry metadata while retaining the complete validated JSON.
+
+`FundamentalEvidenceCoordinator` reuses a scoped unexpired document, calls the
+provider only on cache miss, expiry, or explicit refresh, atomically replaces
+successful refreshed evidence, and preserves the current valid cache after a
+provider failure. Browser fundamentals requests load the complete configured
+document family, carrying explicit refresh intent through ticker confirmation.
+Large JSON does not inflate the operation response: it returns bounded
+operation-owned references that an authenticated tenant-scoped endpoint can
+resolve against the released result. The frontend API client supports those
+references. Benchmarking data remains analyst evidence rather than a required
+visual matrix.
+
+Provider connection remains user-owned. The UI can explicitly open a headed
+login, check readiness and expiry, and securely revoke the owner-only session;
+Jarvis never receives the user's Tijori credential. Connection registration is
+still local/in-memory and therefore not yet a hosted multi-tenant identity
+service.
+
+The frontend command deck uses event-bound holographic identities for Market
+Data, Daily, Weekly, Fundamental, Bull, Bear, and Judge participants. Agent
+motion, packet links, completion glow, reduced-motion behaviour, and opt-in
+procedural neural sounds are presentation-only and never delay backend work.
+The Bull asset is stored with its licence manifest. The Fundamental Analyst is
+named and represented in the UI, but its deterministic scorecard and LLM skill
+are not yet implemented.
+
+Validation for this milestone is **2,171 passing Python tests**, **224 passing
+Tijori MCP tests**, and a successful frontend production build with **51
+passing frontend tests**. The existing non-fatal Plotly client-chunk advisory
+remains.
+
 ## 4. Configuration & Environment
 
 ```dotenv
@@ -1797,7 +1856,8 @@ stored under the file system's access and retention controls.
 cd frontend && npm test
 ```
 
-Current count: **1,874 Python tests** plus **36 browser tests**, fully offline.
+Current count: **2,171 Python tests**, **224 local Tijori MCP tests**, and **51
+frontend tests**, fully offline at this release boundary.
 The frontend build currently emits a non-fatal advisory that the dynamically
 loaded Plotly chunk is larger than 500 kB after minification. Conventions to
 preserve:
@@ -1814,13 +1874,16 @@ preserve:
 
 ## 6. Known Gaps / Not Yet Implemented
 
-- **No microphone/audio adapters.** `handle_voice_transcript()` accepts an
-  already-transcribed string. Continuous microphone capture, acoustic wake-word
-  detection, speech-to-text, and text-to-speech are not implemented.
-- **The first browser client is implemented, but not yet a full 3D/audio
-  experience.** It has a code-rendered reactor, agent matrix, live authenticated
-  SSE, and result panels. There is no WebSocket alternative, microphone,
-  acoustic wake-word engine, STT, TTS, or Three.js scene yet.
+- **No acoustic wake-word engine or continuous hands-free audio session.**
+  Provider-neutral STT/TTS ports, Google and ElevenLabs adapters, browser
+  microphone VAD, and voice-reply controls exist, but the wake phrase is still
+  recognized from submitted text/transcripts rather than an always-listening
+  local acoustic detector.
+- **The browser is a holographic command deck, not a complete asset-driven 3D
+  world.** It has event-bound kinetic agent identities, a licensed Bull model,
+  reactor/packet motion, opt-in procedural sound, authenticated SSE, and result
+  panels. There is no WebSocket alternative or consistently rigged animated
+  3D asset for every participant.
 - **Prompt audit retention is local-only.** The JSONL audit is intentionally
   diagnostic and has no rotation, retention scheduler, encryption-at-rest,
   multi-process sequencing, or secure-deletion workflow yet.
@@ -1839,14 +1902,13 @@ preserve:
   The lower-level deterministic planner, execution engine, storage schema, and
   walk-forward metrics intentionally still support both long and short research
   scenarios. The default Jarvis conversation can release only long or no-trade.
-- **No fundamental, sentiment, or macro agent analysis yet.** The first
-  provider-neutral fundamental evidence contracts now exist for tenant-scoped
-  connections, sources, normalized facts, conflicts, lineage, and immutable
-  snapshots, with in-memory and DuckDB cache repositories. The offline Tijori
-  normalization adapter, hardened stdio transport, and pinned five-tool local
-  bridge now exist and are covered offline. There is no user-facing session
-  provisioning flow, live authenticated validation, scorecard, red-flag
-  engine, financial agent, or debate integration yet.
+- **No Fundamental Analyst, sentiment agent, or macro agent analysis yet.**
+  User-owned Tijori session controls and complete cached structured financial,
+  peer, and benchmarking JSON now exist across provider-neutral contracts,
+  in-memory/DuckDB repositories, browser workflow references, and authenticated
+  resolution. The deterministic scorecard, red-flag engine, versioned
+  Fundamental Analyst skill, and combined technical/fundamental debate remain
+  pending. Annual reports are explicitly deferred.
 - **No genuine order-flow pipeline.** Current hourly/daily/weekly OHLCV, OBV,
   accumulation, volume expansion, and liquidity-sweep calculations are
   price-volume evidence, not bid/ask aggressor flow. Genuine evaluation needs
@@ -1854,7 +1916,7 @@ preserve:
   need a prospective headless recorder; historical replay needs a separately
   licensed order/trade dataset. No `OrderFlowGateway`, recorder, storage schema,
   analyzer, agent, or backtest has been implemented.
-- **No debate/verdict *quality* eval harness.** 1,874 Python tests verify the
+- **No debate/verdict *quality* eval harness.** 2,171 Python tests verify the
   pipeline is *implemented correctly* (schemas, citations, determinism,
   chain-of-custody) — none of them score whether an argument was good or
   a verdict was right against what actually happened next. The
@@ -1935,6 +1997,14 @@ User-stated direction for where Jarvis is headed, not yet fully built:
   the unified dashboard/document-grounded report is not yet built.
 
 ## 8. Document History
+
+- **2026-09-02**: Added complete JSON-first structured Growth Table, Balance
+  Sheet, Profit and Loss, Cash Flow, Ratios, Quarterly Results, Peer Comparison,
+  and Benchmarking Financials flows; provider-neutral adapters and cache
+  contracts; in-memory and DuckDB persistence; browser-owned references and
+  authenticated resolution; user-owned Tijori session controls; and the locked
+  event-driven holographic console. Revalidated **2,171 Python tests**, **224
+  Tijori MCP tests**, and **51 frontend tests** plus the production build.
 
 - **2026-08-28**: Added the tenant-scoped, provider-neutral fundamental
   evidence foundation and five-capability read gateway: source hierarchy and

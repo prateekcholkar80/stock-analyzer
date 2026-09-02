@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -9,12 +9,28 @@ from app.fundamentals.session_provisioning import (
     ProviderSessionStatus,
 )
 from app.models.browser_operations import (
+    BrowserBenchmarkingFinancialsReference,
     BrowserOperationKind,
     BrowserOperationOutput,
     BrowserOperationSnapshot,
     BrowserSessionSnapshot,
+    BrowserStructuredDocumentReference,
 )
 from app.models.conversation import InputChannel
+from app.models.financial_documents import (
+    BenchmarkingCompany,
+    BenchmarkingRow,
+    FinancialDocumentPeriod,
+    FinancialDocumentRow,
+    FinancialDocumentType,
+    FinancialReportingBasis,
+    StructuredFinancialDocument,
+    StructuredBenchmarkingFinancialsDocument,
+)
+from app.models.fundamentals import (
+    FundamentalIssuerIdentity,
+    FundamentalValidationStatus,
+)
 from app.models.technical import TechnicalModel
 
 
@@ -121,6 +137,184 @@ class BrowserOperationResultResponse(TechnicalModel):
     )
     operation: BrowserOperationSnapshot
     output: BrowserOperationOutput | None = None
+
+
+class BrowserStructuredFinancialDocument(TechnicalModel):
+    """Browser-safe complete financial table without provider access scope."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    schema_version: Literal["jarvis.http_financial_document_payload.v1"] = (
+        "jarvis.http_financial_document_payload.v1"
+    )
+    document_id: str = Field(
+        min_length=1,
+        max_length=240,
+        pattern=_ID_PATTERN,
+    )
+    issuer: FundamentalIssuerIdentity
+    document_type: FinancialDocumentType
+    reporting_basis: FinancialReportingBasis
+    currency: str | None = None
+    source_unit: str = Field(min_length=1, max_length=80)
+    skipped_period_labels: tuple[str, ...] = ()
+    periods: tuple[FinancialDocumentPeriod, ...]
+    rows: tuple[FinancialDocumentRow, ...]
+    retrieved_at: datetime
+    expires_at: datetime
+    all_sections_expanded: Literal[True]
+    validation_status: FundamentalValidationStatus
+    limitations: tuple[str, ...] = ()
+    document_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+
+    @classmethod
+    def from_document(
+        cls,
+        document: StructuredFinancialDocument,
+    ) -> "BrowserStructuredFinancialDocument":
+        if not isinstance(document, StructuredFinancialDocument):
+            raise TypeError("browser financial payload requires a document")
+        return cls(
+            document_id=document.document_id,
+            issuer=document.issuer,
+            document_type=document.document_type,
+            reporting_basis=document.reporting_basis,
+            currency=document.currency,
+            source_unit=document.source_unit,
+            skipped_period_labels=document.skipped_period_labels,
+            periods=document.periods,
+            rows=document.rows,
+            retrieved_at=document.retrieved_at,
+            expires_at=document.expires_at,
+            all_sections_expanded=document.all_sections_expanded,
+            validation_status=document.validation_status,
+            limitations=document.limitations,
+            document_fingerprint=document.document_fingerprint,
+        )
+
+
+class BrowserStructuredFinancialDocumentResponse(TechnicalModel):
+    """Authenticated resolution of one released operation reference."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    schema_version: Literal["jarvis.http_financial_document.v1"] = (
+        "jarvis.http_financial_document.v1"
+    )
+    operation_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_ID_PATTERN,
+    )
+    reference: BrowserStructuredDocumentReference
+    document: BrowserStructuredFinancialDocument
+
+    @model_validator(mode="after")
+    def require_reference_document_match(self):
+        document = self.document
+        reference = self.reference
+        if (
+            document.document_id != reference.document_id
+            or document.document_type is not reference.document_type
+            or document.reporting_basis is not reference.reporting_basis
+            or document.document_fingerprint
+            != reference.document_fingerprint
+            or document.issuer.exchange != reference.exchange
+            or document.issuer.symbol != reference.symbol
+        ):
+            raise ValueError("financial document does not match its reference")
+        return self
+
+
+class BrowserBenchmarkingFinancialsDocument(TechnicalModel):
+    """Browser-safe complete Financial benchmark matrix."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    schema_version: Literal[
+        "jarvis.http_benchmarking_financials_payload.v1"
+    ] = "jarvis.http_benchmarking_financials_payload.v1"
+    document_id: str = Field(
+        min_length=1,
+        max_length=240,
+        pattern=_ID_PATTERN,
+    )
+    issuer: FundamentalIssuerIdentity
+    observation_date: date
+    reporting_basis: Literal["not_applicable"] = "not_applicable"
+    companies: tuple[BenchmarkingCompany, ...] = Field(
+        min_length=2,
+        max_length=30,
+    )
+    rows: tuple[BenchmarkingRow, ...] = Field(
+        min_length=1,
+        max_length=300,
+    )
+    retrieved_at: datetime
+    expires_at: datetime
+    all_rows_captured: Literal[True]
+    validation_status: FundamentalValidationStatus
+    limitations: tuple[str, ...] = Field(default=(), max_length=100)
+    document_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+
+    @classmethod
+    def from_document(
+        cls,
+        document: StructuredBenchmarkingFinancialsDocument,
+    ) -> "BrowserBenchmarkingFinancialsDocument":
+        if not isinstance(document, StructuredBenchmarkingFinancialsDocument):
+            raise TypeError("browser benchmarking payload requires a document")
+        return cls(
+            document_id=document.document_id,
+            issuer=document.issuer,
+            observation_date=document.observation_date,
+            reporting_basis=document.reporting_basis,
+            companies=document.companies,
+            rows=document.rows,
+            retrieved_at=document.retrieved_at,
+            expires_at=document.expires_at,
+            all_rows_captured=document.all_rows_captured,
+            validation_status=document.validation_status,
+            limitations=document.limitations,
+            document_fingerprint=document.document_fingerprint,
+        )
+
+
+class BrowserBenchmarkingFinancialsDocumentResponse(TechnicalModel):
+    """Authenticated resolution of one released benchmarking reference."""
+
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+
+    schema_version: Literal[
+        "jarvis.http_benchmarking_financials.v1"
+    ] = "jarvis.http_benchmarking_financials.v1"
+    operation_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_ID_PATTERN,
+    )
+    reference: BrowserBenchmarkingFinancialsReference
+    document: BrowserBenchmarkingFinancialsDocument
+
+    @model_validator(mode="after")
+    def require_reference_document_match(self):
+        document = self.document
+        reference = self.reference
+        if (
+            document.document_id != reference.document_id
+            or document.reporting_basis != reference.reporting_basis
+            or document.document_fingerprint
+            != reference.document_fingerprint
+            or document.observation_date != reference.observation_date
+            or document.issuer.exchange != reference.exchange
+            or document.issuer.symbol != reference.symbol
+            or len(document.companies) != reference.company_count
+            or len(document.rows) != reference.row_count
+        ):
+            raise ValueError(
+                "benchmarking document does not match its reference"
+            )
+        return self
 
 
 class ProviderSessionTargetRequest(TechnicalModel):

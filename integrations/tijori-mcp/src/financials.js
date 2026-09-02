@@ -1,4 +1,10 @@
 import { failureResult, successResult } from './result-envelope.js';
+import { createBalanceSheetSnapshotExtractor } from './balance-sheet.js';
+import { createCashFlowSnapshotExtractor } from './cash-flow.js';
+import { createGrowthTableSnapshotExtractor } from './growth-table.js';
+import { createProfitAndLossSnapshotExtractor } from './profit-and-loss.js';
+import { createQuarterlyResultsSnapshotExtractor } from './quarterly-results.js';
+import { createRatiosSnapshotExtractor } from './ratios.js';
 import { validateToolArguments } from './tool-inputs.js';
 
 
@@ -9,6 +15,14 @@ const MARKET_PATTERN = /^[A-Z0-9&_.:-]+$/;
 const MAX_ROWS = 300;
 const MAX_PERIODS = 40;
 const MAX_FACTS = 2_000;
+const STRUCTURED_DOCUMENT_EXTRACTORS = Object.freeze({
+  growth_table: createGrowthTableSnapshotExtractor,
+  balance_sheet: createBalanceSheetSnapshotExtractor,
+  profit_and_loss: createProfitAndLossSnapshotExtractor,
+  cash_flow: createCashFlowSnapshotExtractor,
+  ratios: createRatiosSnapshotExtractor,
+  quarterly_results: createQuarterlyResultsSnapshotExtractor,
+});
 
 const SUPPORTED_STATEMENTS = new Set([
   'income_statement',
@@ -58,15 +72,33 @@ export function createFinancialsHandler({ browserRunner, clock = () => new Date(
 
   return async function getFinancials(argumentsValue) {
     let request;
+    let observedAt;
     let observedDate;
     try {
       request = validateToolArguments('get_financials', argumentsValue);
-      observedDate = istDate(clock());
+      observedAt = clock();
+      observedDate = istDate(observedAt);
     } catch {
       return failureResult('get_financials', 'unavailable');
     }
     if (request.as_of_date !== null && request.as_of_date !== observedDate) {
       return failureResult('get_financials', 'unavailable');
+    }
+    if (Object.hasOwn(STRUCTURED_DOCUMENT_EXTRACTORS, request.document_type)) {
+      try {
+        const extractorFactory = STRUCTURED_DOCUMENT_EXTRACTORS[request.document_type];
+        const extractDocument = extractorFactory({
+          browserRunner,
+          clock: () => observedAt,
+        });
+        const document = await extractDocument({
+          issuer: request.issuer,
+          reporting_basis: request.reporting_basis,
+        });
+        return successResult('get_financials', { document });
+      } catch {
+        return failureResult('get_financials', 'unavailable');
+      }
     }
     const requestedStatements = request.statements.filter((value) => (
       SUPPORTED_STATEMENTS.has(value)
@@ -90,7 +122,13 @@ export function createFinancialsHandler({ browserRunner, clock = () => new Date(
         });
         const status = responseStatus(response);
         if (status !== null) return { status };
-        await page.waitForSelector('table.dataTable', { timeout: 10_000 });
+        await page.waitForSelector([
+          '#profit_and_loss_table',
+          '#balance_sheet_table',
+          '#cash_flow_table',
+          '#quarterly_results_table',
+          'table.dataTable',
+        ].join(', '), { timeout: 10_000 });
         return { status: 'success', value: await extractFinancials(page) };
       });
       if (outcome.status !== 'success') {
@@ -136,10 +174,14 @@ async function extractFinancials(page) {
     const sections = configs.map(([statement, periodType, sectionId]) => {
       const wrapper = document.getElementById(`${sectionId}_table_wrapper`)
         ?? document.getElementById(`company_table_innertab_${sectionId}_content`)
-          ?.querySelector('.dt-container');
+          ?.querySelector('.dt-container')
+        ?? document.getElementById(`${sectionId}_table`);
       if (!wrapper) return null;
       const container = wrapper.closest('[id$="_content"]') ?? wrapper.parentElement;
-      const unit = container?.querySelector('.unit,.units,[class*="unit"]')?.textContent?.trim() ?? null;
+      const unit = container?.querySelector('.unit,.units,[class*="unit"]')
+        ?.textContent?.trim()
+        ?? wrapper.querySelector('thead th.unit_val')?.textContent?.trim()
+        ?? null;
       const headers = Array.from(wrapper.querySelectorAll('thead th.headerItem'))
         .slice(0, 41)
         .map((element) => element.textContent?.trim() ?? '');
@@ -163,16 +205,18 @@ async function extractFinancials(page) {
 }
 
 function normalizeFinancials(value, request, options) {
+  const identity = resolvedIdentity(value?.metadata, request.issuer);
   if (
     value === null
     || typeof value !== 'object'
-    || !validIdentity(value.metadata, request.issuer)
+    || identity === null
     || !Array.isArray(value.sections)
     || value.sections.length > 4
   ) return null;
 
-  const companyId = String(value.metadata.company_id).trim();
+  const companyId = identity.companyId;
   const facts = [];
+  let omittedAmbiguousLineItems = 0;
   for (const section of value.sections) {
     if (
       section === null
@@ -180,9 +224,10 @@ function normalizeFinancials(value, request, options) {
       || !options.requestedStatements.includes(section.statement)
       || !options.requestedPeriods.includes(section.period_type)
     ) continue;
-    const sectionFacts = normalizeSection(section, request.max_periods);
-    if (sectionFacts === null) return null;
-    facts.push(...sectionFacts);
+    const sectionResult = normalizeSection(section, request.max_periods);
+    if (sectionResult === null) return null;
+    facts.push(...sectionResult.facts);
+    omittedAmbiguousLineItems += sectionResult.omittedAmbiguousLineItems;
     if (facts.length > MAX_FACTS) return null;
   }
   if (facts.length === 0) return null;
@@ -202,10 +247,25 @@ function normalizeFinancials(value, request, options) {
   if (unsupportedPeriods.length > 0) {
     limitations.push(`Unsupported requested period types were omitted: ${unsupportedPeriods.join(', ')}.`);
   }
+  if (!identity.providerExchangeObserved) {
+    limitations.push(
+      'The provider page omitted its exchange field; Jarvis retained the previously resolved issuer exchange after company-ID and symbol verification.',
+    );
+  }
+  if (identity.providerCompanyIdVaries) {
+    limitations.push(
+      'The financial page exposed a different provider-internal company ID; Jarvis retained the previously resolved issuer ID after slug and symbol verification.',
+    );
+  }
+  if (omittedAmbiguousLineItems > 0) {
+    limitations.push(
+      `${omittedAmbiguousLineItems} ambiguous duplicated financial line item(s) were omitted instead of selecting a provider row arbitrarily.`,
+    );
+  }
   return {
     company_id: companyId,
-    exchange: String(value.metadata.exchange).toUpperCase(),
-    symbol: String(value.metadata.symbol).toUpperCase(),
+    exchange: identity.exchange,
+    symbol: identity.symbol,
     sources: [{
       provider_source_id: sourceId,
       source_name: 'Tijori standardized financial tables',
@@ -240,14 +300,29 @@ function normalizeSection(section, maxPeriods) {
 
   const facts = [];
   const seen = new Set();
-  for (const row of section.rows) {
-    if (row === null || typeof row !== 'object' || !Array.isArray(row.values)) continue;
+  const mappedRows = section.rows.map((row) => {
+    if (row === null || typeof row !== 'object' || !Array.isArray(row.values)) {
+      return { item: undefined, row };
+    }
     const original = boundedString(row.metric, 300, true);
-    if (original === null) continue;
-    const item = LINE_ITEMS[section.statement].find(({ labels }) => (
-      labels.includes(comparable(original))
-    ));
-    if (item === undefined) continue;
+    const item = original === null
+      ? undefined
+      : LINE_ITEMS[section.statement].find(({ labels }) => (
+        labels.includes(comparable(original))
+      ));
+    return { item, original, row };
+  });
+  const itemCounts = new Map();
+  for (const { item } of mappedRows) {
+    if (item !== undefined) itemCounts.set(item.id, (itemCounts.get(item.id) ?? 0) + 1);
+  }
+  const ambiguousItems = new Set(
+    [...itemCounts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([itemId]) => itemId),
+  );
+  for (const { item, original, row } of mappedRows) {
+    if (item === undefined || original === undefined || ambiguousItems.has(item.id)) continue;
     for (const period of periods) {
       const factId = `${section.statement}.${item.id}.${section.period_type}.${period.end}`;
       if (seen.has(factId)) return null;
@@ -277,13 +352,16 @@ function normalizeSection(section, maxPeriods) {
       });
     }
   }
-  return facts;
+  return {
+    facts,
+    omittedAmbiguousLineItems: ambiguousItems.size,
+  };
 }
 
 function parsePeriod(value, periodType) {
   const label = boundedString(value, 80, true);
   if (label === null) return { label: '', start: null, end: null };
-  const monthMatch = label.match(/^(Mar|Jun|Sep|Dec)[ -]?(\d{2}|\d{4})$/i);
+  const monthMatch = label.match(/^(Mar|Jun|Sep|Dec)[ '\-]?(\d{2}|\d{4})$/i);
   if (monthMatch) {
     const year = normalizeYear(monthMatch[2]);
     const month = { mar: 3, jun: 6, sep: 9, dec: 12 }[monthMatch[1].toLowerCase()];
@@ -316,20 +394,32 @@ function parsePeriod(value, periodType) {
   return { label, start: null, end: null };
 }
 
-function validIdentity(value, issuer) {
-  if (value === null || typeof value !== 'object') return false;
-  const companyId = boundedString(value.company_id, 128);
-  const exchange = boundedString(value.exchange, 32)?.toUpperCase();
+function resolvedIdentity(value, issuer) {
+  if (value === null || typeof value !== 'object') return null;
+  const providerCompanyId = boundedString(value.company_id, 128);
+  const companyId = issuer.provider_company_id ?? providerCompanyId;
+  const providerExchange = boundedString(value.exchange, 32)?.toUpperCase();
+  const exchange = providerExchange ?? issuer.exchange;
   const symbol = boundedString(value.symbol, 100)?.toUpperCase();
-  return companyId !== null
+  const valid = providerCompanyId !== null
+    && ID_PATTERN.test(providerCompanyId)
+    && companyId !== null
     && ID_PATTERN.test(companyId)
-    && exchange !== null
     && MARKET_PATTERN.test(exchange)
     && symbol !== null
     && MARKET_PATTERN.test(symbol)
     && exchange === issuer.exchange
-    && symbol === issuer.symbol
-    && (issuer.provider_company_id === null || companyId === issuer.provider_company_id);
+    && symbol === issuer.symbol;
+  return valid
+    ? {
+      companyId,
+      exchange,
+      providerCompanyIdVaries: issuer.provider_company_id !== null
+        && providerCompanyId !== issuer.provider_company_id,
+      providerExchangeObserved: providerExchange !== undefined,
+      symbol,
+    }
+    : null;
 }
 
 function monetaryUnit(value) {

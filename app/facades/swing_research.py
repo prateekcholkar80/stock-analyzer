@@ -1,4 +1,5 @@
 from datetime import datetime
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from app.logging_config import get_logger, operation_context
@@ -81,9 +82,18 @@ class JarvisSwingResearchFacade:
         operation_id: str | None = None,
         event_emitter: WorkflowEventEmitter | None = None,
         manage_terminal_events: bool = True,
+        instrument_resolved_callback: (
+            Callable[[SwingAnalysisCommand], None] | None
+        ) = None,
     ) -> JarvisSwingAnalysisResponse:
         if not isinstance(manage_terminal_events, bool):
             raise ValueError("terminal-event policy must be a boolean")
+        if instrument_resolved_callback is not None and not callable(
+            instrument_resolved_callback
+        ):
+            raise ValueError(
+                "instrument-resolved callback must be callable"
+            )
         with operation_context(operation_id) as active_operation_id:
             emitter = (
                 event_emitter
@@ -134,6 +144,18 @@ class JarvisSwingResearchFacade:
                 exchange=command.exchange,
                 symbol=command.symbol,
             )
+            if instrument_resolved_callback is not None:
+                try:
+                    instrument_resolved_callback(command)
+                except Exception:
+                    if manage_terminal_events:
+                        emitter.emit(
+                            WorkflowStage.FAILED,
+                            WorkflowEventState.FAILED,
+                            exchange=command.exchange,
+                            symbol=command.symbol,
+                        )
+                    raise
             command_kwargs = {
                 "operation_id": active_operation_id,
                 "event_emitter": emitter,

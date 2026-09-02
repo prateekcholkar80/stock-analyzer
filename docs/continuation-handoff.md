@@ -1,11 +1,70 @@
 # Jarvis Implementation Continuation Handoff
 
-Last updated: **2026-08-29 (Asia/Kolkata)**
+Last updated: **2026-09-02 (Asia/Kolkata)**
 
 Use this file to resume implementation without relying on chat history. The
 authoritative architectural detail remains in `docs/current-baseline.md`; this
 document captures the current decisions, exact executable path, validation
 evidence, local artifacts, known gaps, and recommended next work.
+
+## Current Structured-Fundamentals Release Candidate
+
+The feature branch now extends the original five-capability Tijori boundary
+without widening its public read-only tool allow-list. `get_financials` can
+return complete JSON-first structured documents for Growth Table, Balance
+Sheet, Profit and Loss, Cash Flow, Ratios, and Quarterly Results. Balance
+Sheet, Profit and Loss, Cash Flow, Ratios, and Quarterly Results are requested
+independently for consolidated and standalone reporting; Growth Table retains
+the provider's not-applicable reporting basis. `get_company_overview` also
+supports complete Peer Comparison and Benchmarking Financials matrices.
+
+The extractors prefer bounded embedded JSON over presentation-state scraping.
+They recursively retain provider hierarchy, labels, periods, units, zeros,
+explicit missing values, auxiliary cells, issuer identity, reporting basis,
+source URL, retrieval time, parser/contract version, and content fingerprint.
+Collapsed browser rows therefore do not truncate the stored document. Raw
+HTML, screenshots, cookies, credentials, browser state, and provider exception
+text do not cross the MCP boundary or enter DuckDB.
+
+Provider-neutral Python contracts translate every accepted document into an
+immutable `StructuredFinancialDocument`. Database-neutral repositories now
+cover financial documents, Peer Comparison, and Benchmarking Financials, with
+in-memory reference adapters and durable DuckDB implementations. Cache keys
+include tenant, provider connection, issuer, document type, and reporting
+basis. Unexpired results are reused; explicit refresh atomically replaces the
+complete applicable company set only after successful retrieval; a provider
+failure preserves the active cache; and expired documents are never returned.
+
+The browser workflow requests the completed structured-document set only when
+fundamentals are explicitly requested. It exposes bounded, operation-owned
+references rather than embedding large provider documents in the operation
+response. Authenticated, tenant-scoped HTTP resolution returns a referenced
+cached JSON document only when it belongs to that released operation. The
+frontend client understands these references for future Fundamental Analyst
+reasoning and inspection; Benchmarking Financials is intentionally evidence,
+not a mandatory dashboard visualization.
+
+The command deck also includes the locked holographic agent presentation:
+event-driven Market Data, Daily, Weekly, Fundamental, Bull, Bear, and Judge
+identities; a licensed Bull model with its licence manifest; perception-only
+packet links and kinetic cores; completion glow; reduced-motion handling; and
+opt-in procedural neural audio. Animation timing never delays or changes the
+backend workflow.
+
+Release-boundary validation on 2026-09-02:
+
+- **224 Tijori MCP tests passed** under the pinned Node 24.20.0 runtime;
+- affected Python subsystem runs completed **534 passing test executions**;
+- the complete Python regression suite passed all **2,171 tests**;
+- the frontend production build and all **51 frontend tests passed**;
+- the known non-fatal Plotly chunk-size advisory remains; and
+- actual `.env` files, browser/session state, DuckDB files, build output,
+  Wrangler state, dependency trees, logs, and Python caches remain ignored.
+
+This milestone still does not implement a Fundamental Analyst, deterministic
+fundamental scorecard, annual-report ingestion, or qualitative management/moat
+claims. Provider-standardized data remains secondary research evidence and
+cannot be promoted to primary or decision-grade evidence by itself.
 
 ## 0. Fundamental-Research Expansion Baseline
 
@@ -394,8 +453,10 @@ Step 1.9 validation evidence:
 
 ## 1. Current Verified State
 
-- Offline regression baseline: **1,874 passing Python unit/integration tests**.
-- Browser baseline: production build plus **36 passing frontend tests**.
+- Offline regression baseline: **2,171 passing Python unit/integration tests**.
+- Browser baseline: production build plus **51 passing frontend tests**.
+- Local Tijori MCP bridge baseline: **224 passing Node tests** under the pinned
+  Node 24.20.0 runtime.
 - The production browser build reports a non-fatal Plotly chunk-size advisory.
 - Live Reliance run authenticated with Angel One and completed the default
   daily/weekly Bull/Bear/Judge workflow.
@@ -1020,14 +1081,14 @@ the established composition without an explicit design-revision request:
   console now provides a CSS-rendered holographic command deck, procedural
   opt-in neural sound cues, HTTP/SSE transport, dynamic reactor, operation
   matrix, Plotly charts, setup view, debate, and executive briefing.
-- Provider-neutral fundamental evidence, the five-capability gateway, offline
-  `TijoriMcpAdapter`, hardened local stdio transport, cache/repository
-  contracts, in-memory and DuckDB schema-v4 repositories, the pinned
-  Jarvis-owned five-tool local bridge, and the authenticated HTTP session
-  lifecycle now exist. The transport, interactive browser, and bridge have
-  still run only against synthetic fixtures; live provider validation,
-  document upload/parser/chunker/vector index/RAG, and the financial agent are
-  pending.
+- Provider-neutral fundamental evidence, the five-capability gateway, hardened
+  local stdio transport, complete structured financial/peer/benchmarking JSON
+  contracts, in-memory and DuckDB repositories, the pinned Jarvis-owned local
+  bridge, authenticated provider sessions, browser cache orchestration, and
+  scoped cached-document resolution now exist. User-owned interactive login
+  and selected provider reads have been manually exercised; automated live
+  provider regression remains intentionally opt-in. The deterministic
+  fundamental metric engine and Fundamental Analyst are pending.
 - The frontend exposes Tijori connection status, explicit headed-login connect,
   refresh/status, expiry/reconnect, and secure revoke controls. Credentials and
   provider session material are never accepted or rendered by the frontend.
@@ -1068,32 +1129,37 @@ the established composition without an explicit design-revision request:
 
 ## 12. Recommended Next Steps, One at a Time
 
-1. After frontend/offline validation, run one separately approved local live
-   smoke test with the user's own Tijori subscription and pinned Node 24
-   runtime. Validate login, status, one approved read-only tool, expiry, and
-   revocation without capturing provider payloads or session material.
-2. Add database-agnostic repository models/ports for the complete
+1. Promote CPR from a chart-only prior-period overlay into a provider-neutral,
+   look-ahead-safe `CPRAnalysisRecord`: width regime, price location,
+   acceptance, breakout/retest/rejection/failed-break lifecycle, qualified
+   evidence IDs, and daily-weekly swing confluence.
+2. Add versioned project-owned runtime skills for Bull, Bear, the existing
+   Judge, and the Fundamental Analyst. Enforce allowed evidence, required
+   citations, output schemas, abstention, skill version/hash audit, and
+   provider-neutral LLM composition.
+3. Build the deterministic normalized fundamental metric engine and preliminary
+   scorecard from the cached structured JSON, explicitly excluding annual
+   reports and qualitative management/moat conclusions.
+4. Add database-agnostic repository models/ports for the complete
    `MultiTimeframeEndToEndSwingAnalysisResult`, then implement in-memory and
    DuckDB adapters with normalized daily/weekly evidence, verdict, trade plan,
-   and presentation tables. This is the recommended immediate step.
-3. Persist the completed dashboard aggregate and add historical-run queries;
+   and presentation tables.
+5. Persist the completed dashboard aggregate and add historical-run queries;
    the live completed-operation read model is implemented.
-4. If genuine order flow is prioritized, define a database-neutral
+6. If genuine order flow is prioritized, define a database-neutral
    `MarketMicrostructureGateway`/`OrderFlowGateway` and immutable tick/book
    contracts before selecting Angel best-five prospective capture or licensed
    historical NSE order/trade data. Never backfill “real order flow” from
    candles.
-5. Browser microphone capture, speech-to-text, the provider-neutral TTS/STT
+7. Browser microphone capture, speech-to-text, the provider-neutral TTS/STT
    ports, and the Google/ElevenLabs adapters are implemented. Remaining audio
    work: exercise the adapters and catalog downloads against live
    endpoints/credentials, add an acoustic wake-word engine, and add rate
    limiting to `/speech` and `/transcribe` — all while keeping transcript
    handling and financial logic vendor-neutral.
-6. Add user-controlled financial-document ingestion and citation-preserving RAG,
-   followed by a document-grounded fundamental agent.
-7. Extend the same evidence package/debate/Judge contracts to technical plus
-   document-grounded fundamentals only after the RAG evaluation suite proves
-   citation completeness and abstention behavior.
+8. Annual-report ingestion, citation-preserving RAG, and qualitative
+   management/moat analysis remain explicitly deferred from the current
+   fundamental milestone.
 
 For a live actionable-plan check, wait for a naturally bullish qualifying
 instrument/dataset and observe it without changing thresholds or forcing the

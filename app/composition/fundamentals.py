@@ -31,6 +31,13 @@ from app.services.provider_sessions import ProviderSessionService
 from app.storage.fundamental_repositories import (
     FundamentalSnapshotRepository,
 )
+from app.storage.financial_document_repositories import (
+    StructuredFinancialDocumentRepository,
+)
+from app.storage.peer_comparison_repositories import PeerComparisonRepository
+from app.storage.benchmarking_financials_repositories import (
+    BenchmarkingFinancialsRepository,
+)
 
 
 TijoriTransportBuilder = Callable[
@@ -168,6 +175,20 @@ def compose_tijori_fundamental_coordinator(
         raise TypeError(
             "Tijori coordinator composition requires a fundamental repository"
         )
+    if not isinstance(repository, StructuredFinancialDocumentRepository):
+        raise TypeError(
+            "Tijori coordinator composition requires structured document "
+            "storage"
+        )
+    if not isinstance(repository, PeerComparisonRepository):
+        raise TypeError(
+            "Tijori coordinator composition requires Peer Comparison storage"
+        )
+    if not isinstance(repository, BenchmarkingFinancialsRepository):
+        raise TypeError(
+            "Tijori coordinator composition requires Benchmarking Financials "
+            "storage"
+        )
     gateway = compose_tijori_fundamental_gateway(
         transport_settings=transport_settings,
         adapter_settings=adapter_settings,
@@ -177,6 +198,9 @@ def compose_tijori_fundamental_coordinator(
     return FundamentalEvidenceCoordinator(
         gateway=gateway,
         repository=repository,
+        structured_document_repository=repository,
+        peer_comparison_repository=repository,
+        benchmarking_financials_repository=repository,
         clock=clock,
         retention=retention,
     )

@@ -204,27 +204,59 @@ class LocalFileProviderSessionProvisioner(ProviderSessionProvisioner):
         with self._lock:
             self._validate_root()
             path = self._safe_path(request.connection)
+            checked_at = self._now(request.requested_at)
+            replaced_artifact: _SessionArtifact | None = None
+            replacement_path: Path | None = None
             try:
-                path.lstat()
+                existing = self._read_artifact(path)
             except FileNotFoundError:
                 pass
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 raise LocalSessionProvisioningError() from exc
             else:
-                raise LocalSessionProvisioningError()
+                if (
+                    not request.replace_existing
+                    or checked_at < existing.expires_at
+                ):
+                    raise LocalSessionProvisioningError()
+                replaced_artifact = existing
+                replacement_path = self._quarantine_for_replacement(
+                    path,
+                    existing.info,
+                )
 
-            response = self._run_interactive_process(path)
-            checked_at = self._now(request.requested_at)
             try:
+                response = self._run_interactive_process(path)
+                checked_at = self._now(request.requested_at)
                 lifecycle = self._lifecycle_for_file(
                     path,
                     request.connection,
                     checked_at,
                 )
-            except (FileNotFoundError, OSError, ValueError) as exc:
+                if (
+                    response["session_reference_hash"]
+                    != lifecycle.session_reference_hash
+                ):
+                    raise LocalSessionProvisioningError()
+            except Exception as exc:
+                if replacement_path is not None and replaced_artifact is not None:
+                    try:
+                        self._restore_replaced_artifact(
+                            path,
+                            replacement_path,
+                            replaced_artifact.info,
+                        )
+                    except Exception as restore_exc:
+                        raise LocalSessionProvisioningError() from restore_exc
+                if isinstance(exc, LocalSessionProvisioningError):
+                    raise
                 raise LocalSessionProvisioningError() from exc
-            if response["session_reference_hash"] != lifecycle.session_reference_hash:
-                raise LocalSessionProvisioningError()
+
+            if replacement_path is not None and replaced_artifact is not None:
+                self._overwrite_and_unlink(
+                    replacement_path,
+                    replaced_artifact.info,
+                )
             validate_provider_session_response_binding(request, lifecycle)
             return lifecycle
 
@@ -424,6 +456,59 @@ class LocalFileProviderSessionProvisioner(ProviderSessionProvisioner):
             raise LocalSessionProvisioningError()
         return info
 
+    def _quarantine_for_replacement(
+        self,
+        path: Path,
+        expected: os.stat_result,
+    ) -> Path:
+        replacement = self._session_root / f".replacement-{path.stem}.tmp"
+        try:
+            replacement.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise LocalSessionProvisioningError() from exc
+        else:
+            raise LocalSessionProvisioningError()
+
+        try:
+            current = path.lstat()
+            if not _same_file(current, expected):
+                raise LocalSessionProvisioningError()
+            os.replace(path, replacement)
+            moved = replacement.lstat()
+            if not _same_file(moved, expected):
+                raise LocalSessionProvisioningError()
+            self._sync_root()
+        except OSError as exc:
+            raise LocalSessionProvisioningError() from exc
+        return replacement
+
+    def _restore_replaced_artifact(
+        self,
+        path: Path,
+        replacement: Path,
+        expected: os.stat_result,
+    ) -> None:
+        try:
+            current = self._validate_session_file(path)
+        except FileNotFoundError:
+            pass
+        else:
+            self._overwrite_and_unlink(path, current)
+
+        try:
+            quarantined = replacement.lstat()
+            if not _same_file(quarantined, expected):
+                raise LocalSessionProvisioningError()
+            os.replace(replacement, path)
+            restored = path.lstat()
+            if not _same_file(restored, expected):
+                raise LocalSessionProvisioningError()
+            self._sync_root()
+        except OSError as exc:
+            raise LocalSessionProvisioningError() from exc
+
     def _overwrite_and_unlink(self, path: Path, expected: os.stat_result) -> None:
         flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -449,13 +534,16 @@ class LocalFileProviderSessionProvisioner(ProviderSessionProvisioner):
             finally:
                 os.close(descriptor)
             path.unlink()
-            root_descriptor = os.open(self._session_root, os.O_RDONLY)
-            try:
-                os.fsync(root_descriptor)
-            finally:
-                os.close(root_descriptor)
+            self._sync_root()
         except OSError as exc:
             raise LocalSessionProvisioningError() from exc
+
+    def _sync_root(self) -> None:
+        descriptor = os.open(self._session_root, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _now(self, requested_at: datetime) -> datetime:
         value = self._clock()
@@ -477,3 +565,12 @@ class _SessionArtifact:
         self.fingerprint = fingerprint
         self.provisioned_at = provisioned_at
         self.expires_at = expires_at
+
+
+def _same_file(current: os.stat_result, expected: os.stat_result) -> bool:
+    return (
+        current.st_dev == expected.st_dev
+        and current.st_ino == expected.st_ino
+        and current.st_nlink == 1
+        and current.st_size == expected.st_size
+    )

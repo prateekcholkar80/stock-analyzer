@@ -6,10 +6,11 @@ not part of the offline vertical slice.
 """
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from pydantic import ValidationError
 
@@ -24,22 +25,44 @@ from app.exceptions import (
 )
 from app.fundamentals.tijori_mcp_contracts import (
     TIJORI_APPROVED_TOOLS,
+    TijoriBalanceSheetDocument,
+    TijoriBalanceSheetPayload,
+    TijoriBenchmarkingFinancialsDocument,
+    TijoriBenchmarkingFinancialsPayload,
+    TijoriBenchmarkingRow,
+    TijoriBenchmarkingCell,
+    TijoriCashFlowDocument,
+    TijoriCashFlowPayload,
     TijoriCompanyRecord,
     TijoriCompanySearchPayload,
     TijoriEvidenceFactRecord,
     TijoriEvidencePayload,
     TijoriEvidenceSourceRecord,
+    TijoriFinancialDocumentCell,
+    TijoriFinancialStatementCell,
+    TijoriGrowthTableDocument,
+    TijoriGrowthTablePayload,
     TijoriIssuerResolutionPayload,
     TijoriMcpAdapterSettings,
     TijoriMcpToolResult,
     TijoriMcpTransport,
     TijoriMcpTransportError,
     TijoriMcpTransportInspection,
+    TijoriPeerComparisonDocument,
+    TijoriPeerComparisonPayload,
+    TijoriProfitAndLossDocument,
+    TijoriProfitAndLossPayload,
+    TijoriQuarterlyResultsDocument,
+    TijoriQuarterlyResultsPayload,
+    TijoriRatiosDocument,
+    TijoriRatiosPayload,
     TijoriToolName,
     TijoriToolStatus,
     TijoriTransportFailureKind,
 )
 from app.gateways.fundamentals import (
+    FundamentalBenchmarkingFinancialsGateway,
+    FundamentalBenchmarkingFinancialsResult,
     FundamentalCapability,
     FundamentalCapabilityDescriptor,
     FundamentalCapabilityManifest,
@@ -55,10 +78,33 @@ from app.gateways.fundamentals import (
     FundamentalIssuerCandidate,
     FundamentalIssuerResolutionRequest,
     FundamentalIssuerResolutionResult,
+    FundamentalPeerComparisonGateway,
+    FundamentalPeerComparisonResult,
     FundamentalResolutionStatus,
     FundamentalRetrievalStatus,
     FundamentalShareholdingRequest,
+    FundamentalStructuredDocumentGateway,
+    FundamentalStructuredDocumentRequest,
+    FundamentalStructuredDocumentResult,
     validate_fundamental_response_binding,
+)
+from app.models.financial_documents import (
+    BenchmarkingCell,
+    BenchmarkingCompany,
+    BenchmarkingRow,
+    BenchmarkingSection,
+    FinancialDocumentCell,
+    FinancialDocumentPeriod,
+    FinancialDocumentRow,
+    FinancialDocumentRowKind,
+    FinancialDocumentType,
+    FinancialReportingBasis,
+    PeerComparisonCell,
+    PeerComparisonCompany,
+    PeerComparisonMetric,
+    StructuredBenchmarkingFinancialsDocument,
+    StructuredFinancialDocument,
+    StructuredPeerComparisonDocument,
 )
 from app.models.fundamentals import (
     FundamentalAvailabilityStatus,
@@ -77,6 +123,7 @@ from app.models.fundamentals import (
     FundamentalSourceReference,
     FundamentalSourceType,
     FundamentalValidationStatus,
+    FundamentalValueKind,
     NormalizedFundamentalFact,
     ProviderConnectionScope,
 )
@@ -87,6 +134,14 @@ _PayloadT = TypeVar(
     TijoriCompanySearchPayload,
     TijoriIssuerResolutionPayload,
     TijoriEvidencePayload,
+    TijoriGrowthTablePayload,
+    TijoriBalanceSheetPayload,
+    TijoriCashFlowPayload,
+    TijoriProfitAndLossPayload,
+    TijoriRatiosPayload,
+    TijoriQuarterlyResultsPayload,
+    TijoriPeerComparisonPayload,
+    TijoriBenchmarkingFinancialsPayload,
 )
 _ResponseT = TypeVar("_ResponseT", bound=FundamentalGatewayResponse)
 _FINGERPRINT_CHARS = frozenset("0123456789abcdef")
@@ -108,7 +163,12 @@ _STATUS_LIMITATIONS = {
 }
 
 
-class TijoriMcpAdapter(FundamentalEvidenceGateway):
+class TijoriMcpAdapter(
+    FundamentalBenchmarkingFinancialsGateway,
+    FundamentalEvidenceGateway,
+    FundamentalPeerComparisonGateway,
+    FundamentalStructuredDocumentGateway,
+):
     """Normalize only five audited, read-only Tijori tools."""
 
     def __init__(
@@ -354,6 +414,164 @@ class TijoriMcpAdapter(FundamentalEvidenceGateway):
             arguments=self._evidence_arguments(request),
         )
 
+    def retrieve_peer_comparison(
+        self,
+        *,
+        request: FundamentalCompanyOverviewRequest,
+    ) -> FundamentalPeerComparisonResult:
+        """Return one bound, provider-neutral Peer Comparison result."""
+
+        arguments = self._evidence_arguments(request)
+        arguments["document_type"] = "peer_comparison"
+        started_at, result, completed_at = self._call(
+            request=request,
+            tool_name="get_company_overview",
+            arguments=arguments,
+        )
+        self._raise_terminal_tool_status(result.status, request=request)
+        payload = self._parse_payload(
+            TijoriPeerComparisonPayload,
+            result,
+            request=request,
+        )
+        provider_document = payload.document
+        issuer = request.issuer
+        if (
+            provider_document.issuer.exchange != issuer.exchange
+            or provider_document.issuer.symbol != issuer.symbol
+            or (
+                issuer.provider_company_id is not None
+                and provider_document.issuer.provider_company_id
+                != issuer.provider_company_id
+            )
+            or (
+                issuer.provider_slug is not None
+                and provider_document.issuer.provider_slug
+                != issuer.provider_slug
+            )
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori Peer Comparison belongs to a different issuer",
+            )
+        if (
+            request.as_of_date is not None
+            and provider_document.observation_date != request.as_of_date
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori Peer Comparison observation date does not match",
+            )
+        if not (
+            started_at
+            <= provider_document.source.retrieved_at
+            <= completed_at
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori Peer Comparison retrieval time is outside the request",
+            )
+        try:
+            document = self._normalize_peer_comparison_document(
+                request,
+                provider_document,
+            )
+            response = FundamentalPeerComparisonResult(
+                **self._response_metadata(
+                    request,
+                    started_at,
+                    completed_at,
+                ),
+                issuer=request.issuer,
+                status=FundamentalRetrievalStatus.COMPLETED,
+                document=document,
+            )
+        except (ValidationError, InvalidOperation, ValueError) as exc:
+            raise FundamentalResponseValidationError(
+                "Tijori Peer Comparison could not be normalized safely",
+                **self._error_context(request),
+            ) from exc
+        return self._bind(request, response)
+
+    def retrieve_benchmarking_financials(
+        self,
+        *,
+        request: FundamentalCompanyOverviewRequest,
+    ) -> FundamentalBenchmarkingFinancialsResult:
+        """Return one bound, provider-neutral Financial benchmark result."""
+
+        arguments = self._evidence_arguments(request)
+        arguments["document_type"] = "benchmarking_financials"
+        started_at, result, completed_at = self._call(
+            request=request,
+            tool_name="get_company_overview",
+            arguments=arguments,
+        )
+        self._raise_terminal_tool_status(result.status, request=request)
+        payload = self._parse_payload(
+            TijoriBenchmarkingFinancialsPayload,
+            result,
+            request=request,
+        )
+        provider_document = payload.document
+        issuer = request.issuer
+        if (
+            provider_document.issuer.exchange != issuer.exchange
+            or provider_document.issuer.symbol != issuer.symbol
+            or (
+                issuer.provider_company_id is not None
+                and provider_document.issuer.provider_company_id
+                != issuer.provider_company_id
+            )
+            or (
+                issuer.provider_slug is not None
+                and provider_document.issuer.provider_slug
+                != issuer.provider_slug
+            )
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori Benchmarking Financials belongs to a different issuer",
+            )
+        if (
+            request.as_of_date is not None
+            and provider_document.observation_date != request.as_of_date
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori Benchmarking Financials observation date does not match",
+            )
+        if not (
+            started_at
+            <= provider_document.source.retrieved_at
+            <= completed_at
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori Benchmarking Financials retrieval time is outside the request",
+            )
+        try:
+            document = self._normalize_benchmarking_financials_document(
+                request,
+                provider_document,
+            )
+            response = FundamentalBenchmarkingFinancialsResult(
+                **self._response_metadata(
+                    request,
+                    started_at,
+                    completed_at,
+                ),
+                issuer=request.issuer,
+                status=FundamentalRetrievalStatus.COMPLETED,
+                document=document,
+            )
+        except (ValidationError, InvalidOperation, ValueError) as exc:
+            raise FundamentalResponseValidationError(
+                "Tijori Benchmarking Financials could not be normalized safely",
+                **self._error_context(request),
+            ) from exc
+        return self._bind(request, response)
+
     def retrieve_financials(
         self,
         *,
@@ -371,6 +589,647 @@ class TijoriMcpAdapter(FundamentalEvidenceGateway):
             request=request,
             tool_name="get_financials",
             arguments=arguments,
+        )
+
+    def retrieve_growth_table_document(
+        self,
+        *,
+        request: FundamentalFinancialsRequest,
+        reporting_basis: Literal["consolidated", "standalone"],
+    ) -> TijoriGrowthTableDocument:
+        """Retrieve one validated structured Growth Table document.
+
+        This provider-specific bridge is deliberately separate from the
+        legacy evidence retrieval path until the provider-neutral structured
+        document gateway is introduced.
+        """
+
+        if reporting_basis not in {"consolidated", "standalone"}:
+            raise TypeError(
+                "Growth Table request basis must be consolidated or standalone"
+            )
+        arguments = self._evidence_arguments(request)
+        arguments.update(
+            {
+                "document_type": "growth_table",
+                "reporting_basis": reporting_basis,
+            }
+        )
+        started_at, result, completed_at = self._call(
+            request=request,
+            tool_name="get_financials",
+            arguments=arguments,
+        )
+        self._raise_terminal_tool_status(result.status, request=request)
+        payload = self._parse_payload(
+            TijoriGrowthTablePayload,
+            result,
+            request=request,
+        )
+        document = payload.document
+        issuer = request.issuer
+        if (
+            document.issuer.exchange != issuer.exchange
+            or document.issuer.symbol != issuer.symbol
+            or (
+                issuer.provider_company_id is not None
+                and document.issuer.provider_company_id
+                != issuer.provider_company_id
+            )
+            or (
+                issuer.provider_slug is not None
+                and document.issuer.provider_slug != issuer.provider_slug
+            )
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori Growth Table belongs to a different issuer",
+            )
+        if not (
+            started_at <= document.source.retrieved_at <= completed_at
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori Growth Table retrieval time is outside the request",
+            )
+        return document
+
+    def retrieve_structured_financial_document(
+        self,
+        *,
+        request: FundamentalStructuredDocumentRequest,
+    ) -> FundamentalStructuredDocumentResult:
+        """Return one validated document without exposing Tijori contracts."""
+
+        if request.document_type not in {
+            FinancialDocumentType.GROWTH_TABLE,
+            FinancialDocumentType.BALANCE_SHEET,
+            FinancialDocumentType.PROFIT_AND_LOSS,
+            FinancialDocumentType.CASH_FLOW,
+            FinancialDocumentType.RATIOS,
+            FinancialDocumentType.QUARTERLY_RESULTS,
+        }:
+            raise FundamentalGatewayConfigurationError(
+                "Tijori structured retrieval does not support this document type",
+                **self._error_context(request),
+            )
+        arguments = self._evidence_arguments(request)
+        arguments.update(
+            {
+                "document_type": request.document_type.value,
+                "reporting_basis": request.reporting_basis.value,
+            }
+        )
+        started_at, result, completed_at = self._call(
+            request=request,
+            tool_name="get_financials",
+            arguments=arguments,
+        )
+        self._raise_terminal_tool_status(result.status, request=request)
+        payload_model = {
+            FinancialDocumentType.GROWTH_TABLE: TijoriGrowthTablePayload,
+            FinancialDocumentType.BALANCE_SHEET: TijoriBalanceSheetPayload,
+            FinancialDocumentType.PROFIT_AND_LOSS: TijoriProfitAndLossPayload,
+            FinancialDocumentType.CASH_FLOW: TijoriCashFlowPayload,
+            FinancialDocumentType.RATIOS: TijoriRatiosPayload,
+            FinancialDocumentType.QUARTERLY_RESULTS: (
+                TijoriQuarterlyResultsPayload
+            ),
+        }[request.document_type]
+        payload = self._parse_payload(payload_model, result, request=request)
+        provider_document = payload.document
+        self._validate_structured_document_identity(request, provider_document)
+        if provider_document.reporting_basis != request.reporting_basis.value:
+            self._raise_invalid_response(
+                request,
+                "Tijori document reporting basis does not match the request",
+            )
+        if not (
+            started_at <= provider_document.source.retrieved_at <= completed_at
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori document retrieval time is outside the request",
+            )
+        try:
+            if isinstance(provider_document, TijoriGrowthTableDocument):
+                document = self._normalize_growth_table_document(
+                    request,
+                    provider_document,
+                )
+            elif isinstance(provider_document, TijoriProfitAndLossDocument):
+                document = self._normalize_mixed_unit_statement_document(
+                    request,
+                    provider_document,
+                )
+            elif isinstance(provider_document, TijoriRatiosDocument):
+                document = self._normalize_mixed_unit_statement_document(
+                    request,
+                    provider_document,
+                )
+            elif isinstance(
+                provider_document,
+                TijoriQuarterlyResultsDocument,
+            ):
+                document = self._normalize_mixed_unit_statement_document(
+                    request,
+                    provider_document,
+                )
+            elif isinstance(provider_document, TijoriCashFlowDocument):
+                document = self._normalize_cash_flow_document(
+                    request,
+                    provider_document,
+                )
+            else:
+                document = self._normalize_balance_sheet_document(
+                    request,
+                    provider_document,
+                )
+            response = FundamentalStructuredDocumentResult(
+                **self._response_metadata(request, started_at, completed_at),
+                issuer=request.issuer,
+                document_type=request.document_type,
+                reporting_basis=request.reporting_basis,
+                status=FundamentalRetrievalStatus.COMPLETED,
+                document=document,
+            )
+        except (ValidationError, InvalidOperation, ValueError) as exc:
+            raise FundamentalResponseValidationError(
+                "Tijori structured document could not be normalized safely",
+                **self._error_context(request),
+            ) from exc
+        return self._bind(request, response)
+
+    def _validate_structured_document_identity(
+        self,
+        request: FundamentalStructuredDocumentRequest,
+        document: (
+            TijoriGrowthTableDocument
+            | TijoriBalanceSheetDocument
+            | TijoriCashFlowDocument
+            | TijoriProfitAndLossDocument
+            | TijoriRatiosDocument
+            | TijoriQuarterlyResultsDocument
+        ),
+    ) -> None:
+        issuer = request.issuer
+        if (
+            document.issuer.exchange != issuer.exchange
+            or document.issuer.symbol != issuer.symbol
+            or (
+                issuer.provider_company_id is not None
+                and document.issuer.provider_company_id
+                != issuer.provider_company_id
+            )
+            or (
+                issuer.provider_slug is not None
+                and document.issuer.provider_slug != issuer.provider_slug
+            )
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori structured document belongs to a different issuer",
+            )
+
+    @staticmethod
+    def _normalize_growth_table_document(
+        request: FundamentalStructuredDocumentRequest,
+        source: TijoriGrowthTableDocument,
+    ) -> StructuredFinancialDocument:
+        periods = tuple(
+            FinancialDocumentPeriod(
+                period_key=column.column_key,
+                source_label=column.source_label,
+                display_order=column.display_order,
+            )
+            for column in source.columns
+        )
+        rows = tuple(
+            FinancialDocumentRow(
+                row_key=row.row_key,
+                original_label=row.original_label,
+                parent_row_key=row.parent_row_key,
+                depth=row.depth,
+                row_kind=FinancialDocumentRowKind(row.row_kind),
+                value_kind=FundamentalValueKind.PERCENTAGE,
+                display_order=row.display_order,
+                cells=tuple(
+                    TijoriMcpAdapter._normalize_growth_table_cell(
+                        cell,
+                        source_unit=source.unit,
+                    )
+                    for cell in row.values
+                ),
+            )
+            for row in source.rows
+        )
+        return StructuredFinancialDocument(
+            document_id=(
+                f"tijori.{request.issuer.exchange}.{request.issuer.symbol}."
+                f"{request.document_type.value}.{request.reporting_basis.value}"
+            ),
+            connection=request.connection,
+            issuer=request.issuer,
+            document_type=request.document_type,
+            reporting_basis=request.reporting_basis,
+            currency=None,
+            source_unit=source.unit,
+            periods=periods,
+            rows=rows,
+            source_location=source.source.location,
+            retrieved_at=source.source.retrieved_at,
+            expires_at=source.source.retrieved_at + timedelta(days=10),
+            all_sections_expanded=source.all_sections_expanded,
+            validation_status=FundamentalValidationStatus.VALIDATED,
+        )
+
+    @staticmethod
+    def _normalize_peer_comparison_document(
+        request: FundamentalCompanyOverviewRequest,
+        source: TijoriPeerComparisonDocument,
+    ) -> StructuredPeerComparisonDocument:
+        metrics = tuple(
+            PeerComparisonMetric(
+                metric_key=metric.metric_key,
+                source_label=metric.source_label,
+                standardized_label=metric.standardized_label,
+                value_kind=FundamentalValueKind(metric.value_kind),
+                source_unit=metric.source_unit,
+                normalized_unit=metric.source_unit,
+                currency=(
+                    "INR" if metric.value_kind == "monetary" else None
+                ),
+                display_order=metric.display_order,
+            )
+            for metric in source.metrics
+        )
+        metrics_by_key = {metric.metric_key: metric for metric in metrics}
+        peers = tuple(
+            PeerComparisonCompany(
+                peer_key=peer.peer_key,
+                legal_name=peer.legal_name,
+                provider_slug=peer.provider_slug,
+                is_subject=peer.is_subject,
+                display_order=peer.display_order,
+                cells=tuple(
+                    TijoriMcpAdapter._normalize_peer_comparison_cell(
+                        cell.metric_key,
+                        cell.source_value,
+                        cell.availability_status,
+                        metrics_by_key[cell.metric_key].source_unit,
+                    )
+                    for cell in peer.values
+                ),
+            )
+            for peer in source.peers
+        )
+        return StructuredPeerComparisonDocument(
+            document_id=(
+                f"tijori.{request.issuer.exchange}.{request.issuer.symbol}."
+                "peer_comparison.not_applicable"
+            ),
+            connection=request.connection,
+            issuer=request.issuer,
+            observation_date=source.observation_date,
+            metrics=metrics,
+            peers=peers,
+            source_location=source.source.location,
+            retrieved_at=source.source.retrieved_at,
+            expires_at=source.source.retrieved_at + timedelta(days=10),
+            validation_status=FundamentalValidationStatus.VALIDATED,
+        )
+
+    @staticmethod
+    def _normalize_benchmarking_financials_document(
+        request: FundamentalCompanyOverviewRequest,
+        source: TijoriBenchmarkingFinancialsDocument,
+    ) -> StructuredBenchmarkingFinancialsDocument:
+        companies = tuple(
+            BenchmarkingCompany(
+                company_key=company.company_key,
+                legal_name=company.legal_name,
+                provider_slug=company.provider_slug,
+                is_subject=company.is_subject,
+                display_order=company.display_order,
+            )
+            for company in source.companies
+        )
+        rows = tuple(
+            TijoriMcpAdapter._normalize_benchmarking_row(row)
+            for row in source.rows
+        )
+        return StructuredBenchmarkingFinancialsDocument(
+            document_id=(
+                f"tijori.{request.issuer.exchange}.{request.issuer.symbol}."
+                "benchmarking_financials.not_applicable"
+            ),
+            connection=request.connection,
+            issuer=request.issuer,
+            observation_date=source.observation_date,
+            companies=companies,
+            rows=rows,
+            source_location=source.source.location,
+            retrieved_at=source.source.retrieved_at,
+            expires_at=source.source.retrieved_at + timedelta(days=10),
+            all_rows_captured=source.all_rows_captured,
+            validation_status=FundamentalValidationStatus.VALIDATED,
+        )
+
+    @staticmethod
+    def _normalize_benchmarking_row(
+        source: TijoriBenchmarkingRow,
+    ) -> BenchmarkingRow:
+        section = {
+            "bch_op_metric": BenchmarkingSection.OPERATIONAL_METRICS,
+            "bch_financial": BenchmarkingSection.FINANCIALS,
+            "bch_shareholdings": BenchmarkingSection.SHAREHOLDINGS,
+        }[source.provider_section]
+        value_kind, source_unit, normalized_unit = (
+            TijoriMcpAdapter._benchmarking_value_semantics(source)
+        )
+        return BenchmarkingRow(
+            row_key=source.row_key,
+            parent_row_key=source.parent_row_key,
+            original_label=source.original_label,
+            depth=source.depth,
+            row_kind=source.row_kind,
+            section=section,
+            value_kind=value_kind,
+            source_unit=source_unit,
+            normalized_unit=normalized_unit,
+            provider_hidden=source.provider_hidden,
+            display_order=source.display_order,
+            cells=tuple(
+                TijoriMcpAdapter._normalize_benchmarking_cell(
+                    cell,
+                    value_kind=value_kind,
+                )
+                for cell in source.values
+            ),
+        )
+
+    @staticmethod
+    def _benchmarking_value_semantics(source) -> tuple[
+        FundamentalValueKind,
+        str,
+        str,
+    ]:
+        if source.row_kind == "section":
+            return (
+                FundamentalValueKind.OTHER,
+                "not applicable",
+                "not applicable",
+            )
+        values = tuple(
+            cell.source_value
+            for cell in source.values
+            if cell.source_value is not None
+        )
+        if any("%" in value for value in values):
+            return FundamentalValueKind.PERCENTAGE, "percent", "percent"
+        if any(
+            "₹" in value or value.casefold().endswith(" cr")
+            for value in values
+        ):
+            return FundamentalValueKind.MONETARY, "INR crore", "INR crore"
+        if any(value.casefold().endswith("x") for value in values):
+            return FundamentalValueKind.RATIO, "ratio", "ratio"
+        return FundamentalValueKind.OTHER, "provider scalar", "provider scalar"
+
+    @staticmethod
+    def _normalize_benchmarking_cell(
+        source: TijoriBenchmarkingCell,
+        *,
+        value_kind: FundamentalValueKind,
+    ) -> BenchmarkingCell:
+        available = source.availability_status == "available"
+        normalized_value = None
+        if available:
+            numeric = source.source_value.replace(",", "").replace("₹", "")
+            numeric = numeric.replace("%", "")
+            numeric = numeric.removesuffix("Cr").removesuffix("cr")
+            numeric = numeric.removesuffix("x").removesuffix("X")
+            normalized_value = Decimal(numeric.strip())
+        return BenchmarkingCell(
+            company_key=source.company_key,
+            source_value=source.source_value,
+            normalized_value=normalized_value,
+            availability_status=(
+                FundamentalAvailabilityStatus.AVAILABLE
+                if available
+                else FundamentalAvailabilityStatus.UNKNOWN
+            ),
+            is_best=source.is_best,
+        )
+
+    @staticmethod
+    def _normalize_peer_comparison_cell(
+        metric_key: str,
+        source_value: str | None,
+        availability_status: Literal["available", "unknown"],
+        source_unit: str,
+    ) -> PeerComparisonCell:
+        available = availability_status == "available"
+        normalized_value = None
+        if available:
+            if source_value is None:
+                raise ValueError("available peer value is missing")
+            numeric = source_value.replace(",", "").replace("₹", "").strip()
+            suffix = {
+                "INR crore": "cr",
+                "percent": "%",
+                "ratio": "x",
+            }.get(source_unit)
+            if suffix is not None and numeric.casefold().endswith(suffix):
+                numeric = numeric[: -len(suffix)].strip()
+            normalized_value = Decimal(numeric)
+        return PeerComparisonCell(
+            metric_key=metric_key,
+            source_value=source_value,
+            normalized_value=normalized_value,
+            availability_status=(
+                FundamentalAvailabilityStatus.AVAILABLE
+                if available
+                else FundamentalAvailabilityStatus.UNKNOWN
+            ),
+        )
+
+    @staticmethod
+    def _normalize_growth_table_cell(
+        cell: TijoriFinancialDocumentCell,
+        *,
+        source_unit: str,
+    ) -> FinancialDocumentCell:
+        source_value = cell.source_value
+        available = cell.availability_status == "available"
+        normalized_value = None
+        if available:
+            normalized_value = Decimal(
+                source_value.replace(",", "").removesuffix("%").strip()
+            )
+        return FinancialDocumentCell(
+            period_key=cell.column_key,
+            source_value=source_value,
+            normalized_value=normalized_value,
+            source_unit=source_unit if available else None,
+            normalized_unit=source_unit if available else None,
+            yoy_change=cell.yoy_change,
+            percentage_of_parent=cell.percentage_of_parent,
+            availability_status=(
+                FundamentalAvailabilityStatus.AVAILABLE
+                if available
+                else FundamentalAvailabilityStatus.UNKNOWN
+            ),
+        )
+
+    @staticmethod
+    def _normalize_balance_sheet_document(
+        request: FundamentalStructuredDocumentRequest,
+        source: TijoriBalanceSheetDocument,
+    ) -> StructuredFinancialDocument:
+        periods = tuple(
+            FinancialDocumentPeriod(
+                period_key=period.period_key,
+                source_label=period.source_label,
+                display_order=period.display_order,
+            )
+            for period in source.periods
+        )
+        rows = tuple(
+            FinancialDocumentRow(
+                row_key=row.row_key,
+                original_label=row.original_label,
+                parent_row_key=row.parent_row_key,
+                depth=row.depth,
+                row_kind=FinancialDocumentRowKind(row.row_kind),
+                value_kind=FundamentalValueKind.MONETARY,
+                display_order=row.display_order,
+                cells=tuple(
+                    TijoriMcpAdapter._normalize_balance_sheet_cell(
+                        cell,
+                        source_unit=source.source_unit,
+                        normalized_unit=source.normalized_unit,
+                    )
+                    for cell in row.values
+                ),
+            )
+            for row in source.rows
+        )
+        return StructuredFinancialDocument(
+            document_id=(
+                f"tijori.{request.issuer.exchange}.{request.issuer.symbol}."
+                f"{request.document_type.value}.{request.reporting_basis.value}"
+            ),
+            connection=request.connection,
+            issuer=request.issuer,
+            document_type=request.document_type,
+            reporting_basis=request.reporting_basis,
+            currency="INR",
+            source_unit=source.source_unit,
+            skipped_period_labels=source.skipped_report_dates,
+            periods=periods,
+            rows=rows,
+            source_location=source.source.location,
+            retrieved_at=source.source.retrieved_at,
+            expires_at=source.source.retrieved_at + timedelta(days=10),
+            all_sections_expanded=source.all_sections_expanded,
+            validation_status=FundamentalValidationStatus.VALIDATED,
+        )
+
+    @staticmethod
+    def _normalize_balance_sheet_cell(
+        cell: TijoriFinancialStatementCell,
+        *,
+        source_unit: str,
+        normalized_unit: str,
+    ) -> FinancialDocumentCell:
+        available = cell.availability_status == "available"
+        normalized_value = (
+            Decimal(cell.source_value.replace(",", "").strip())
+            if available and cell.source_value is not None
+            else None
+        )
+        return FinancialDocumentCell(
+            period_key=cell.period_key,
+            source_value=cell.source_value,
+            normalized_value=normalized_value,
+            source_unit=source_unit if available else None,
+            normalized_unit=normalized_unit if available else None,
+            yoy_change=cell.yoy_change,
+            percentage_of_parent=cell.percentage_of_parent,
+            availability_status=(
+                FundamentalAvailabilityStatus.AVAILABLE
+                if available
+                else FundamentalAvailabilityStatus.UNKNOWN
+            ),
+        )
+
+    @staticmethod
+    def _normalize_cash_flow_document(
+        request: FundamentalStructuredDocumentRequest,
+        source: TijoriCashFlowDocument,
+    ) -> StructuredFinancialDocument:
+        return TijoriMcpAdapter._normalize_balance_sheet_document(
+            request,
+            source,
+        )
+
+    @staticmethod
+    def _normalize_mixed_unit_statement_document(
+        request: FundamentalStructuredDocumentRequest,
+        source: (
+            TijoriProfitAndLossDocument
+            | TijoriRatiosDocument
+            | TijoriQuarterlyResultsDocument
+        ),
+    ) -> StructuredFinancialDocument:
+        periods = tuple(
+            FinancialDocumentPeriod(
+                period_key=period.period_key,
+                source_label=period.source_label,
+                display_order=period.display_order,
+            )
+            for period in source.periods
+        )
+        rows = tuple(
+            FinancialDocumentRow(
+                row_key=row.row_key,
+                original_label=row.original_label,
+                parent_row_key=row.parent_row_key,
+                depth=row.depth,
+                row_kind=FinancialDocumentRowKind(row.row_kind),
+                value_kind=FundamentalValueKind(row.value_kind),
+                display_order=row.display_order,
+                cells=tuple(
+                    TijoriMcpAdapter._normalize_balance_sheet_cell(
+                        cell,
+                        source_unit=row.source_unit,
+                        normalized_unit=row.normalized_unit,
+                    )
+                    for cell in row.values
+                ),
+            )
+            for row in source.rows
+        )
+        return StructuredFinancialDocument(
+            document_id=(
+                f"tijori.{request.issuer.exchange}.{request.issuer.symbol}."
+                f"{request.document_type.value}.{request.reporting_basis.value}"
+            ),
+            connection=request.connection,
+            issuer=request.issuer,
+            document_type=request.document_type,
+            reporting_basis=request.reporting_basis,
+            currency="INR",
+            source_unit=source.source_unit,
+            skipped_period_labels=source.skipped_report_dates,
+            periods=periods,
+            rows=rows,
+            source_location=source.source.location,
+            retrieved_at=source.source.retrieved_at,
+            expires_at=source.source.retrieved_at + timedelta(days=10),
+            all_sections_expanded=source.all_sections_expanded,
+            validation_status=FundamentalValidationStatus.VALIDATED,
         )
 
     def retrieve_shareholding(
@@ -815,6 +1674,8 @@ class TijoriMcpAdapter(FundamentalEvidenceGateway):
             "issuer": {
                 "exchange": issuer.exchange,
                 "symbol": issuer.symbol,
+                "legal_name": issuer.legal_name,
+                "isin": issuer.isin,
                 "provider_company_id": issuer.provider_company_id,
                 "provider_slug": issuer.provider_slug,
             },
