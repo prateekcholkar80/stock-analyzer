@@ -519,6 +519,9 @@ class FakeFundamentalSnapshotRepository:
     def save_fundamental_snapshot(self, stored):
         return stored
 
+    def replace_fundamental_snapshot(self, stored, *, scope):
+        return stored
+
     def get_fundamental_snapshot(self, key, *, scope, as_of):
         return None
 
@@ -537,6 +540,29 @@ class IncompleteFundamentalSnapshotRepository:
         return stored
 
 
+class LegacyFundamentalSnapshotRepository:
+    """Old repository surface intentionally missing atomic replacement."""
+
+    @property
+    def adapter_name(self):
+        return "legacy-fundamental-storage"
+
+    def save_fundamental_snapshot(self, stored):
+        return stored
+
+    def get_fundamental_snapshot(self, key, *, scope, as_of):
+        return None
+
+    def list_fundamental_snapshots(self, query, *, as_of):
+        return ()
+
+    def delete_fundamental_snapshot(self, key, *, scope):
+        return False
+
+    def purge_expired_fundamental_snapshots(self, *, as_of):
+        return 0
+
+
 class FundamentalSnapshotRepositoryProtocolTests(unittest.TestCase):
     def test_complete_fake_satisfies_runtime_protocol(self):
         self.assertIsInstance(
@@ -550,12 +576,19 @@ class FundamentalSnapshotRepositoryProtocolTests(unittest.TestCase):
             FundamentalSnapshotRepository,
         )
 
+    def test_legacy_repository_without_atomic_replace_is_rejected(self):
+        self.assertNotIsInstance(
+            LegacyFundamentalSnapshotRepository(),
+            FundamentalSnapshotRepository,
+        )
+
     def test_repository_surface_has_no_unscoped_list_or_raw_payload_method(self):
         methods = set(dir(FundamentalSnapshotRepository))
 
         self.assertNotIn("list_all", methods)
         self.assertNotIn("save_raw_payload", methods)
         self.assertNotIn("save_session", methods)
+        self.assertIn("replace_fundamental_snapshot", methods)
         self.assertIn("purge_expired_fundamental_snapshots", methods)
 
 

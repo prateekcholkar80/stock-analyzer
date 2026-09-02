@@ -141,7 +141,8 @@ function normalizeCompany(value, slug, locator) {
   const companyId = normalizedString(value.company_id, 128);
   const legalName = normalizedString(value.legal_name, 300, true);
   const symbol = normalizedString(value.symbol, 100)?.toUpperCase();
-  const exchange = normalizedString(value.exchange, 32)?.toUpperCase();
+  const providerExchange = normalizedString(value.exchange, 32)?.toUpperCase();
+  const exchange = providerExchange ?? locator.exchange ?? undefined;
   const isin = value.isin === undefined || value.isin === null
     ? null
     : normalizedString(value.isin, 12)?.toUpperCase();
@@ -164,7 +165,7 @@ function normalizeCompany(value, slug, locator) {
     exchange,
     symbol,
     isin,
-  });
+  }, providerExchange !== undefined);
   return {
     company_id: companyId,
     slug,
@@ -178,7 +179,7 @@ function normalizeCompany(value, slug, locator) {
   };
 }
 
-function directMatch(locator, company) {
+function directMatch(locator, company, providerExchangeObserved) {
   if (locator.provider_company_id === company.company_id) {
     return { kind: 'provider_id', fields: ['provider_company_id'] };
   }
@@ -186,7 +187,12 @@ function directMatch(locator, company) {
     return { kind: 'exact_isin', fields: ['isin'] };
   }
   if (locator.symbol !== null && locator.symbol === company.symbol) {
-    const fields = locator.exchange === null ? ['symbol'] : ['symbol', 'exchange'];
+    const fields = locator.exchange === null
+      ? ['symbol']
+      : [
+        'symbol',
+        providerExchangeObserved ? 'exchange' : 'requested_exchange',
+      ];
     return { kind: 'exact_symbol', fields };
   }
   if (

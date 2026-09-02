@@ -2,6 +2,8 @@ import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
+from hashlib import sha256
+from re import fullmatch
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -11,9 +13,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.models import (
+    BrowserBenchmarkingFinancialsDocument,
+    BrowserBenchmarkingFinancialsDocumentResponse,
     BrowserConversationInputRequest,
     BrowserOperationResultResponse,
+    BrowserStructuredFinancialDocument,
+    BrowserStructuredFinancialDocumentResponse,
     CreateBrowserSessionResponse,
+    ProviderSessionLifecycleResponse,
+    ProviderSessionStatusRequest,
+    ProviderSessionTargetRequest,
+    ProvisionProviderSessionRequest,
+    RevokeProviderSessionRequest,
     SpeechSynthesisRequest,
     SpeechTranscriptionResponse,
     SubmitBrowserOperationRequest,
@@ -23,6 +34,12 @@ from app.api.session_auth import (
     InMemoryBrowserSessionAuthorizer,
 )
 from app.audit.prompt_audit import prompt_audit_session_context
+from app.fundamentals.session_provisioning import (
+    ProviderSessionInspectionRequest,
+    ProviderSessionLifecycle,
+    ProviderSessionProvisioningRequest,
+    ProviderSessionRevocationRequest,
+)
 from app.exceptions import (
     BrowserOperationConflictError,
     BrowserOperationNotFoundError,
@@ -37,6 +54,7 @@ from app.exceptions import (
     TTSError,
     TTSProviderUnavailableError,
     TTSSynthesisError,
+    StorageError,
 )
 from app.models.browser_operations import (
     BrowserOperationOutput,
@@ -55,11 +73,22 @@ from app.models.browser_conversation import (
 )
 from app.models.conversation import JarvisUtterance
 from app.models.dashboard import JarvisDashboardView
+from app.models.fundamentals import ProviderConnectionScope
+from app.models.financial_document_storage import (
+    StructuredDocumentRepositoryScope,
+)
 from app.presentation.dashboard import (
     DashboardProjectionError,
     JarvisDashboardProjector,
 )
 from app.stt.gateway import Transcription
+from app.services.provider_sessions import ProviderSessionCommandError
+from app.storage.financial_document_repositories import (
+    StructuredFinancialDocumentRepository,
+)
+from app.storage.benchmarking_financials_repositories import (
+    BenchmarkingFinancialsRepository,
+)
 from app.tts.gateway import SpeechSynthesis
 
 
@@ -173,12 +202,67 @@ class TranscriptionApplication(Protocol):
         ...
 
 
+@runtime_checkable
+class ProviderSessionApplication(Protocol):
+    def status(
+        self,
+        *,
+        request: ProviderSessionInspectionRequest,
+    ) -> ProviderSessionLifecycle:
+        ...
+
+    def provision(
+        self,
+        *,
+        request: ProviderSessionProvisioningRequest,
+    ) -> ProviderSessionLifecycle:
+        ...
+
+    def revoke(
+        self,
+        *,
+        request: ProviderSessionRevocationRequest,
+    ) -> ProviderSessionLifecycle:
+        ...
+
+
+@runtime_checkable
+class BrowserSessionOwnershipRegistry(Protocol):
+    def bind_browser_session(
+        self,
+        *,
+        browser_session_id: str,
+        tenant_id: str,
+    ) -> None:
+        ...
+
+    def unbind_browser_session(self, browser_session_id: str) -> bool:
+        ...
+
+
 def create_jarvis_http_app(
     operations: BrowserOperationApplication,
     *,
     conversation: BrowserConversationApplication | None = None,
     speech: SpeechSynthesisApplication | None = None,
     transcription: TranscriptionApplication | None = None,
+    provider_sessions: ProviderSessionApplication | None = None,
+    provider_connection_scope_resolver: Callable[
+        [str, ProviderSessionTargetRequest],
+        ProviderConnectionScope,
+    ]
+    | None = None,
+    browser_session_ownership: BrowserSessionOwnershipRegistry | None = None,
+    tenant_identity_resolver: Callable[[Request], str] | None = None,
+    structured_document_repository: (
+        StructuredFinancialDocumentRepository | None
+    ) = None,
+    benchmarking_financials_repository: (
+        BenchmarkingFinancialsRepository | None
+    ) = None,
+    structured_document_scope_resolver: (
+        Callable[[str], ProviderConnectionScope] | None
+    ) = None,
     dashboard_projector: JarvisDashboardProjector | None = None,
     authorizer: BrowserSessionAuthorizer | None = None,
     clock: ApiClock | None = None,
@@ -208,6 +292,75 @@ def create_jarvis_http_app(
         TranscriptionApplication,
     ):
         raise ValueError("Jarvis HTTP API requires a transcription application")
+    if (provider_sessions is None) != (
+        provider_connection_scope_resolver is None
+    ):
+        raise ValueError(
+            "Jarvis HTTP API provider sessions require service and scope resolver"
+        )
+    if provider_sessions is not None and not isinstance(
+        provider_sessions,
+        ProviderSessionApplication,
+    ):
+        raise ValueError("Jarvis HTTP API requires a provider session application")
+    if (
+        provider_connection_scope_resolver is not None
+        and not callable(provider_connection_scope_resolver)
+    ):
+        raise ValueError("Jarvis HTTP API requires a provider scope resolver")
+    if (browser_session_ownership is None) != (
+        tenant_identity_resolver is None
+    ):
+        raise ValueError(
+            "Jarvis HTTP API session ownership requires registry and tenant resolver"
+        )
+    if browser_session_ownership is not None and not isinstance(
+        browser_session_ownership,
+        BrowserSessionOwnershipRegistry,
+    ):
+        raise ValueError("Jarvis HTTP API requires a session ownership registry")
+    if tenant_identity_resolver is not None and not callable(
+        tenant_identity_resolver
+    ):
+        raise ValueError("Jarvis HTTP API requires a tenant identity resolver")
+    document_repositories_configured = any(
+        repository is not None
+        for repository in (
+            structured_document_repository,
+            benchmarking_financials_repository,
+        )
+    )
+    if document_repositories_configured != (
+        structured_document_scope_resolver is not None
+    ):
+        raise ValueError(
+            "Jarvis HTTP API document reads require repositories and a scope "
+            "resolver"
+        )
+    if structured_document_repository is not None and not isinstance(
+        structured_document_repository,
+        StructuredFinancialDocumentRepository,
+    ):
+        raise ValueError(
+            "Jarvis HTTP API requires structured document storage"
+        )
+    if (
+        benchmarking_financials_repository is not None
+        and not isinstance(
+            benchmarking_financials_repository,
+            BenchmarkingFinancialsRepository,
+        )
+    ):
+        raise ValueError(
+            "Jarvis HTTP API requires Benchmarking Financials storage"
+        )
+    if (
+        structured_document_scope_resolver is not None
+        and not callable(structured_document_scope_resolver)
+    ):
+        raise ValueError(
+            "Jarvis HTTP API requires a structured document scope resolver"
+        )
     resolved_authorizer = authorizer or InMemoryBrowserSessionAuthorizer()
     resolved_dashboard_projector = (
         dashboard_projector or JarvisDashboardProjector()
@@ -336,6 +489,13 @@ def create_jarvis_http_app(
             content={"detail": "Speech transcription is currently unavailable."},
         )
 
+    @app.exception_handler(ProviderSessionCommandError)
+    async def provider_session_failure(_request, _exc):
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={"detail": "Provider session command is currently unavailable."},
+        )
+
     def authorize(session_id: str, access_token: str | None) -> None:
         if access_token is None or not access_token.strip():
             raise HTTPException(
@@ -350,6 +510,52 @@ def create_jarvis_http_app(
                 detail="browser session authorization failed",
             ) from exc
 
+    def resolve_tenant_identity(request: Request) -> str | None:
+        if tenant_identity_resolver is None:
+            return None
+        try:
+            tenant_id = tenant_identity_resolver(request)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="tenant identity could not be established",
+            ) from exc
+        if (
+            not isinstance(tenant_id, str)
+            or len(tenant_id) > 128
+            or fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", tenant_id) is None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="tenant identity could not be established",
+            )
+        return tenant_id
+
+    def bind_browser_ownership(session_id: str, tenant_id: str) -> None:
+        if browser_session_ownership is None:
+            return
+        try:
+            browser_session_ownership.bind_browser_session(
+                browser_session_id=session_id,
+                tenant_id=tenant_id,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="browser session ownership is currently unavailable",
+            ) from exc
+
+    def unbind_browser_ownership(session_id: str) -> None:
+        if browser_session_ownership is None:
+            return
+        try:
+            browser_session_ownership.unbind_browser_session(session_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="browser session ownership is currently unavailable",
+            ) from exc
+
     def owned_operation(
         session_id: str,
         operation_id: str,
@@ -361,6 +567,50 @@ def create_jarvis_http_app(
             )
         return snapshot
 
+    def resolve_provider_scope(
+        session_id: str,
+        target: ProviderSessionTargetRequest,
+    ) -> ProviderConnectionScope:
+        if provider_connection_scope_resolver is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        try:
+            scope = provider_connection_scope_resolver(session_id, target)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="provider connection was not found",
+            ) from exc
+        if (
+            not isinstance(scope, ProviderConnectionScope)
+            or scope.provider_connection_id != target.provider_connection_id
+            or scope.provider != target.provider
+            or scope.account_reference_hash != target.account_reference_hash
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="provider connection was not found",
+            )
+        return scope
+
+    def provider_request_id(
+        session_id: str,
+        command: str,
+        client_key: str,
+        target: ProviderSessionTargetRequest,
+    ) -> str:
+        material = "\0".join(
+            (
+                session_id,
+                command,
+                client_key,
+                target.provider,
+                target.provider_connection_id,
+                target.account_reference_hash or "unbound",
+            )
+        )
+        digest = sha256(material.encode("utf-8")).hexdigest()
+        return f"provider-session.{command}.{digest}"
+
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "jarvis-research-api"}
@@ -370,11 +620,16 @@ def create_jarvis_http_app(
         response_model=CreateBrowserSessionResponse,
         status_code=status.HTTP_201_CREATED,
     )
-    def create_session() -> CreateBrowserSessionResponse:
+    def create_session(request: Request) -> CreateBrowserSessionResponse:
         now = resolved_clock()
         session_id = resolved_session_ids()
+        tenant_id = resolve_tenant_identity(request)
         access_token = resolved_authorizer.issue(session_id)
+        ownership_bound = False
         try:
+            if browser_session_ownership is not None and tenant_id is not None:
+                bind_browser_ownership(session_id, tenant_id)
+                ownership_bound = True
             if conversation is not None:
                 conversation.open_session(session_id, at=now)
             session = operations.open_session(
@@ -388,6 +643,11 @@ def create_jarvis_http_app(
             if conversation is not None:
                 try:
                     conversation.close_session(session_id, at=now)
+                except Exception:
+                    pass
+            if ownership_bound and browser_session_ownership is not None:
+                try:
+                    browser_session_ownership.unbind_browser_session(session_id)
                 except Exception:
                     pass
             resolved_authorizer.revoke(session_id)
@@ -410,10 +670,98 @@ def create_jarvis_http_app(
             session_id,
             closed_at=resolved_clock(),
         )
-        if conversation is not None:
-            conversation.close_session(session_id, at=resolved_clock())
-        resolved_authorizer.revoke(session_id)
+        try:
+            if conversation is not None:
+                conversation.close_session(session_id, at=resolved_clock())
+        finally:
+            try:
+                unbind_browser_ownership(session_id)
+            finally:
+                resolved_authorizer.revoke(session_id)
         return closed
+
+    if provider_sessions is not None:
+
+        @app.post(
+            "/api/v1/sessions/{session_id}/provider-session/status",
+            response_model=ProviderSessionLifecycleResponse,
+        )
+        def provider_session_status(
+            session_id: str,
+            body: ProviderSessionStatusRequest,
+            x_jarvis_session_token: str | None = Header(default=None),
+        ) -> ProviderSessionLifecycleResponse:
+            authorize(session_id, x_jarvis_session_token)
+            scope = resolve_provider_scope(session_id, body.target)
+            lifecycle = provider_sessions.status(
+                request=ProviderSessionInspectionRequest(
+                    request_id=provider_request_id(
+                        session_id,
+                        "status",
+                        uuid4().hex,
+                        body.target,
+                    ),
+                    connection=scope,
+                    requested_at=resolved_clock(),
+                )
+            )
+            return ProviderSessionLifecycleResponse.from_lifecycle(lifecycle)
+
+        @app.post(
+            "/api/v1/sessions/{session_id}/provider-session/provision",
+            response_model=ProviderSessionLifecycleResponse,
+        )
+        def provision_provider_session(
+            session_id: str,
+            body: ProvisionProviderSessionRequest,
+            x_jarvis_session_token: str | None = Header(default=None),
+        ) -> ProviderSessionLifecycleResponse:
+            authorize(session_id, x_jarvis_session_token)
+            scope = resolve_provider_scope(session_id, body.target)
+            lifecycle = provider_sessions.provision(
+                request=ProviderSessionProvisioningRequest(
+                    request_id=provider_request_id(
+                        session_id,
+                        "provision",
+                        body.idempotency_key,
+                        body.target,
+                    ),
+                    connection=scope,
+                    requested_at=resolved_clock(),
+                    user_interaction_authorized=(
+                        body.user_interaction_authorized
+                    ),
+                    replace_existing=body.replace_existing,
+                )
+            )
+            return ProviderSessionLifecycleResponse.from_lifecycle(lifecycle)
+
+        @app.post(
+            "/api/v1/sessions/{session_id}/provider-session/revoke",
+            response_model=ProviderSessionLifecycleResponse,
+        )
+        def revoke_provider_session(
+            session_id: str,
+            body: RevokeProviderSessionRequest,
+            x_jarvis_session_token: str | None = Header(default=None),
+        ) -> ProviderSessionLifecycleResponse:
+            authorize(session_id, x_jarvis_session_token)
+            scope = resolve_provider_scope(session_id, body.target)
+            lifecycle = provider_sessions.revoke(
+                request=ProviderSessionRevocationRequest(
+                    request_id=provider_request_id(
+                        session_id,
+                        "revoke",
+                        body.idempotency_key,
+                        body.target,
+                    ),
+                    connection=scope,
+                    requested_at=resolved_clock(),
+                    reason=body.reason,
+                    secure_delete_required=body.secure_delete_required,
+                )
+            )
+            return ProviderSessionLifecycleResponse.from_lifecycle(lifecycle)
 
     @app.post(
         "/api/v1/sessions/{session_id}/operations",
@@ -489,6 +837,181 @@ def create_jarvis_http_app(
                 content=response.model_dump(mode="json"),
             )
         raise HTTPException(status_code=500, detail="invalid operation state")
+
+    @app.get(
+        "/api/v1/sessions/{session_id}/operations/{operation_id}"
+        "/financial-documents/{cache_entry_id}",
+        response_model=BrowserStructuredFinancialDocumentResponse,
+    )
+    def get_structured_financial_document(
+        session_id: str,
+        operation_id: str,
+        cache_entry_id: str,
+        x_jarvis_session_token: str | None = Header(default=None),
+    ) -> BrowserStructuredFinancialDocumentResponse:
+        authorize(session_id, x_jarvis_session_token)
+        snapshot = owned_operation(session_id, operation_id)
+        if snapshot.status is not BrowserOperationStatus.COMPLETED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="financial documents are available after completion",
+            )
+        output = operations.get_result(operation_id)
+        if output is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="completed browser operation result is unavailable",
+            )
+        reference = next(
+            (
+                item
+                for item in output.structured_document_references
+                if item.cache_entry_id == cache_entry_id
+            ),
+            None,
+        )
+        if reference is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        if (
+            structured_document_repository is None
+            or structured_document_scope_resolver is None
+        ):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        try:
+            connection = structured_document_scope_resolver(session_id)
+            if not isinstance(connection, ProviderConnectionScope):
+                raise TypeError("invalid structured document scope")
+            stored = (
+                structured_document_repository
+                .get_structured_financial_document_by_cache_entry_id(
+                    cache_entry_id,
+                    scope=StructuredDocumentRepositoryScope(
+                        tenant_id=connection.tenant_id,
+                        provider_connection_id=(
+                            connection.provider_connection_id
+                        ),
+                        provider=connection.provider,
+                    ),
+                    as_of=resolved_clock(),
+                )
+            )
+        except (StorageError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="financial document storage is currently unavailable",
+            ) from exc
+        if stored is None:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="financial document cache entry is no longer active",
+            )
+        document = stored.result.document
+        if document is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="cached financial document is invalid",
+            )
+        try:
+            return BrowserStructuredFinancialDocumentResponse(
+                operation_id=operation_id,
+                reference=reference,
+                document=BrowserStructuredFinancialDocument.from_document(
+                    document
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="cached financial document failed integrity checks",
+            ) from exc
+
+    @app.get(
+        "/api/v1/sessions/{session_id}/operations/{operation_id}"
+        "/benchmarking-financials/{cache_entry_id}",
+        response_model=BrowserBenchmarkingFinancialsDocumentResponse,
+    )
+    def get_benchmarking_financials_document(
+        session_id: str,
+        operation_id: str,
+        cache_entry_id: str,
+        x_jarvis_session_token: str | None = Header(default=None),
+    ) -> BrowserBenchmarkingFinancialsDocumentResponse:
+        authorize(session_id, x_jarvis_session_token)
+        snapshot = owned_operation(session_id, operation_id)
+        if snapshot.status is not BrowserOperationStatus.COMPLETED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Benchmarking Financials are available after completion"
+                ),
+            )
+        output = operations.get_result(operation_id)
+        if output is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="completed browser operation result is unavailable",
+            )
+        reference = output.benchmarking_financials_reference
+        if reference is None or reference.cache_entry_id != cache_entry_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        if (
+            benchmarking_financials_repository is None
+            or structured_document_scope_resolver is None
+        ):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        try:
+            connection = structured_document_scope_resolver(session_id)
+            if not isinstance(connection, ProviderConnectionScope):
+                raise TypeError("invalid Benchmarking Financials scope")
+            stored = (
+                benchmarking_financials_repository
+                .get_benchmarking_financials_by_cache_entry_id(
+                    cache_entry_id,
+                    scope=StructuredDocumentRepositoryScope(
+                        tenant_id=connection.tenant_id,
+                        provider_connection_id=(
+                            connection.provider_connection_id
+                        ),
+                        provider=connection.provider,
+                    ),
+                    as_of=resolved_clock(),
+                )
+            )
+        except (StorageError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Benchmarking Financials storage is currently unavailable"
+                ),
+            ) from exc
+        if stored is None:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail=(
+                    "Benchmarking Financials cache entry is no longer active"
+                ),
+            )
+        document = stored.result.document
+        if document is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="cached Benchmarking Financials document is invalid",
+            )
+        try:
+            return BrowserBenchmarkingFinancialsDocumentResponse(
+                operation_id=operation_id,
+                reference=reference,
+                document=BrowserBenchmarkingFinancialsDocument.from_document(
+                    document
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "cached Benchmarking Financials failed integrity checks"
+                ),
+            ) from exc
 
     @app.post(
         "/api/v1/sessions/{session_id}/operations/{operation_id}/cancel",

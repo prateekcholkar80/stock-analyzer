@@ -49,6 +49,10 @@ const TOOL_INPUT_SCHEMAS = Object.freeze({
   get_company_overview: z.looseObject({
     issuer: issuerSchema,
     as_of_date: z.string().optional().nullable(),
+    document_type: z.enum([
+      'peer_comparison',
+      'benchmarking_financials',
+    ]).optional(),
   }),
   get_financials: z.looseObject({
     issuer: issuerSchema,
@@ -56,6 +60,19 @@ const TOOL_INPUT_SCHEMAS = Object.freeze({
     statements: z.array(z.string()).optional(),
     period_types: z.array(z.string()).optional(),
     max_periods: z.number().int().optional(),
+    document_type: z.enum([
+      'growth_table',
+      'balance_sheet',
+      'profit_and_loss',
+      'cash_flow',
+      'ratios',
+      'quarterly_results',
+    ]).optional(),
+    reporting_basis: z.enum([
+      'consolidated',
+      'standalone',
+      'not_applicable',
+    ]).optional(),
   }),
   get_shareholding: z.looseObject({
     issuer: issuerSchema,

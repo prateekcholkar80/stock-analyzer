@@ -40,9 +40,12 @@ TijoriToolName = Literal[
     "get_shareholding",
 ]
 
-_MAX_PAYLOAD_BYTES = 1_000_000
-_MAX_JSON_DEPTH = 8
-_MAX_JSON_NODES = 10_000
+# Fully expanded statements are bounded at 500 rows by 40 periods. Their
+# labelled cell objects legitimately exceed the earlier generic envelope even
+# though the document remains finite and schema validated.
+_MAX_PAYLOAD_BYTES = 8_000_000
+_MAX_JSON_DEPTH = 16
+_MAX_JSON_NODES = 250_000
 
 
 class TijoriToolStatus(StrEnum):
@@ -452,6 +455,969 @@ class TijoriEvidencePayload(FundamentalModel):
         ):
             raise ValueError("Tijori fact references an unknown source")
         return self
+
+
+class TijoriFinancialDocumentIssuer(FundamentalModel):
+    """Provider identity embedded in one structured financial document."""
+
+    exchange: str = Field(min_length=1, max_length=32)
+    symbol: str = Field(min_length=1, max_length=100)
+    legal_name: str = Field(min_length=1, max_length=300)
+    provider_company_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+    provider_slug: str = Field(
+        min_length=1,
+        max_length=240,
+        pattern=r"^[a-z0-9][a-z0-9-]*$",
+    )
+
+    @field_validator("exchange", "symbol", mode="before")
+    @classmethod
+    def normalize_market_identity(cls, value: str) -> str:
+        return value.upper()
+
+
+class TijoriFinancialDocumentSource(FundamentalModel):
+    provider: Literal["tijori"] = "tijori"
+    location: str = Field(min_length=1, max_length=2_000)
+    retrieved_at: datetime
+
+    @field_validator("retrieved_at")
+    @classmethod
+    def require_retrieval_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Tijori document retrieval time requires timezone")
+        return value
+
+    @field_validator("location")
+    @classmethod
+    def require_safe_financials_location(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or (parsed.hostname or "").lower() != "www.tijorifinance.com"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Tijori financial document location is unsafe")
+        return value
+
+
+class TijoriFinancialDocumentColumn(FundamentalModel):
+    column_key: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z][a-z0-9_.:-]*$",
+    )
+    source_label: str = Field(min_length=1, max_length=80)
+    display_order: int = Field(ge=0, le=200)
+
+
+class TijoriFinancialDocumentCell(FundamentalModel):
+    column_key: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z][a-z0-9_.:-]*$",
+    )
+    source_value: str | None = Field(default=None, min_length=1, max_length=500)
+    yoy_change: str | None = Field(default=None, min_length=1, max_length=80)
+    percentage_of_parent: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+    )
+    availability_status: Literal["available", "unknown"]
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> Self:
+        if (self.availability_status == "available") != (
+            self.source_value is not None
+        ):
+            raise ValueError("Tijori document cell availability contradicts value")
+        if self.source_value is None and (
+            self.yoy_change is not None
+            or self.percentage_of_parent is not None
+        ):
+            raise ValueError(
+                "Tijori document auxiliary values require a primary value"
+            )
+        return self
+
+
+class TijoriFinancialDocumentRow(FundamentalModel):
+    row_key: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[a-z][a-z0-9_.:-]*$",
+    )
+    original_label: str = Field(min_length=1, max_length=300)
+    parent_row_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[a-z][a-z0-9_.:-]*$",
+    )
+    depth: int = Field(ge=0, le=20)
+    row_kind: Literal["section", "total", "subtotal", "component", "metric"]
+    display_order: int = Field(ge=0, le=499)
+    values: tuple[TijoriFinancialDocumentCell, ...] = Field(
+        min_length=1,
+        max_length=120,
+    )
+
+    @model_validator(mode="after")
+    def validate_parent_shape(self) -> Self:
+        if self.depth == 0 and self.parent_row_key is not None:
+            raise ValueError("Tijori root document row cannot have a parent")
+        if self.depth > 0 and self.parent_row_key is None:
+            raise ValueError("Tijori nested document row requires a parent")
+        if self.parent_row_key == self.row_key:
+            raise ValueError("Tijori document row cannot parent itself")
+        return self
+
+
+class TijoriFinancialDocumentExtraction(FundamentalModel):
+    column_count: int = Field(ge=1, le=120)
+    row_count: int = Field(ge=1, le=500)
+    status: Literal["complete"] = "complete"
+
+
+class TijoriGrowthTableDocument(FundamentalModel):
+    """Exact fail-closed contract emitted by the Growth Table extractor."""
+
+    schema_version: Literal["tijori.financial_document.v1"]
+    document_type: Literal["growth_table"]
+    reporting_basis: Literal["consolidated", "standalone", "not_applicable"]
+    issuer: TijoriFinancialDocumentIssuer
+    source: TijoriFinancialDocumentSource
+    unit: str = Field(min_length=1, max_length=80)
+    all_sections_expanded: Literal[True]
+    columns: tuple[TijoriFinancialDocumentColumn, ...] = Field(
+        min_length=1,
+        max_length=120,
+    )
+    rows: tuple[TijoriFinancialDocumentRow, ...] = Field(
+        min_length=1,
+        max_length=500,
+    )
+    extraction: TijoriFinancialDocumentExtraction
+
+    @model_validator(mode="after")
+    def validate_complete_document(self) -> Self:
+        expected_location = (
+            "https://www.tijorifinance.com/company/"
+            f"{self.issuer.provider_slug}/financials/"
+        )
+        if self.source.location != expected_location:
+            raise ValueError("Tijori document location does not match issuer")
+
+        column_keys = tuple(column.column_key for column in self.columns)
+        if len(column_keys) != len(set(column_keys)):
+            raise ValueError("Tijori document column keys must be unique")
+        if tuple(column.display_order for column in self.columns) != tuple(
+            range(len(self.columns))
+        ):
+            raise ValueError("Tijori document columns must be contiguous")
+
+        row_keys = tuple(row.row_key for row in self.rows)
+        if len(row_keys) != len(set(row_keys)):
+            raise ValueError("Tijori document row keys must be unique")
+        if tuple(row.display_order for row in self.rows) != tuple(
+            range(len(self.rows))
+        ):
+            raise ValueError("Tijori document rows must be contiguous")
+        if len(self.rows) * len(self.columns) > 5_000:
+            raise ValueError("Tijori document exceeds the cell safety bound")
+
+        rows_by_key = {row.row_key: row for row in self.rows}
+        for row in self.rows:
+            if tuple(cell.column_key for cell in row.values) != column_keys:
+                raise ValueError("Tijori document row must cover columns in order")
+            if row.parent_row_key is None:
+                continue
+            parent = rows_by_key.get(row.parent_row_key)
+            if (
+                parent is None
+                or parent.display_order >= row.display_order
+                or parent.depth != row.depth - 1
+            ):
+                raise ValueError("Tijori document row hierarchy is invalid")
+
+        if (
+            self.extraction.column_count != len(self.columns)
+            or self.extraction.row_count != len(self.rows)
+        ):
+            raise ValueError("Tijori document extraction counts do not match")
+        return self
+
+    @computed_field
+    @property
+    def document_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"document_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
+class TijoriGrowthTablePayload(FundamentalModel):
+    """Successful get_financials payload for one structured Growth Table."""
+
+    document: TijoriGrowthTableDocument
+
+
+class TijoriFinancialStatementPeriod(FundamentalModel):
+    """One provider-labelled statement period in original display order."""
+
+    period_key: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z][a-z0-9_.:-]*$",
+    )
+    source_label: str = Field(min_length=1, max_length=80)
+    display_order: int = Field(ge=0, le=200)
+
+
+class TijoriFinancialStatementCell(FundamentalModel):
+    """One exact statement cell with missing values distinct from zero."""
+
+    period_key: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z][a-z0-9_.:-]*$",
+    )
+    source_value: str | None = Field(default=None, min_length=1, max_length=500)
+    yoy_change: str | None = Field(default=None, min_length=1, max_length=80)
+    percentage_of_parent: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+    )
+    availability_status: Literal["available", "unknown"]
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> Self:
+        if (self.availability_status == "available") != (
+            self.source_value is not None
+        ):
+            raise ValueError(
+                "Tijori statement cell availability contradicts value"
+            )
+        if self.source_value is None and (
+            self.yoy_change is not None
+            or self.percentage_of_parent is not None
+        ):
+            raise ValueError(
+                "Tijori statement auxiliary values require a primary value"
+            )
+        return self
+
+
+class TijoriFinancialStatementRow(FundamentalModel):
+    """One provider-defined row in a recursively expanded statement."""
+
+    row_key: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[a-z][a-z0-9_.:-]*$",
+    )
+    original_label: str = Field(min_length=1, max_length=300)
+    parent_row_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[a-z][a-z0-9_.:-]*$",
+    )
+    depth: int = Field(ge=0, le=20)
+    row_kind: Literal["section", "total", "subtotal", "component", "metric"]
+    display_order: int = Field(ge=0, le=499)
+    values: tuple[TijoriFinancialStatementCell, ...] = Field(
+        min_length=1,
+        max_length=120,
+    )
+
+    @model_validator(mode="after")
+    def validate_parent_shape(self) -> Self:
+        if self.depth == 0 and self.parent_row_key is not None:
+            raise ValueError("Tijori root statement row cannot have a parent")
+        if self.depth > 0 and self.parent_row_key is None:
+            raise ValueError("Tijori nested statement row requires a parent")
+        if self.parent_row_key == self.row_key:
+            raise ValueError("Tijori statement row cannot parent itself")
+        return self
+
+
+class TijoriFinancialStatementExtraction(FundamentalModel):
+    period_count: int = Field(ge=1, le=120)
+    row_count: int = Field(ge=1, le=500)
+    cell_count: int = Field(ge=1, le=20_000)
+    maximum_depth: int = Field(ge=0, le=20)
+    status: Literal["complete"] = "complete"
+
+
+class TijoriBalanceSheetDocument(FundamentalModel):
+    """Complete provider Balance Sheet for one explicit reporting basis."""
+
+    schema_version: Literal["tijori.financial_document.v1"]
+    document_type: Literal["balance_sheet"]
+    reporting_basis: Literal["consolidated", "standalone"]
+    issuer: TijoriFinancialDocumentIssuer
+    source: TijoriFinancialDocumentSource
+    source_unit: Literal["Rs. Cr."]
+    normalized_unit: Literal["INR crore"]
+    skipped_report_dates: tuple[str, ...] = Field(max_length=120)
+    all_sections_expanded: Literal[True]
+    periods: tuple[TijoriFinancialStatementPeriod, ...] = Field(
+        min_length=1,
+        max_length=120,
+    )
+    rows: tuple[TijoriFinancialStatementRow, ...] = Field(
+        min_length=1,
+        max_length=500,
+    )
+    extraction: TijoriFinancialStatementExtraction
+
+    @field_validator("skipped_report_dates")
+    @classmethod
+    def validate_skipped_report_dates(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if any(not value or len(value) > 80 for value in values):
+            raise ValueError(
+                "Tijori skipped report dates must be non-blank and bounded"
+            )
+        if len(values) != len(set(values)):
+            raise ValueError("Tijori skipped report dates must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def validate_complete_document(self) -> Self:
+        expected_location = (
+            "https://www.tijorifinance.com/company/"
+            f"{self.issuer.provider_slug}/financials/"
+        )
+        if self.source.location != expected_location:
+            raise ValueError("Tijori Balance Sheet location does not match issuer")
+
+        period_keys = tuple(period.period_key for period in self.periods)
+        if len(period_keys) != len(set(period_keys)):
+            raise ValueError("Tijori Balance Sheet period keys must be unique")
+        if tuple(period.display_order for period in self.periods) != tuple(
+            range(len(self.periods))
+        ):
+            raise ValueError("Tijori Balance Sheet periods must be contiguous")
+
+        row_keys = tuple(row.row_key for row in self.rows)
+        if len(row_keys) != len(set(row_keys)):
+            raise ValueError("Tijori Balance Sheet row keys must be unique")
+        if tuple(row.display_order for row in self.rows) != tuple(
+            range(len(self.rows))
+        ):
+            raise ValueError("Tijori Balance Sheet rows must be contiguous")
+        cell_count = len(self.rows) * len(self.periods)
+        if cell_count > 20_000:
+            raise ValueError("Tijori Balance Sheet exceeds the cell safety bound")
+
+        rows_by_key = {row.row_key: row for row in self.rows}
+        for row in self.rows:
+            if tuple(cell.period_key for cell in row.values) != period_keys:
+                raise ValueError(
+                    "Tijori Balance Sheet row must cover periods in order"
+                )
+            if row.parent_row_key is None:
+                continue
+            parent = rows_by_key.get(row.parent_row_key)
+            if (
+                parent is None
+                or parent.display_order >= row.display_order
+                or parent.depth != row.depth - 1
+            ):
+                raise ValueError("Tijori Balance Sheet row hierarchy is invalid")
+
+        if (
+            self.extraction.period_count != len(self.periods)
+            or self.extraction.row_count != len(self.rows)
+            or self.extraction.cell_count != cell_count
+            or self.extraction.maximum_depth
+            != max(row.depth for row in self.rows)
+        ):
+            raise ValueError(
+                "Tijori Balance Sheet extraction counts do not match"
+            )
+        return self
+
+    @computed_field
+    @property
+    def document_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"document_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
+class TijoriBalanceSheetPayload(FundamentalModel):
+    """Successful get_financials payload for one complete Balance Sheet."""
+
+    document: TijoriBalanceSheetDocument
+
+
+class TijoriCashFlowDocument(TijoriBalanceSheetDocument):
+    """Complete provider Cash Flow for one explicit reporting basis."""
+
+    document_type: Literal["cash_flow"]
+
+
+class TijoriCashFlowPayload(FundamentalModel):
+    """Successful get_financials payload for one complete Cash Flow."""
+
+    document: TijoriCashFlowDocument
+
+
+class TijoriProfitAndLossRow(TijoriFinancialStatementRow):
+    """One P&L row with its provider and normalized measurement units."""
+
+    value_kind: Literal["monetary", "percentage", "count"]
+    source_unit: Literal["Rs. Cr.", "percent", "crore shares"]
+    normalized_unit: Literal["INR crore", "percent", "crore shares"]
+
+    @model_validator(mode="after")
+    def validate_value_kind_units(self) -> Self:
+        expected_units = {
+            "monetary": ("Rs. Cr.", "INR crore"),
+            "percentage": ("percent", "percent"),
+            "count": ("crore shares", "crore shares"),
+        }
+        if (
+            self.source_unit,
+            self.normalized_unit,
+        ) != expected_units[self.value_kind]:
+            raise ValueError("Tijori P&L row units contradict its value kind")
+        return self
+
+
+class TijoriProfitAndLossDocument(TijoriBalanceSheetDocument):
+    """Complete provider P&L statement for one explicit reporting basis."""
+
+    document_type: Literal["profit_and_loss"]
+    source_unit: Literal["mixed"]
+    normalized_unit: Literal["mixed"]
+    rows: tuple[TijoriProfitAndLossRow, ...] = Field(
+        min_length=1,
+        max_length=500,
+    )
+
+
+class TijoriProfitAndLossPayload(FundamentalModel):
+    """Successful get_financials payload for one complete P&L statement."""
+
+    document: TijoriProfitAndLossDocument
+
+
+class TijoriRatiosRow(TijoriFinancialStatementRow):
+    """One ratio-table row with its explicit measurement semantics."""
+
+    value_kind: Literal[
+        "monetary",
+        "percentage",
+        "per_share",
+        "ratio",
+        "other",
+    ]
+    source_unit: Literal[
+        "Rs. Cr.",
+        "percent",
+        "per share",
+        "ratio",
+        "days",
+        "not applicable",
+    ]
+    normalized_unit: Literal[
+        "INR crore",
+        "percent",
+        "per share",
+        "ratio",
+        "days",
+        "not applicable",
+    ]
+
+    @model_validator(mode="after")
+    def validate_value_kind_units(self) -> Self:
+        exact_units = {
+            "monetary": ("Rs. Cr.", "INR crore"),
+            "percentage": ("percent", "percent"),
+            "per_share": ("per share", "per share"),
+            "ratio": ("ratio", "ratio"),
+        }
+        supplied = (self.source_unit, self.normalized_unit)
+        if self.value_kind == "other":
+            if supplied not in {
+                ("days", "days"),
+                ("not applicable", "not applicable"),
+            }:
+                raise ValueError(
+                    "Tijori Ratios other-row units are unsupported"
+                )
+        elif supplied != exact_units[self.value_kind]:
+            raise ValueError("Tijori Ratios row units contradict its value kind")
+        return self
+
+
+class TijoriRatiosDocument(TijoriBalanceSheetDocument):
+    """Complete provider Ratios table for one reporting basis."""
+
+    document_type: Literal["ratios"]
+    source_unit: Literal["mixed"]
+    normalized_unit: Literal["mixed"]
+    rows: tuple[TijoriRatiosRow, ...] = Field(
+        min_length=1,
+        max_length=500,
+    )
+
+
+class TijoriRatiosPayload(FundamentalModel):
+    """Successful get_financials payload for one complete Ratios table."""
+
+    document: TijoriRatiosDocument
+
+
+class TijoriQuarterlyResultsRow(TijoriFinancialStatementRow):
+    """One quarterly-result row with explicit measurement semantics."""
+
+    value_kind: Literal["monetary", "percentage", "per_share", "other"]
+    source_unit: Literal[
+        "Rs. Cr.",
+        "percent",
+        "per share",
+        "not applicable",
+    ]
+    normalized_unit: Literal[
+        "INR crore",
+        "percent",
+        "per share",
+        "not applicable",
+    ]
+
+    @model_validator(mode="after")
+    def validate_value_kind_units(self) -> Self:
+        expected_units = {
+            "monetary": ("Rs. Cr.", "INR crore"),
+            "percentage": ("percent", "percent"),
+            "per_share": ("per share", "per share"),
+            "other": ("not applicable", "not applicable"),
+        }
+        if (
+            self.source_unit,
+            self.normalized_unit,
+        ) != expected_units[self.value_kind]:
+            raise ValueError(
+                "Tijori Quarterly Results row units contradict its value kind"
+            )
+        return self
+
+
+class TijoriQuarterlyResultsDocument(TijoriBalanceSheetDocument):
+    """Complete provider Quarterly Results for one reporting basis."""
+
+    document_type: Literal["quarterly_results"]
+    source_unit: Literal["mixed"]
+    normalized_unit: Literal["mixed"]
+    rows: tuple[TijoriQuarterlyResultsRow, ...] = Field(
+        min_length=1,
+        max_length=500,
+    )
+
+
+class TijoriQuarterlyResultsPayload(FundamentalModel):
+    """Successful get_financials payload for complete Quarterly Results."""
+
+    document: TijoriQuarterlyResultsDocument
+
+
+class TijoriPeerComparisonMetric(FundamentalModel):
+    """One explicitly labelled metric in a peer-comparison matrix."""
+
+    metric_key: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+    standardized_label: str = Field(min_length=1, max_length=120)
+    value_kind: Literal["monetary", "ratio", "percentage"]
+    source_unit: Literal["INR", "INR crore", "ratio", "percent"]
+    source_label: str = Field(min_length=1, max_length=120)
+    display_order: int = Field(ge=0, le=29)
+
+    @model_validator(mode="after")
+    def validate_metric_units(self) -> Self:
+        allowed_units = {
+            "monetary": {"INR", "INR crore"},
+            "ratio": {"ratio"},
+            "percentage": {"percent"},
+        }
+        if self.source_unit not in allowed_units[self.value_kind]:
+            raise ValueError(
+                "Tijori Peer Comparison metric units contradict value kind"
+            )
+        return self
+
+
+class TijoriPeerComparisonCell(FundamentalModel):
+    """One peer metric value with missing values distinct from numeric zero."""
+
+    metric_key: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+    source_value: str | None = Field(default=None, min_length=1, max_length=120)
+    availability_status: Literal["available", "unknown"]
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> Self:
+        if (self.availability_status == "available") != (
+            self.source_value is not None
+        ):
+            raise ValueError(
+                "Tijori Peer Comparison availability contradicts value"
+            )
+        return self
+
+
+class TijoriPeerComparisonCompany(FundamentalModel):
+    """One provider-labelled subject or peer in display order."""
+
+    peer_key: str = Field(
+        min_length=1,
+        max_length=250,
+        pattern=r"^peer_[a-z0-9_]+$",
+    )
+    legal_name: str = Field(min_length=1, max_length=300)
+    provider_slug: str = Field(
+        min_length=1,
+        max_length=240,
+        pattern=r"^[a-z0-9][a-z0-9-]*$",
+    )
+    is_subject: bool
+    display_order: int = Field(ge=0, le=49)
+    values: tuple[TijoriPeerComparisonCell, ...] = Field(
+        min_length=1,
+        max_length=30,
+    )
+
+    @model_validator(mode="after")
+    def validate_provider_key(self) -> Self:
+        expected = f"peer_{self.provider_slug.replace('-', '_')}"
+        if self.peer_key != expected:
+            raise ValueError(
+                "Tijori Peer Comparison key does not match provider slug"
+            )
+        return self
+
+
+class TijoriPeerComparisonExtraction(FundamentalModel):
+    metric_count: int = Field(ge=1, le=30)
+    peer_count: int = Field(ge=1, le=50)
+    cell_count: int = Field(ge=1, le=1_500)
+    status: Literal["complete"] = "complete"
+
+
+class TijoriPeerComparisonDocument(FundamentalModel):
+    """Complete cross-sectional Peer Comparison provider document."""
+
+    schema_version: Literal["tijori.peer_comparison.v1"]
+    document_type: Literal["peer_comparison"]
+    issuer: TijoriFinancialDocumentIssuer
+    source: TijoriFinancialDocumentSource
+    observation_date: date
+    metrics: tuple[TijoriPeerComparisonMetric, ...] = Field(
+        min_length=1,
+        max_length=30,
+    )
+    peers: tuple[TijoriPeerComparisonCompany, ...] = Field(
+        min_length=1,
+        max_length=50,
+    )
+    extraction: TijoriPeerComparisonExtraction
+
+    @model_validator(mode="after")
+    def validate_complete_document(self) -> Self:
+        expected_location = (
+            "https://www.tijorifinance.com/company/"
+            f"{self.issuer.provider_slug}/"
+        )
+        if self.source.location != expected_location:
+            raise ValueError(
+                "Tijori Peer Comparison location does not match issuer"
+            )
+        if self.issuer.provider_company_id is None:
+            raise ValueError(
+                "Tijori Peer Comparison requires a provider company ID"
+            )
+
+        metric_keys = tuple(metric.metric_key for metric in self.metrics)
+        if len(metric_keys) != len(set(metric_keys)):
+            raise ValueError("Tijori Peer Comparison metric keys must be unique")
+        if tuple(metric.display_order for metric in self.metrics) != tuple(
+            range(len(self.metrics))
+        ):
+            raise ValueError(
+                "Tijori Peer Comparison metrics must be contiguous"
+            )
+
+        peer_keys = tuple(peer.peer_key for peer in self.peers)
+        peer_slugs = tuple(peer.provider_slug for peer in self.peers)
+        if (
+            len(peer_keys) != len(set(peer_keys))
+            or len(peer_slugs) != len(set(peer_slugs))
+        ):
+            raise ValueError("Tijori Peer Comparison peers must be unique")
+        if tuple(peer.display_order for peer in self.peers) != tuple(
+            range(len(self.peers))
+        ):
+            raise ValueError("Tijori Peer Comparison peers must be contiguous")
+        if sum(peer.is_subject for peer in self.peers) != 1:
+            raise ValueError(
+                "Tijori Peer Comparison must identify one subject"
+            )
+        subject = next(peer for peer in self.peers if peer.is_subject)
+        if subject.provider_slug != self.issuer.provider_slug:
+            raise ValueError(
+                "Tijori Peer Comparison subject does not match issuer"
+            )
+        if any(
+            tuple(cell.metric_key for cell in peer.values) != metric_keys
+            for peer in self.peers
+        ):
+            raise ValueError(
+                "Tijori Peer Comparison rows must cover metrics in order"
+            )
+
+        expected_cells = len(self.metrics) * len(self.peers)
+        if (
+            self.extraction.metric_count != len(self.metrics)
+            or self.extraction.peer_count != len(self.peers)
+            or self.extraction.cell_count != expected_cells
+        ):
+            raise ValueError(
+                "Tijori Peer Comparison extraction counts do not match"
+            )
+        return self
+
+    @computed_field
+    @property
+    def document_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"document_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
+class TijoriPeerComparisonPayload(FundamentalModel):
+    """Successful get_company_overview Peer Comparison payload."""
+
+    document: TijoriPeerComparisonDocument
+
+
+class TijoriBenchmarkingCompany(FundamentalModel):
+    """One subject or peer column in the Benchmarking matrix."""
+
+    company_key: str = Field(
+        min_length=1,
+        max_length=250,
+        pattern=r"^company_[a-z0-9_]+$",
+    )
+    legal_name: str = Field(min_length=1, max_length=300)
+    provider_slug: str = Field(
+        min_length=1,
+        max_length=240,
+        pattern=r"^[a-z0-9][a-z0-9-]*$",
+    )
+    is_subject: bool
+    display_order: int = Field(ge=0, le=29)
+
+    @model_validator(mode="after")
+    def validate_provider_key(self) -> Self:
+        expected = f"company_{self.provider_slug.replace('-', '_')}"
+        if self.company_key != expected:
+            raise ValueError(
+                "Tijori Benchmarking company key does not match provider slug"
+            )
+        return self
+
+
+class TijoriBenchmarkingCell(FundamentalModel):
+    """One company value with provider best-value annotation."""
+
+    company_key: str = Field(
+        min_length=1,
+        max_length=250,
+        pattern=r"^company_[a-z0-9_]+$",
+    )
+    source_value: str | None = Field(default=None, min_length=1, max_length=160)
+    availability_status: Literal["available", "unknown"]
+    is_best: bool
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> Self:
+        if (self.availability_status == "available") != (
+            self.source_value is not None
+        ):
+            raise ValueError(
+                "Tijori Benchmarking availability contradicts value"
+            )
+        return self
+
+
+class TijoriBenchmarkingRow(FundamentalModel):
+    """One hierarchical metric or expandable section from the provider table."""
+
+    row_key: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
+    parent_row_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
+    original_label: str = Field(min_length=1, max_length=300)
+    depth: int = Field(ge=0, le=10)
+    row_kind: Literal["section", "metric"]
+    provider_section: Literal[
+        "bch_op_metric",
+        "bch_financial",
+        "bch_shareholdings",
+    ]
+    provider_hidden: bool
+    display_order: int = Field(ge=0, le=299)
+    values: tuple[TijoriBenchmarkingCell, ...] = Field(
+        min_length=2,
+        max_length=30,
+    )
+
+    @model_validator(mode="after")
+    def validate_parent_shape(self) -> Self:
+        if self.depth == 0 and self.parent_row_key is not None:
+            raise ValueError("Tijori Benchmarking root row cannot have a parent")
+        if self.depth > 0 and self.parent_row_key is None:
+            raise ValueError("Tijori Benchmarking nested row requires a parent")
+        if self.parent_row_key == self.row_key:
+            raise ValueError("Tijori Benchmarking row cannot parent itself")
+        return self
+
+
+class TijoriBenchmarkingExtraction(FundamentalModel):
+    company_count: int = Field(ge=2, le=30)
+    row_count: int = Field(ge=1, le=300)
+    cell_count: int = Field(ge=2, le=9_000)
+    maximum_depth: int = Field(ge=0, le=10)
+    provider_hidden_row_count: int = Field(ge=0, le=300)
+    status: Literal["complete"] = "complete"
+
+
+class TijoriBenchmarkingFinancialsDocument(FundamentalModel):
+    """Complete hierarchical Financial subsection of Benchmarking."""
+
+    schema_version: Literal["tijori.benchmarking_financials.v1"]
+    document_type: Literal["benchmarking_financials"]
+    reporting_basis: Literal["not_applicable"]
+    issuer: TijoriFinancialDocumentIssuer
+    source: TijoriFinancialDocumentSource
+    observation_date: date
+    all_rows_captured: Literal[True]
+    companies: tuple[TijoriBenchmarkingCompany, ...] = Field(
+        min_length=2,
+        max_length=30,
+    )
+    rows: tuple[TijoriBenchmarkingRow, ...] = Field(
+        min_length=1,
+        max_length=300,
+    )
+    extraction: TijoriBenchmarkingExtraction
+
+    @model_validator(mode="after")
+    def validate_complete_document(self) -> Self:
+        expected_location = (
+            "https://www.tijorifinance.com/company/"
+            f"{self.issuer.provider_slug}/benchmarking/"
+        )
+        if self.source.location != expected_location:
+            raise ValueError(
+                "Tijori Benchmarking location does not match issuer"
+            )
+        if self.issuer.provider_company_id is None:
+            raise ValueError(
+                "Tijori Benchmarking requires a provider company ID"
+            )
+
+        company_keys = tuple(company.company_key for company in self.companies)
+        company_slugs = tuple(
+            company.provider_slug for company in self.companies
+        )
+        if (
+            len(company_keys) != len(set(company_keys))
+            or len(company_slugs) != len(set(company_slugs))
+        ):
+            raise ValueError("Tijori Benchmarking companies must be unique")
+        if tuple(company.display_order for company in self.companies) != tuple(
+            range(len(self.companies))
+        ):
+            raise ValueError("Tijori Benchmarking companies must be contiguous")
+        if sum(company.is_subject for company in self.companies) != 1:
+            raise ValueError("Tijori Benchmarking must identify one subject")
+        subject = next(
+            company for company in self.companies if company.is_subject
+        )
+        if subject.provider_slug != self.issuer.provider_slug:
+            raise ValueError("Tijori Benchmarking subject does not match issuer")
+
+        row_keys: set[str] = set()
+        row_depths: dict[str, int] = {}
+        for expected_order, row in enumerate(self.rows):
+            if row.row_key in row_keys:
+                raise ValueError("Tijori Benchmarking row keys must be unique")
+            if row.display_order != expected_order:
+                raise ValueError("Tijori Benchmarking rows must be contiguous")
+            if row.parent_row_key is not None:
+                parent_depth = row_depths.get(row.parent_row_key)
+                if parent_depth is None or parent_depth + 1 != row.depth:
+                    raise ValueError(
+                        "Tijori Benchmarking row hierarchy is inconsistent"
+                    )
+            if tuple(cell.company_key for cell in row.values) != company_keys:
+                raise ValueError(
+                    "Tijori Benchmarking rows must cover companies in order"
+                )
+            row_keys.add(row.row_key)
+            row_depths[row.row_key] = row.depth
+
+        expected_cells = len(self.companies) * len(self.rows)
+        expected_depth = max(row.depth for row in self.rows)
+        expected_hidden = sum(row.provider_hidden for row in self.rows)
+        if (
+            self.extraction.company_count != len(self.companies)
+            or self.extraction.row_count != len(self.rows)
+            or self.extraction.cell_count != expected_cells
+            or self.extraction.maximum_depth != expected_depth
+            or self.extraction.provider_hidden_row_count != expected_hidden
+        ):
+            raise ValueError(
+                "Tijori Benchmarking extraction counts do not match"
+            )
+        return self
+
+    @computed_field
+    @property
+    def document_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"document_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
+class TijoriBenchmarkingFinancialsPayload(FundamentalModel):
+    """Successful get_company_overview Benchmarking Financials payload."""
+
+    document: TijoriBenchmarkingFinancialsDocument
 
 
 def _canonical_payload(payload: dict[str, Any]) -> bytes:

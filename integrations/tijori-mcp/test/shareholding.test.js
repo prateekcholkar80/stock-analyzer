@@ -11,19 +11,31 @@ const ISSUER = {
 };
 const METADATA = { company_id: 123, exchange: 'NSE', symbol: 'TCS' };
 
-function fixture({ status = 200, metadata = METADATA, headers = [], rows = [], failure } = {}) {
+function fixture({
+  status = 200,
+  metadata = METADATA,
+  headers = [],
+  rows = [],
+  failure,
+  responseUrl = 'https://www.tijorifinance.com/company/tata-consultancy-services/shareholding/',
+} = {}) {
   const observed = { calls: 0 };
   const page = {
     async evaluate() {
       if (failure) throw failure;
       return { metadata, headers, rows };
     },
-    async goto(url) {
+    async goto(url, options) {
       observed.calls += 1;
       observed.url = url;
-      return { status: () => status };
+      observed.gotoOptions = options;
+      return { status: () => status, url: () => responseUrl };
     },
-    async waitForSelector() {},
+    async waitForFunction(predicate, argument, options) {
+      observed.readinessPredicate = predicate;
+      observed.readinessArgument = argument;
+      observed.readinessOptions = options;
+    },
   };
   return {
     observed,
@@ -68,8 +80,19 @@ test('normalizes latest quarterly ownership facts without inferring categories',
   );
   assert.equal(result.payload.facts[0].normalized_value, '71.74');
   assert.equal(result.payload.facts[0].normalized_unit, 'percent');
+  const publicAggregate = result.payload.facts.find(({ line_item_id }) => (
+    line_item_id === 'ownership.public_holding'
+  ));
+  assert.equal(publicAggregate.line_item_standard, 'Non-promoter/public aggregate');
   assert.equal(JSON.stringify(result).includes('Unmapped category'), false);
   assert.equal(provider.observed.url.endsWith('/shareholding/'), true);
+  assert.deepEqual(provider.observed.gotoOptions, {
+    timeout: 20_000,
+    waitUntil: 'commit',
+  });
+  assert.equal(typeof provider.observed.readinessPredicate, 'function');
+  assert.equal(provider.observed.readinessArgument, undefined);
+  assert.deepEqual(provider.observed.readinessOptions, { timeout: 20_000 });
 });
 
 test('sorts fiscal-quarter labels and applies the requested quarter bound', async () => {
@@ -83,6 +106,16 @@ test('sorts fiscal-quarter labels and applies the requested quarter bound', asyn
     result.payload.facts.map(({ period_end, normalized_value }) => [period_end, normalized_value]),
     [['2025-09-30', '5.3'], ['2025-06-30', '5.2']],
   );
+});
+
+test('accepts apostrophe month labels used by current shareholding pages', async () => {
+  const result = await handler(fixture({
+    headers: ['Category', "Mar'25", "Jun'25"],
+    rows: [{ category: 'Public', values: ['5.1', '5.2'] }],
+  }))({ issuer: ISSUER, quarters: 1, include_promoter_pledge: false });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.facts[0].period_end, '2025-06-30');
 });
 
 test('preserves requested but undisclosed promoter pledge as unknown evidence', async () => {
@@ -108,6 +141,49 @@ test('preserves requested but undisclosed promoter pledge as unknown evidence', 
   );
 });
 
+test('retains a resolved issuer exchange when ownership metadata omits it', async () => {
+  const result = await handler(fixture({
+    ...history(),
+    metadata: { company_id: 123, symbol: 'TCS' },
+  }))({ issuer: ISSUER, quarters: 1 });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.exchange, 'NSE');
+  assert.match(result.payload.limitations.at(-1), /omitted its exchange field/i);
+});
+
+test('retains the resolved issuer ID when the ownership page uses another internal ID', async () => {
+  const result = await handler(fixture({
+    ...history(),
+    metadata: { company_id: 999, exchange: 'NSE', symbol: 'TCS' },
+  }))({ issuer: ISSUER, quarters: 1 });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.company_id, ISSUER.provider_company_id);
+  assert.match(result.payload.limitations.at(-1), /provider-internal company ID/i);
+});
+
+test('uses resolved identity when the exact ownership page omits metadata', async () => {
+  const result = await handler(fixture({
+    ...history(),
+    metadata: null,
+  }))({ issuer: ISSUER, quarters: 1 });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.company_id, ISSUER.provider_company_id);
+  assert.match(result.payload.limitations.at(-1), /omitted issuer metadata/i);
+});
+
+test('rejects ownership redirects before accepting metadata-free evidence', async () => {
+  const result = await handler(fixture({
+    ...history(),
+    metadata: null,
+    responseUrl: 'https://www.tijorifinance.com/login/',
+  }))({ issuer: ISSUER, quarters: 1 });
+
+  assert.equal(result.status, 'unavailable');
+});
+
 test('rejects historical cutoffs, missing slugs, and conflicting identities', async () => {
   const provider = fixture(history());
   const getShareholding = handler(provider);
@@ -123,6 +199,11 @@ test('rejects historical cutoffs, missing slugs, and conflicting identities', as
     ...history(), metadata: { ...METADATA, symbol: 'INFY' },
   }))({ issuer: ISSUER });
   assert.equal(mismatch.status, 'unavailable');
+
+  const exchangeMismatch = await handler(fixture({
+    ...history(), metadata: { ...METADATA, exchange: 'BSE' },
+  }))({ issuer: ISSUER });
+  assert.equal(exchangeMismatch.status, 'unavailable');
 });
 
 test('fails closed for malformed periods, duplicate categories, rows, and values', async () => {

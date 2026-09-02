@@ -21,6 +21,7 @@ from app.fundamentals.adapters.tijori_mcp import TijoriMcpAdapter
 from app.fundamentals.transports.stdio_mcp import (
     TijoriStdioMcpSettings,
     TijoriStdioMcpTransport,
+    _validate_json_shape,
 )
 from app.models.fundamentals import ProviderConnectionScope
 from app.gateways.fundamentals import FundamentalCompanySearchRequest
@@ -68,8 +69,36 @@ class TijoriStdioMcpSettingsTests(unittest.TestCase):
                 session_root=Path(directory),
             )
             self.assertEqual(len(settings.configuration_fingerprint), 64)
+            self.assertEqual(settings.timeout_seconds, 30.0)
+            self.assertEqual(settings.max_message_bytes, 8_500_000)
             with self.assertRaises(ValidationError):
                 settings.timeout_seconds = 2.0
+
+            with self.assertRaises(ValidationError):
+                TijoriStdioMcpSettings(
+                    runtime_executable=Path(sys.executable).resolve(),
+                    runtime_sha256=file_hash(Path(sys.executable).resolve()),
+                    server_entrypoint=FIXTURE,
+                    server_sha256=file_hash(FIXTURE),
+                    session_root=Path(directory),
+                    max_message_bytes=10_000_001,
+                )
+
+
+class TijoriJsonShapeTests(unittest.TestCase):
+    def test_accepts_current_mcp_schema_depth_but_rejects_deeper_input(self):
+        accepted: object = "leaf"
+        for _ in range(16):
+            accepted = {"nested": accepted}
+        _validate_json_shape(accepted)
+
+        rejected = {"nested": accepted}
+        with self.assertRaises(TijoriMcpTransportError) as caught:
+            _validate_json_shape(rejected)
+        self.assertEqual(
+            caught.exception.kind,
+            TijoriTransportFailureKind.PROTOCOL,
+        )
 
 
 class TijoriStdioMcpTransportTests(unittest.TestCase):
@@ -245,9 +274,15 @@ class TijoriStdioMcpTransportTests(unittest.TestCase):
 
     def test_rejects_oversized_response_and_accepts_server_notification(self):
         self.write_session("oversized_message")
+        bounded_transport = TijoriStdioMcpTransport(
+            settings=self.settings.model_copy(
+                update={"max_message_bytes": 1_100_000}
+            ),
+            clock=lambda: NOW,
+        )
         self.assert_transport_failure(
             TijoriTransportFailureKind.PROTOCOL,
-            lambda: self.transport.inspect(connection=self.connection),
+            lambda: bounded_transport.inspect(connection=self.connection),
         )
         self.write_session("notification_first")
         inspection = self.transport.inspect(connection=self.connection)

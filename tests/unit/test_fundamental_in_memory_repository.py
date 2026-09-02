@@ -229,6 +229,72 @@ class InMemoryFundamentalSnapshotRepositoryTests(unittest.TestCase):
             refreshed,
         )
 
+    def test_explicit_refresh_atomically_replaces_active_evidence(self):
+        old = build_entry()
+        self.clock.now = old.stored_at
+        self.repository.save_fundamental_snapshot(old)
+        later = timedelta(hours=2)
+        refreshed = build_entry(
+            requested_at=REQUESTED_AT + later,
+            completed_at=COMPLETED_AT + later,
+        )
+        self.clock.now = refreshed.stored_at
+
+        saved = self.repository.replace_fundamental_snapshot(
+            refreshed,
+            scope=self.scope,
+        )
+
+        self.assertEqual(saved, refreshed)
+        self.assertEqual(
+            self.repository.get_fundamental_snapshot(
+                refreshed.cache_key,
+                scope=self.scope,
+                as_of=self.clock.now,
+            ),
+            refreshed,
+        )
+
+    def test_failed_explicit_refresh_preserves_active_evidence(self):
+        old = build_entry()
+        self.clock.now = old.stored_at
+        self.repository.save_fundamental_snapshot(old)
+        later = timedelta(hours=2)
+        refreshed = build_entry(
+            requested_at=REQUESTED_AT + later,
+            completed_at=COMPLETED_AT + later,
+        )
+        self.clock.now = refreshed.stored_at
+        self.repository.replace_fundamental_snapshot(
+            refreshed,
+            scope=self.scope,
+        )
+        other_scope = FundamentalRepositoryScope(
+            tenant_id="tenant.other",
+            provider_connection_id="provider.tijori.other",
+            provider="tijori",
+        )
+
+        with self.assertRaises(StorageConflictError):
+            self.repository.replace_fundamental_snapshot(
+                old,
+                scope=self.scope,
+            )
+        with self.assertRaises(StorageError):
+            self.repository.replace_fundamental_snapshot(
+                refreshed,
+                scope=other_scope,
+            )
+
+        self.assertEqual(
+            self.repository.get_fundamental_snapshot(
+                refreshed.cache_key,
+                scope=self.scope,
+                as_of=self.clock.now,
+            ),
+            refreshed,
+        )
+
     def test_point_read_and_delete_require_matching_scope(self):
         stored = build_stored()
         other_scope = FundamentalRepositoryScope(

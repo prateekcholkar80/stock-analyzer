@@ -1,11 +1,70 @@
 # Jarvis Implementation Continuation Handoff
 
-Last updated: **2026-08-28 (Asia/Kolkata)**
+Last updated: **2026-09-02 (Asia/Kolkata)**
 
 Use this file to resume implementation without relying on chat history. The
 authoritative architectural detail remains in `docs/current-baseline.md`; this
 document captures the current decisions, exact executable path, validation
 evidence, local artifacts, known gaps, and recommended next work.
+
+## Current Structured-Fundamentals Release Candidate
+
+The feature branch now extends the original five-capability Tijori boundary
+without widening its public read-only tool allow-list. `get_financials` can
+return complete JSON-first structured documents for Growth Table, Balance
+Sheet, Profit and Loss, Cash Flow, Ratios, and Quarterly Results. Balance
+Sheet, Profit and Loss, Cash Flow, Ratios, and Quarterly Results are requested
+independently for consolidated and standalone reporting; Growth Table retains
+the provider's not-applicable reporting basis. `get_company_overview` also
+supports complete Peer Comparison and Benchmarking Financials matrices.
+
+The extractors prefer bounded embedded JSON over presentation-state scraping.
+They recursively retain provider hierarchy, labels, periods, units, zeros,
+explicit missing values, auxiliary cells, issuer identity, reporting basis,
+source URL, retrieval time, parser/contract version, and content fingerprint.
+Collapsed browser rows therefore do not truncate the stored document. Raw
+HTML, screenshots, cookies, credentials, browser state, and provider exception
+text do not cross the MCP boundary or enter DuckDB.
+
+Provider-neutral Python contracts translate every accepted document into an
+immutable `StructuredFinancialDocument`. Database-neutral repositories now
+cover financial documents, Peer Comparison, and Benchmarking Financials, with
+in-memory reference adapters and durable DuckDB implementations. Cache keys
+include tenant, provider connection, issuer, document type, and reporting
+basis. Unexpired results are reused; explicit refresh atomically replaces the
+complete applicable company set only after successful retrieval; a provider
+failure preserves the active cache; and expired documents are never returned.
+
+The browser workflow requests the completed structured-document set only when
+fundamentals are explicitly requested. It exposes bounded, operation-owned
+references rather than embedding large provider documents in the operation
+response. Authenticated, tenant-scoped HTTP resolution returns a referenced
+cached JSON document only when it belongs to that released operation. The
+frontend client understands these references for future Fundamental Analyst
+reasoning and inspection; Benchmarking Financials is intentionally evidence,
+not a mandatory dashboard visualization.
+
+The command deck also includes the locked holographic agent presentation:
+event-driven Market Data, Daily, Weekly, Fundamental, Bull, Bear, and Judge
+identities; a licensed Bull model with its licence manifest; perception-only
+packet links and kinetic cores; completion glow; reduced-motion handling; and
+opt-in procedural neural audio. Animation timing never delays or changes the
+backend workflow.
+
+Release-boundary validation on 2026-09-02:
+
+- **224 Tijori MCP tests passed** under the pinned Node 24.20.0 runtime;
+- affected Python subsystem runs completed **534 passing test executions**;
+- the complete Python regression suite passed all **2,171 tests**;
+- the frontend production build and all **51 frontend tests passed**;
+- the known non-fatal Plotly chunk-size advisory remains; and
+- actual `.env` files, browser/session state, DuckDB files, build output,
+  Wrangler state, dependency trees, logs, and Python caches remain ignored.
+
+This milestone still does not implement a Fundamental Analyst, deterministic
+fundamental scorecard, annual-report ingestion, or qualitative management/moat
+claims. Provider-standardized data remains secondary research evidence and
+cannot be promoted to primary or decision-grade evidence by itself.
 
 ## 0. Fundamental-Research Expansion Baseline
 
@@ -394,8 +453,10 @@ Step 1.9 validation evidence:
 
 ## 1. Current Verified State
 
-- Offline regression baseline: **1,874 passing Python unit/integration tests**.
-- Browser baseline: production build plus **36 passing frontend tests**.
+- Offline regression baseline: **2,171 passing Python unit/integration tests**.
+- Browser baseline: production build plus **51 passing frontend tests**.
+- Local Tijori MCP bridge baseline: **224 passing Node tests** under the pinned
+  Node 24.20.0 runtime.
 - The production browser build reports a non-fatal Plotly chunk-size advisory.
 - Live Reliance run authenticated with Angel One and completed the default
   daily/weekly Bull/Bear/Judge workflow.
@@ -758,10 +819,13 @@ git diff --check
 git status --short
 ```
 
-Expected full-suite baseline for this handoff: `Ran 1803 tests` and `OK`, then
-`36` passing frontend tests after a successful production build. Do not treat a
-live provider call as part of the offline regression suite. The build's Plotly
-chunk-size warning is advisory; any actual build/test failure remains blocking.
+The historical full-suite baseline at the time this section was written was
+`Ran 1803 tests` and `OK`, followed by `36` passing frontend tests after a
+successful production build. Provider-session work was added afterward and has
+not yet received a new complete staging-boundary regression count. Establish
+and record that new count before staging. Do not treat a live provider call as
+part of the offline regression suite. The build's Plotly chunk-size warning is
+advisory; any actual build/test failure remains blocking.
 
 ### UI event foundation added after the original handoff
 
@@ -849,6 +913,158 @@ zone of the required effective type exists on that side of price. The UI states
 that explicitly. Accumulation zones remain separate evidence and are not
 silently reclassified as support/resistance.
 
+### User-owned provider-session backend completed on 2026-08-29
+
+The backend path for manual, user-owned Tijori authentication is now
+implemented and remains provider-neutral above the local adapter. It does not
+accept a Tijori username, password, cookie, CSRF token, browser storage value,
+or raw authenticated payload through Python, HTTP, command-line arguments,
+DuckDB, logs, or environment variables.
+
+The implementation consists of:
+
+- `app/fundamentals/session_provisioning.py`: frozen provider-neutral status,
+  provision, and secure-revocation contracts with connection binding and
+  secret-free lifecycle metadata;
+- `app/fundamentals/local_session_provisioner.py`: owner-only local inspection,
+  bounded interactive-process execution, independent artifact validation,
+  expiry classification, and overwrite-plus-unlink revocation;
+- `integrations/tijori-mcp/src/interactive-session.js`: headed Playwright login
+  flow restricted to first-party Tijori HTTPS pages, positive authentication
+  confirmation, and atomic no-overwrite session installation;
+- `integrations/tijori-mcp/src/provision-session-cli.js`: Node 24-only command
+  accepting the scoped target and timeout through controlled environment
+  values, rejecting command arguments, and returning only status plus a SHA-256
+  session reference;
+- `app/services/provider_sessions.py`: provider-neutral application commands
+  for `status`, `provision`, and `revoke`, including response rebinding and
+  sanitized failures;
+- `app/fundamentals/provider_connections.py`: thread-safe in-memory connection
+  registry that binds a browser session to one tenant and resolves only an
+  exactly matching provider connection/account reference within that tenant;
+- `app/composition/fundamentals.py`: composition of the pinned runtime, fixed
+  repository-local provisioning CLI, deterministic session path, local
+  provisioner, and application service;
+- `app/api/models.py` and `app/api/http.py`: authenticated, secret-free HTTP
+  contracts and routes for provider-session status, provisioning, and
+  revocation; and
+- `examples/browser_api.py`: explicit opt-in local bootstrap that registers one
+  user-owned Tijori connection and injects the service, registry, scope
+  resolver, ownership hooks, and fixed local tenant resolver.
+
+The HTTP routes are:
+
+- `POST /api/v1/sessions/{session_id}/provider-session/status`;
+- `POST /api/v1/sessions/{session_id}/provider-session/provision`; and
+- `POST /api/v1/sessions/{session_id}/provider-session/revoke`.
+
+All three require the existing browser-session capability token. Browser
+session creation binds the session to the trusted tenant identity; normal
+closure unbinds it, and access-token revocation still occurs if unbinding
+fails. Resolver errors and connection mismatches return a non-disclosing 404,
+invalid explicit authorization/secure-deletion inputs return 422, ownership
+failures return a sanitized 503, and provider command failures return a
+sanitized 502. Lifecycle responses omit tenant ID, account reference hash,
+session reference hash, cookies, paths, and credentials.
+
+Runtime enablement is deliberately explicit:
+
+- `JARVIS_TIJORI_ENABLED=true` activates composition; unset or `false` leaves
+  the existing API unchanged;
+- `JARVIS_LOCAL_TENANT_ID` and `JARVIS_TIJORI_CONNECTION_ID` are non-secret
+  Jarvis identifiers;
+- `JARVIS_TIJORI_ACCOUNT_REFERENCE_HASH` is optional and may contain only a
+  64-character lowercase SHA-256 value, never the underlying account identity;
+- the runtime executable and MCP server entrypoint are absolute, pinned by
+  SHA-256, non-symlinked, executable/readable as applicable, and not
+  group/world writable;
+- the runtime must be Node 24; the provisioning CLI enforces that major
+  version again at execution time;
+- the session root must be canonical, current-user-owned, and mode 0700; and
+- the provisioning CLI path is fixed under the repository and is not supplied
+  by browser input or environment configuration.
+
+See `.env.example` for the complete supported variable set. The default
+interactive timeout is five minutes, the default local session maximum age is
+twelve hours, and the MCP/session payload ceiling defaults to 5,000,000 bytes.
+The authenticated artifact itself remains an owner-only local file and is
+never copied into DuckDB.
+
+Offline operator checklist before any separately approved live smoke test:
+
+1. Install or copy a fixed Node 24 runtime to an absolute regular-file path.
+   Confirm that invoking that exact file with `--version` reports major version
+   24. Do not configure a moving `node`, `nvm current`, or symlink path.
+2. Verify that the configured MCP server entrypoint is the reviewed
+   Jarvis-owned local bridge. Calculate SHA-256 for the exact runtime and server
+   files and place only those digests in `.env`; recalculate after every
+   intentional upgrade.
+3. Create a dedicated session directory outside public/static/frontend paths,
+   make it current-user-owned, and set mode 0700. Do not reuse the DuckDB data,
+   log, download, or repository directory.
+4. Set `JARVIS_TIJORI_ENABLED=true`, the local tenant/connection identifiers,
+   pinned file paths/digests, session root, and provider contract version.
+   Leave the optional account reference blank unless a non-reversible
+   64-character lowercase SHA-256 reference is already available.
+5. Confirm that no `TIJORI_USERNAME`, `TIJORI_PASSWORD`, cookie, CSRF, bearer,
+   or browser-storage variable has been added. Jarvis has no supported setting
+   for any of them.
+6. Start the Python API normally. Composition validates paths and hashes but
+   does not open a Tijori browser. The headed browser opens only after an
+   authenticated browser session sends an explicitly authorized provision
+   command.
+7. Keep live login/provider validation separate from offline tests. Do not save
+   screenshots, traces, raw tool payloads, console output, or session files as
+   test fixtures. Exercise secure revocation when the smoke test is complete.
+
+Offline validation completed across the bounded substeps:
+
+- 13 local provisioner tests, 7 Node CLI tests, and 7 interactive-browser
+  fixture tests passed;
+- the complete local bridge suite passed with 125 tests;
+- 8 composition, 7 command-service, 6 connection-registry, 5 API-model, and 33
+  HTTP API tests passed;
+- 4 executable-bootstrap tests passed without the earlier LiteLLM remote
+  price-map lookup, after moving live research imports inside `create_app()`;
+- the combined Python provider-session path passed 85 tests; and
+- the fundamental/Tijori subsystem passed 226 tests at its latest applicable
+  checkpoint.
+
+No live Tijori provider request, Angel One login, LLM call, or credential-backed
+test was performed at the PR boundary. Deterministic merge-gate validation on
+2026-08-30 passed **1,974 Python tests**, **45 frontend tests** plus the frontend
+production build, and **140 local Tijori MCP tests**. `pip check` reported no
+broken requirements and `git diff --check` passed.
+
+### Locked Jarvis command-deck design
+
+The command-deck visual contract is locked at this milestone. Future work may
+add agents and states through the same reusable contracts, but should not change
+the established composition without an explicit design-revision request:
+
+- the Jarvis neural core remains central, with three packet-bearing reactor
+  orbits and state-aware illumination;
+- Research Division cards place vertically centred copy on the left and the
+  holographic agent on the right, with dynamically measured links converging on
+  the Jarvis core;
+- Debate Chamber cards retain their left-side hologram and place agent status
+  at the bottom-left, with links converging on the same core;
+- Market Data, Daily, and Weekly analysts share the complete scanner-ring
+  geometry while keeping their distinct candlestick/scanning instruments and
+  colour identities;
+- Fundamental Analyst uses an emerald radar with binary-data rain; Bull, Bear,
+  and Judge retain green, red, and neutral-blue kinetic identities;
+- every agent has two colour-matched orbital packet clusters. Packets remain
+  subtle while idle and become denser/brighter through state-driven CSS only;
+- connector and hologram animation is perception-only. It never delays,
+  schedules, retries, or changes backend execution;
+- procedural neural audio is opt-in through the explicit switchboard control,
+  defaults to OFF after refresh, is rate-limited, and distinguishes activation,
+  dispatch, evidence, verdict, completion, and fault cues. It does not persist
+  audio or alter voice-reply behaviour; and
+- reduced-motion preferences remain authoritative, and audio requires an
+  explicit browser interaction before it can start.
+
 ## 11. Known Gaps and Honest Boundaries
 
 - No acoustic wake-word engine and no hands-free/streaming audio session.
@@ -861,16 +1077,33 @@ silently reclassified as support/resistance.
   cap-class xlsx URL is a hardcoded per-release constant with no auto-discovery.
 - Speech routes have no rate limiting or per-session quota; `/transcribe` only
   caps a single upload at 10 MiB.
-- No WebSocket alternative or full 3D/audio Jarvis experience. The browser
-  console, HTTP/SSE transport, dynamic reactor, operation matrix, Plotly charts,
-  setup view, debate, and executive briefing are implemented.
-- Provider-neutral fundamental evidence, five-capability gateway, offline
-  `TijoriMcpAdapter`, hardened local stdio transport, cache/repository
-  contracts, in-memory and DuckDB schema-v4 repositories, and the pinned
-  Jarvis-owned five-tool local bridge exist. The transport and bridge have only
-  run against synthetic MCP/browser fixtures; there is still no user-facing
-  session provisioning, live provider validation, document upload/parser/
-  chunker/vector index/RAG, or financial agent.
+- No WebSocket alternative or asset-driven full 3D environment. The browser
+  console now provides a CSS-rendered holographic command deck, procedural
+  opt-in neural sound cues, HTTP/SSE transport, dynamic reactor, operation
+  matrix, Plotly charts, setup view, debate, and executive briefing.
+- Provider-neutral fundamental evidence, the five-capability gateway, hardened
+  local stdio transport, complete structured financial/peer/benchmarking JSON
+  contracts, in-memory and DuckDB repositories, the pinned Jarvis-owned local
+  bridge, authenticated provider sessions, browser cache orchestration, and
+  scoped cached-document resolution now exist. User-owned interactive login
+  and selected provider reads have been manually exercised; automated live
+  provider regression remains intentionally opt-in. The deterministic
+  fundamental metric engine and Fundamental Analyst are pending.
+- The frontend exposes Tijori connection status, explicit headed-login connect,
+  refresh/status, expiry/reconnect, and secure revoke controls. Credentials and
+  provider session material are never accepted or rendered by the frontend.
+- The executable bootstrap currently supports one configured local tenant and
+  one user-owned Tijori connection. A hosted multi-user deployment must replace
+  the fixed tenant resolver with authenticated identity and persist connection
+  registrations behind a database-agnostic repository.
+- The provider-connection registry is intentionally in memory. Browser close
+  unbinds ownership, but abrupt process termination loses registry bindings;
+  authenticated session files remain owner-only on disk until expiry or
+  explicit revocation.
+- Provider-session client idempotency keys produce deterministic request IDs,
+  but there is no durable command-result/idempotency repository yet. A retry
+  after successful provisioning observes the existing session rather than
+  silently overwriting it.
 - No news, sentiment, macro, portfolio construction, or order placement.
 - No live market ticker; the product is historical/swing research.
 - No genuine order-flow feed, recorder, schema, analysis agent, or historical
@@ -896,33 +1129,37 @@ silently reclassified as support/resistance.
 
 ## 12. Recommended Next Steps, One at a Time
 
-1. Design and explicitly approve the user-owned session provisioning workflow
-   without introducing shared credentials. Each user must independently create
-   an owner-only session file for their tenant-scoped provider connection.
-   Authentication and live provider calls remain a separate explicit opt-in
-   smoke test and must never enter the offline regression suite.
-2. Add database-agnostic repository models/ports for the complete
+1. Promote CPR from a chart-only prior-period overlay into a provider-neutral,
+   look-ahead-safe `CPRAnalysisRecord`: width regime, price location,
+   acceptance, breakout/retest/rejection/failed-break lifecycle, qualified
+   evidence IDs, and daily-weekly swing confluence.
+2. Add versioned project-owned runtime skills for Bull, Bear, the existing
+   Judge, and the Fundamental Analyst. Enforce allowed evidence, required
+   citations, output schemas, abstention, skill version/hash audit, and
+   provider-neutral LLM composition.
+3. Build the deterministic normalized fundamental metric engine and preliminary
+   scorecard from the cached structured JSON, explicitly excluding annual
+   reports and qualitative management/moat conclusions.
+4. Add database-agnostic repository models/ports for the complete
    `MultiTimeframeEndToEndSwingAnalysisResult`, then implement in-memory and
    DuckDB adapters with normalized daily/weekly evidence, verdict, trade plan,
-   and presentation tables. This is the recommended immediate step.
-3. Persist the completed dashboard aggregate and add historical-run queries;
+   and presentation tables.
+5. Persist the completed dashboard aggregate and add historical-run queries;
    the live completed-operation read model is implemented.
-4. If genuine order flow is prioritized, define a database-neutral
+6. If genuine order flow is prioritized, define a database-neutral
    `MarketMicrostructureGateway`/`OrderFlowGateway` and immutable tick/book
    contracts before selecting Angel best-five prospective capture or licensed
    historical NSE order/trade data. Never backfill “real order flow” from
    candles.
-5. Browser microphone capture, speech-to-text, the provider-neutral TTS/STT
+7. Browser microphone capture, speech-to-text, the provider-neutral TTS/STT
    ports, and the Google/ElevenLabs adapters are implemented. Remaining audio
    work: exercise the adapters and catalog downloads against live
    endpoints/credentials, add an acoustic wake-word engine, and add rate
    limiting to `/speech` and `/transcribe` — all while keeping transcript
    handling and financial logic vendor-neutral.
-6. Add user-controlled financial-document ingestion and citation-preserving RAG,
-   followed by a document-grounded fundamental agent.
-7. Extend the same evidence package/debate/Judge contracts to technical plus
-   document-grounded fundamentals only after the RAG evaluation suite proves
-   citation completeness and abstention behavior.
+8. Annual-report ingestion, citation-preserving RAG, and qualitative
+   management/moat analysis remain explicitly deferred from the current
+   fundamental milestone.
 
 For a live actionable-plan check, wait for a naturally bullish qualifying
 instrument/dataset and observe it without changing thresholds or forcing the

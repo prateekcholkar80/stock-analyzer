@@ -8,11 +8,15 @@ function browserProbe({
   finalUrl = 'https://www.tijorifinance.com/',
   responseStatus = 200,
   authenticatedCount = 0,
+  authenticatedVisibleCount = authenticatedCount,
   challengeCount = 0,
+  challengeVisibleCount = challengeCount,
   loginCount = 0,
+  loginVisibleCount = loginCount,
   failure,
 } = {}) {
   const observed = {};
+  const context = {};
   return {
     observed,
     runner: {
@@ -25,13 +29,36 @@ function browserProbe({
             return { status: () => responseStatus };
           },
           locator(selector) {
+            const category = selector.includes('challenge-form')
+              ? 'challenge'
+              : selector.includes('input[type="password"]')
+                ? 'login'
+                : 'authenticated';
+            const count = {
+              authenticated: authenticatedCount,
+              challenge: challengeCount,
+              login: loginCount,
+            }[category];
+            const visibleCount = {
+              authenticated: authenticatedVisibleCount,
+              challenge: challengeVisibleCount,
+              login: loginVisibleCount,
+            }[category];
             return {
               async count() {
-                if (selector.includes('challenge-form')) return challengeCount;
-                if (selector.includes('input[type="password"]')) return loginCount;
-                return authenticatedCount;
+                return count;
+              },
+              nth(index) {
+                return {
+                  async isVisible() {
+                    return index < visibleCount;
+                  },
+                };
               },
             };
+          },
+          context() {
+            return context;
           },
           url() {
             return finalUrl;
@@ -68,6 +95,73 @@ test('classifies login redirects and login controls as authentication required',
       status: 'authentication_required',
     });
   }
+});
+
+test('ignores hidden login remnants when authenticated controls are visible', async () => {
+  const fixture = browserProbe({
+    authenticatedCount: 1,
+    loginCount: 2,
+    loginVisibleCount: 0,
+  });
+
+  assert.deepEqual(await probeAuthentication(fixture.runner), {
+    authenticated: true,
+    status: 'authenticated',
+  });
+});
+
+test('does not accept hidden authenticated controls', async () => {
+  const fixture = browserProbe({
+    authenticatedCount: 1,
+    authenticatedVisibleCount: 0,
+  });
+
+  assert.deepEqual(await probeAuthentication(fixture.runner), {
+    authenticated: false,
+    status: 'unavailable',
+  });
+});
+
+test('accepts persisted account-page proof when Tijori exposes no profile control', async () => {
+  const fixture = browserProbe();
+  let received;
+
+  const result = await probeAuthentication(fixture.runner, {
+    persistedSessionVerifier: async (dependencies) => {
+      received = dependencies;
+      return { authenticated: true, status: 'authenticated' };
+    },
+  });
+
+  assert.deepEqual(result, { authenticated: true, status: 'authenticated' });
+  assert.equal(typeof received.page.url, 'function');
+  assert.equal(received.context !== null, true);
+});
+
+test('fails closed when persisted account-page proof is unavailable', async () => {
+  const fixture = browserProbe();
+
+  const result = await probeAuthentication(fixture.runner, {
+    persistedSessionVerifier: async () => ({
+      authenticated: false,
+      status: 'unavailable',
+    }),
+  });
+
+  assert.deepEqual(result, { authenticated: false, status: 'unavailable' });
+});
+
+test('ignores hidden challenge remnants after positive authentication', async () => {
+  const fixture = browserProbe({
+    authenticatedCount: 1,
+    challengeCount: 1,
+    challengeVisibleCount: 0,
+  });
+
+  assert.deepEqual(await probeAuthentication(fixture.runner), {
+    authenticated: true,
+    status: 'authenticated',
+  });
 });
 
 test('fails closed for challenge pages and ambiguous markup', async () => {
@@ -133,6 +227,10 @@ test('validates the runner and bounded timeout without opening a browser', async
       /outside safe bounds/,
     );
   }
+  await assert.rejects(
+    () => probeAuthentication(fixture.runner, { persistedSessionVerifier: null }),
+    /persisted-session verifier/,
+  );
   assert.deepEqual(fixture.observed, {});
 });
 

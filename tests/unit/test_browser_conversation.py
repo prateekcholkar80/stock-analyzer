@@ -168,9 +168,27 @@ class BrowserConversationCoordinatorTests(unittest.TestCase):
             first.operation.request.message,
             "analyze Reliance for a swing trade",
         )
+        self.assertFalse(first.operation.request.fundamentals_requested)
+        self.assertFalse(first.operation.request.refresh_requested)
         self.assertIs(retry.outcome, ConversationOutcome.DISPATCHED)
         self.assertEqual(len(self.operations.submit_calls), 1)
         self.assertIs(busy.outcome, ConversationOutcome.BUSY)
+
+    def test_explicit_fundamental_refresh_is_cleaned_and_carried_to_operation(self):
+        turn = self._turn(
+            (
+                "Hey Jarvis, refresh fundamentals and analyze "
+                "Torrent Pharma for me"
+            ),
+            "request-fundamentals",
+        )
+
+        self.assertEqual(
+            turn.operation.request.message,
+            "analyze Torrent Pharma for me",
+        )
+        self.assertTrue(turn.operation.request.fundamentals_requested)
+        self.assertTrue(turn.operation.request.refresh_requested)
 
     def test_completed_analysis_becomes_response_then_support_is_follow_up(self):
         dispatched = self._turn(
@@ -323,7 +341,12 @@ class BrowserConversationCoordinatorTickerResolutionTests(unittest.TestCase):
         conversation.open_session("session-1", at=T0)
 
         dispatched = self._turn(
-            conversation, "Hey Jarvis analyze Infosys", "request-1"
+            conversation,
+            (
+                "Hey Jarvis refresh fundamentals and analyze Infosys "
+                "for me"
+            ),
+            "request-1",
         )
         self.operations.fail(
             dispatched.operation.request.operation_id,
@@ -340,7 +363,10 @@ class BrowserConversationCoordinatorTickerResolutionTests(unittest.TestCase):
         )
         self.assertIs(awaiting.state, ConversationState.AWAITING_CONFIRMATION)
         self.assertIn('Did you mean "INFY-EQ"', awaiting.display_message)
-        self.assertEqual(executor.attempt_calls, ["analyze Infosys"])
+        self.assertEqual(
+            executor.attempt_calls,
+            ["analyze Infosys for me"],
+        )
 
         confirmed = self._turn(
             conversation, "yes", "request-2", at=T0 + timedelta(seconds=3)
@@ -351,6 +377,8 @@ class BrowserConversationCoordinatorTickerResolutionTests(unittest.TestCase):
             confirmed.operation.request.message,
             "Analyze INFY-EQ for a swing trade",
         )
+        self.assertTrue(confirmed.operation.request.fundamentals_requested)
+        self.assertTrue(confirmed.operation.request.refresh_requested)
 
     def test_declining_the_guess_returns_to_listening(self):
         from app.use_cases.resolve_ticker_conversationally import (

@@ -67,10 +67,18 @@ async function retrieveCompanies(page, argumentsValue) {
   const companies = [];
   let completeProviderRecords = 0;
   const identities = new Set();
+  const constrainedExchange = argumentsValue.exchanges.length === 1
+    ? argumentsValue.exchanges[0]
+    : null;
   for (const slug of slugs) {
     const metadata = await retrieveCompanyMetadata(page, slug);
     if (metadata.status !== 'success') return metadata;
-    const company = normalizeCompany(metadata.value, slug, argumentsValue.query);
+    const company = normalizeCompany(
+      metadata.value,
+      slug,
+      argumentsValue.query,
+      constrainedExchange,
+    );
     if (company === null) continue;
     completeProviderRecords += 1;
     if (
@@ -145,12 +153,13 @@ async function retrieveCompanyMetadata(page, slug) {
   return { status: 'success', value };
 }
 
-function normalizeCompany(value, slug, query) {
+function normalizeCompany(value, slug, query, constrainedExchange) {
   if (value === null || typeof value !== 'object') return null;
   const companyId = normalizedString(value.company_id, 128);
   const legalName = normalizedString(value.legal_name, 300, true);
   const symbol = normalizedString(value.symbol, 100)?.toUpperCase();
-  const exchange = normalizedString(value.exchange, 32)?.toUpperCase();
+  const providerExchange = normalizedString(value.exchange, 32)?.toUpperCase();
+  const exchange = providerExchange ?? constrainedExchange;
   const isin = value.isin === undefined || value.isin === null
     ? null
     : normalizedString(value.isin, 12)?.toUpperCase();
@@ -168,6 +177,9 @@ function normalizeCompany(value, slug, query) {
   }
 
   const match = matchEvidence(query, legalName, symbol);
+  const matchedOn = providerExchange === undefined
+    ? [...match.fields, 'requested_exchange']
+    : match.fields;
   return {
     company_id: companyId,
     slug,
@@ -177,7 +189,7 @@ function normalizeCompany(value, slug, query) {
     isin,
     match_kind: match.kind,
     match_score: match.score,
-    matched_on: match.fields,
+    matched_on: matchedOn,
   };
 }
 

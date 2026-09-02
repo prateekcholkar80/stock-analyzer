@@ -1,4 +1,6 @@
 import { failureResult, successResult } from './result-envelope.js';
+import { createBenchmarkingFinancialsExtractor } from './benchmarking-financials.js';
+import { createPeerComparisonSnapshotExtractor } from './peer-comparison.js';
 import { validateToolArguments } from './tool-inputs.js';
 
 
@@ -65,13 +67,15 @@ export function createCompanyOverviewHandler({ browserRunner, clock = () => new 
 
   return async function getCompanyOverview(argumentsValue) {
     let argumentsNormalized;
+    let observedAt;
     let observedDate;
     try {
       argumentsNormalized = validateToolArguments(
         'get_company_overview',
         argumentsValue,
       );
-      observedDate = istDate(clock());
+      observedAt = clock();
+      observedDate = istDate(observedAt);
     } catch {
       return failureResult('get_company_overview', 'unavailable');
     }
@@ -80,6 +84,36 @@ export function createCompanyOverviewHandler({ browserRunner, clock = () => new 
       && argumentsNormalized.as_of_date !== observedDate
     ) {
       return failureResult('get_company_overview', 'unavailable');
+    }
+
+    if (argumentsNormalized.document_type === 'peer_comparison') {
+      try {
+        const extractPeerComparison = createPeerComparisonSnapshotExtractor({
+          browserRunner,
+          clock: () => observedAt,
+        });
+        const document = await extractPeerComparison({
+          issuer: argumentsNormalized.issuer,
+        });
+        return successResult('get_company_overview', { document });
+      } catch {
+        return failureResult('get_company_overview', 'unavailable');
+      }
+    }
+
+    if (argumentsNormalized.document_type === 'benchmarking_financials') {
+      try {
+        const extractBenchmarkingFinancials = createBenchmarkingFinancialsExtractor({
+          browserRunner,
+          clock: () => observedAt,
+        });
+        const document = await extractBenchmarkingFinancials({
+          issuer: argumentsNormalized.issuer,
+        });
+        return successResult('get_company_overview', { document });
+      } catch {
+        return failureResult('get_company_overview', 'unavailable');
+      }
     }
 
     const slug = argumentsNormalized.issuer.provider_slug?.trim().toLowerCase();
@@ -165,12 +199,15 @@ function normalizeOverview(value, issuer, slug, observedDate) {
     return null;
   }
   const companyId = boundedString(value.metadata.company_id, 128);
-  const exchange = boundedString(value.metadata.exchange, 32)?.toUpperCase();
+  const providerExchange = boundedString(
+    value.metadata.exchange,
+    32,
+  )?.toUpperCase();
+  const exchange = providerExchange ?? issuer.exchange;
   const symbol = boundedString(value.metadata.symbol, 100)?.toUpperCase();
   if (
     companyId === null
     || !ID_PATTERN.test(companyId)
-    || exchange === null
     || !MARKET_PATTERN.test(exchange)
     || symbol === null
     || !MARKET_PATTERN.test(symbol)
@@ -199,6 +236,16 @@ function normalizeOverview(value, issuer, slug, observedDate) {
   const sourceId = 'tijori-overview';
   for (const fact of facts) fact.provider_source_id = sourceId;
 
+  const limitations = [
+    'Provider-standardized secondary evidence; reconcile material values against primary company or exchange disclosures.',
+    'Metric-specific reporting periods were not disclosed on the overview page; values use the observation date.',
+  ];
+  if (providerExchange === undefined) {
+    limitations.push(
+      'The provider page omitted its exchange field; Jarvis retained the previously resolved issuer exchange after company-ID and symbol verification.',
+    );
+  }
+
   return {
     company_id: companyId,
     exchange,
@@ -212,10 +259,7 @@ function normalizeOverview(value, issuer, slug, observedDate) {
       published_at: null,
     }],
     facts,
-    limitations: [
-      'Provider-standardized secondary evidence; reconcile material values against primary company or exchange disclosures.',
-      'Metric-specific reporting periods were not disclosed on the overview page; values use the observation date.',
-    ],
+    limitations,
   };
 }
 

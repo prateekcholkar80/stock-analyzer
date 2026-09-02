@@ -59,7 +59,7 @@ async function connectServer(server) {
 
 function providerBrowserRunner() {
   const state = { route: null };
-  const response = (payload) => {
+  const response = (payload, responseUrl = 'https://www.tijorifinance.com/') => {
     const body = Buffer.from(
       typeof payload === 'string' ? payload : JSON.stringify(payload),
     );
@@ -67,6 +67,7 @@ function providerBrowserRunner() {
       async body() { return body; },
       async headers() { return { 'content-length': String(body.length) }; },
       status() { return 200; },
+      url() { return responseUrl; },
     };
   };
   const metadata = {
@@ -109,9 +110,10 @@ function providerBrowserRunner() {
       state.route = url.endsWith('/financials/')
         ? 'financials'
         : url.endsWith('/shareholding/') ? 'shareholding' : 'company';
-      return response('company page');
+      return response('company page', url);
     },
     async waitForSelector() {},
+    async waitForFunction() {},
   };
   return Object.freeze({ run: async (task) => task(page) });
 }
@@ -129,6 +131,127 @@ test('registers exactly five read-only tools with input schemas', async (context
     assert.equal(tool.annotations.openWorldHint, true);
     assert.equal(tool.inputSchema.type, 'object');
   }
+  const companyOverview = result.tools.find(
+    ({ name }) => name === 'get_company_overview',
+  );
+  assert.deepEqual(
+    companyOverview.inputSchema.properties.document_type.enum,
+    ['peer_comparison', 'benchmarking_financials'],
+  );
+  assert.equal(
+    companyOverview.inputSchema.required.includes('document_type'),
+    false,
+  );
+  const financials = result.tools.find(({ name }) => name === 'get_financials');
+  assert.deepEqual(
+    financials.inputSchema.properties.document_type.enum,
+    [
+      'growth_table',
+      'balance_sheet',
+      'profit_and_loss',
+      'cash_flow',
+      'ratios',
+      'quarterly_results',
+    ],
+  );
+  assert.deepEqual(
+    financials.inputSchema.properties.reporting_basis.enum,
+    ['consolidated', 'standalone', 'not_applicable'],
+  );
+  assert.equal(
+    financials.inputSchema.required.includes('document_type'),
+    false,
+  );
+  assert.equal(
+    financials.inputSchema.required.includes('reporting_basis'),
+    false,
+  );
+});
+
+test('admits Peer Comparison at the public MCP boundary', async (context) => {
+  let received;
+  const registry = registryWith({
+    get_company_overview: async (argumentsValue) => {
+      received = argumentsValue;
+      return successResult('get_company_overview', { document: {} });
+    },
+  });
+  const { client, server } = await connectedClient(registry);
+  context.after(async () => server.close());
+
+  const issuer = {
+    exchange: 'NSE',
+    symbol: 'COFORGE',
+    legal_name: 'Coforge Ltd.',
+    provider_company_id: 'coforge-1',
+    provider_slug: 'coforge-ltd',
+  };
+  const result = await client.callTool({
+    name: 'get_company_overview',
+    arguments: { issuer, document_type: 'peer_comparison' },
+  });
+
+  assert.equal(result.isError, false);
+  assert.equal(received.document_type, 'peer_comparison');
+});
+
+test('admits Benchmarking Financials at the public MCP boundary', async (context) => {
+  let received;
+  const registry = registryWith({
+    get_company_overview: async (argumentsValue) => {
+      received = argumentsValue;
+      return successResult('get_company_overview', { document: {} });
+    },
+  });
+  const { client, server } = await connectedClient(registry);
+  context.after(async () => server.close());
+
+  const issuer = {
+    exchange: 'NSE',
+    symbol: 'COFORGE',
+    legal_name: 'Coforge Ltd.',
+    provider_company_id: 'coforge-1',
+    provider_slug: 'coforge-ltd',
+  };
+  const result = await client.callTool({
+    name: 'get_company_overview',
+    arguments: { issuer, document_type: 'benchmarking_financials' },
+  });
+
+  assert.equal(result.isError, false);
+  assert.equal(received.document_type, 'benchmarking_financials');
+});
+
+test('admits the Growth Table provider basis at the public MCP boundary', async (context) => {
+  let received;
+  const registry = registryWith({
+    get_financials: async (argumentsValue) => {
+      received = argumentsValue;
+      return successResult('get_financials', { document: {} });
+    },
+  });
+  const { client, server } = await connectedClient(registry);
+  context.after(async () => server.close());
+
+  const issuer = {
+    exchange: 'NSE',
+    symbol: 'COFORGE',
+    legal_name: 'Coforge Ltd.',
+    provider_company_id: 'coforge-1',
+    provider_slug: 'coforge-ltd',
+  };
+  const result = await client.callTool({
+    name: 'get_financials',
+    arguments: {
+      issuer,
+      document_type: 'growth_table',
+      reporting_basis: 'not_applicable',
+    },
+  });
+
+  assert.equal(result.isError, false);
+  assert.equal(received.document_type, 'growth_table');
+  assert.equal(received.reporting_basis, 'not_applicable');
 });
 
 test('advertises an unauthenticated state when no session is attached to the factory', async (context) => {

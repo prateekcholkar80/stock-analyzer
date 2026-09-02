@@ -3,6 +3,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from re import fullmatch
 from threading import RLock
 from types import TracebackType
 
@@ -32,9 +33,27 @@ from app.models.fundamental_storage import (
     StoredFundamentalSnapshot,
     fundamental_snapshot_summary,
 )
+from app.models.financial_document_storage import (
+    StoredStructuredFinancialDocument,
+    StructuredDocumentCacheKey,
+    StructuredDocumentRepositoryScope,
+)
+from app.models.peer_comparison_storage import (
+    PeerComparisonCacheKey,
+    StoredPeerComparisonDocument,
+)
+from app.models.benchmarking_financials_storage import (
+    BenchmarkingFinancialsCacheKey,
+    StoredBenchmarkingFinancialsDocument,
+)
 
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
+_STRUCTURED_CACHE_ENTRY_ID_PATTERN = r"^financial_document:[a-f0-9]{64}$"
+_PEER_COMPARISON_CACHE_ENTRY_ID_PATTERN = r"^peer_comparison:[a-f0-9]{64}$"
+_BENCHMARKING_FINANCIALS_CACHE_ENTRY_ID_PATTERN = (
+    r"^benchmarking_financials:[a-f0-9]{64}$"
+)
 FundamentalCacheClock = Callable[[], datetime]
 
 
@@ -60,6 +79,11 @@ class DuckDBJarvisStorage:
             self._connection = duckdb.connect(database_name)
             self._initialize_schema()
             self.purge_expired_fundamental_snapshots(as_of=self._now())
+            self.purge_expired_structured_financial_documents(
+                as_of=self._now()
+            )
+            self.purge_expired_peer_comparisons(as_of=self._now())
+            self.purge_expired_benchmarking_financials(as_of=self._now())
         except StorageError:
             self._close_after_initialization_failure()
             raise
@@ -528,6 +552,86 @@ class DuckDBJarvisStorage:
                     "Unable to persist DuckDB fundamental snapshot"
                 ) from exc
 
+    def replace_fundamental_snapshot(
+        self,
+        stored: StoredFundamentalSnapshot,
+        *,
+        scope: FundamentalRepositoryScope,
+    ) -> StoredFundamentalSnapshot:
+        """Transactionally install newer evidence for one scoped cache key."""
+
+        value = StoredFundamentalSnapshot.model_validate(stored)
+        caller_scope = FundamentalRepositoryScope.model_validate(scope)
+        summary = fundamental_snapshot_summary(value)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_fundamental_locked(as_of=now)
+                if value.cache_key.repository_scope != caller_scope:
+                    raise StorageError(
+                        "fundamental replacement scope does not match cache key"
+                    )
+                if value.stored_at > now:
+                    raise StorageError(
+                        "fundamental snapshot storage time is in the future"
+                    )
+                if value.is_expired(as_of=now):
+                    raise StorageError(
+                        "expired fundamental snapshot cannot be saved"
+                    )
+
+                existing = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_fundamental_snapshots "
+                    "WHERE cache_entry_id = ?",
+                    [value.cache_key.cache_entry_id],
+                ).fetchone()
+                if existing is None:
+                    persisted = value
+                    self._insert_fundamental_parent(persisted, summary)
+                else:
+                    current = StoredFundamentalSnapshot.model_validate_json(
+                        existing[1]
+                    )
+                    if current.storage_fingerprint != existing[0]:
+                        raise StorageError(
+                            "DuckDB fundamental snapshot fingerprint is "
+                            "inconsistent"
+                        )
+                    if existing[0] == value.storage_fingerprint:
+                        persisted = current
+                    else:
+                        if value.retrieved_at <= current.retrieved_at:
+                            raise StorageConflictError(
+                                "fundamental replacement is not newer than "
+                                "cached data"
+                            )
+                        self._delete_fundamental_entry_locked(
+                            value.cache_key.cache_entry_id
+                        )
+                        persisted = value
+                        self._insert_fundamental_parent(persisted, summary)
+
+                self._persist_fundamental_details(persisted)
+                self._connection.execute("COMMIT")
+                return StoredFundamentalSnapshot.model_validate_json(
+                    persisted.model_dump_json(exclude_computed_fields=True)
+                )
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to replace DuckDB fundamental snapshot"
+                ) from exc
+
     def get_fundamental_snapshot(
         self,
         key: FundamentalSnapshotCacheKey,
@@ -749,6 +853,940 @@ class DuckDBJarvisStorage:
                     "Unable to purge DuckDB fundamental snapshots"
                 ) from exc
 
+    def save_structured_financial_document(
+        self,
+        stored: StoredStructuredFinancialDocument,
+    ) -> StoredStructuredFinancialDocument:
+        value = StoredStructuredFinancialDocument.model_validate(stored)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_structured_documents_locked(as_of=now)
+                self._validate_structured_document_writable(value, as_of=now)
+                existing = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_structured_financial_documents "
+                    "WHERE cache_entry_id = ?",
+                    [value.cache_key.cache_entry_id],
+                ).fetchone()
+                if existing is None:
+                    self._insert_structured_document(value)
+                    persisted = value
+                else:
+                    if existing[0] != value.storage_fingerprint:
+                        raise StorageConflictError(
+                            "structured document cache key contains different data"
+                        )
+                    persisted = StoredStructuredFinancialDocument.model_validate_json(
+                        existing[1]
+                    )
+                    if persisted.storage_fingerprint != existing[0]:
+                        raise StorageError(
+                            "DuckDB structured document fingerprint is inconsistent"
+                        )
+                self._connection.execute("COMMIT")
+                return self._copy_structured_document(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to persist DuckDB structured document"
+                ) from exc
+
+    def replace_structured_financial_document(
+        self,
+        stored: StoredStructuredFinancialDocument,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+    ) -> StoredStructuredFinancialDocument:
+        value = StoredStructuredFinancialDocument.model_validate(stored)
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_structured_documents_locked(as_of=now)
+                if value.cache_key.repository_scope != caller_scope:
+                    raise StorageError(
+                        "structured document replacement scope does not match key"
+                    )
+                self._validate_structured_document_writable(value, as_of=now)
+                existing = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_structured_financial_documents "
+                    "WHERE cache_entry_id = ?",
+                    [value.cache_key.cache_entry_id],
+                ).fetchone()
+                if existing is None:
+                    self._insert_structured_document(value)
+                    persisted = value
+                else:
+                    current = StoredStructuredFinancialDocument.model_validate_json(
+                        existing[1]
+                    )
+                    if current.storage_fingerprint != existing[0]:
+                        raise StorageError(
+                            "DuckDB structured document fingerprint is inconsistent"
+                        )
+                    if existing[0] == value.storage_fingerprint:
+                        persisted = current
+                    else:
+                        if value.retrieved_at <= current.retrieved_at:
+                            raise StorageConflictError(
+                                "structured document replacement is not newer"
+                            )
+                        self._delete_structured_document_locked(
+                            value.cache_key.cache_entry_id
+                        )
+                        self._insert_structured_document(value)
+                        persisted = value
+                self._connection.execute("COMMIT")
+                return self._copy_structured_document(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to replace DuckDB structured document"
+                ) from exc
+
+    def get_structured_financial_document(
+        self,
+        key: StructuredDocumentCacheKey,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+        as_of: datetime,
+    ) -> StoredStructuredFinancialDocument | None:
+        requested_key = StructuredDocumentCacheKey.model_validate(key)
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(
+            as_of,
+            "structured document cache read time",
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_structured_documents_locked(as_of=read_at)
+                row = None
+                if requested_key.repository_scope == caller_scope:
+                    row = self._connection.execute(
+                        "SELECT storage_fingerprint, payload_json "
+                        "FROM jarvis_structured_financial_documents "
+                        "WHERE cache_entry_id = ? AND tenant_id = ? "
+                        "AND provider_connection_id = ? AND provider = ? "
+                        "AND stored_at <= ? AND expires_at > ?",
+                        [
+                            requested_key.cache_entry_id,
+                            caller_scope.tenant_id,
+                            caller_scope.provider_connection_id,
+                            caller_scope.provider,
+                            read_at,
+                            read_at,
+                        ],
+                    ).fetchone()
+                self._connection.execute("COMMIT")
+                if row is None:
+                    return None
+                persisted = StoredStructuredFinancialDocument.model_validate_json(
+                    row[1]
+                )
+                if (
+                    persisted.storage_fingerprint != row[0]
+                    or persisted.cache_key != requested_key
+                    or persisted.cache_key.repository_scope != caller_scope
+                ):
+                    raise StorageError(
+                        "DuckDB structured document failed integrity checks"
+                    )
+                return self._copy_structured_document(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to load DuckDB structured document"
+                ) from exc
+
+    def get_structured_financial_document_by_cache_entry_id(
+        self,
+        cache_entry_id: str,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+        as_of: datetime,
+    ) -> StoredStructuredFinancialDocument | None:
+        if (
+            not isinstance(cache_entry_id, str)
+            or fullmatch(
+                _STRUCTURED_CACHE_ENTRY_ID_PATTERN,
+                cache_entry_id,
+            )
+            is None
+        ):
+            raise ValueError("structured document cache entry ID is invalid")
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(
+            as_of,
+            "structured document cache read time",
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_structured_documents_locked(as_of=read_at)
+                row = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_structured_financial_documents "
+                    "WHERE cache_entry_id = ? AND tenant_id = ? "
+                    "AND provider_connection_id = ? AND provider = ? "
+                    "AND stored_at <= ? AND expires_at > ?",
+                    [
+                        cache_entry_id,
+                        caller_scope.tenant_id,
+                        caller_scope.provider_connection_id,
+                        caller_scope.provider,
+                        read_at,
+                        read_at,
+                    ],
+                ).fetchone()
+                self._connection.execute("COMMIT")
+                if row is None:
+                    return None
+                persisted = StoredStructuredFinancialDocument.model_validate_json(
+                    row[1]
+                )
+                if (
+                    persisted.storage_fingerprint != row[0]
+                    or persisted.cache_key.cache_entry_id != cache_entry_id
+                    or persisted.cache_key.repository_scope != caller_scope
+                ):
+                    raise StorageError(
+                        "DuckDB structured document failed integrity checks"
+                    )
+                return self._copy_structured_document(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to resolve DuckDB structured document reference"
+                ) from exc
+
+    def delete_structured_financial_document(
+        self,
+        key: StructuredDocumentCacheKey,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+    ) -> bool:
+        requested_key = StructuredDocumentCacheKey.model_validate(key)
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_structured_documents_locked(as_of=now)
+                exists = None
+                if requested_key.repository_scope == caller_scope:
+                    exists = self._connection.execute(
+                        "SELECT 1 FROM jarvis_structured_financial_documents "
+                        "WHERE cache_entry_id = ? AND tenant_id = ? "
+                        "AND provider_connection_id = ? AND provider = ?",
+                        [
+                            requested_key.cache_entry_id,
+                            caller_scope.tenant_id,
+                            caller_scope.provider_connection_id,
+                            caller_scope.provider,
+                        ],
+                    ).fetchone()
+                if exists is not None:
+                    self._delete_structured_document_locked(
+                        requested_key.cache_entry_id
+                    )
+                self._connection.execute("COMMIT")
+                return exists is not None
+            except duckdb.Error as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to delete DuckDB structured document"
+                ) from exc
+
+    def purge_expired_structured_financial_documents(
+        self,
+        *,
+        as_of: datetime,
+    ) -> int:
+        purge_at = _require_aware_datetime(
+            as_of,
+            "structured document purge time",
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                removed = self._purge_expired_structured_documents_locked(
+                    as_of=purge_at
+                )
+                self._connection.execute("COMMIT")
+                return removed
+            except duckdb.Error as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to purge DuckDB structured documents"
+                ) from exc
+
+    def save_peer_comparison(
+        self,
+        stored: StoredPeerComparisonDocument,
+    ) -> StoredPeerComparisonDocument:
+        value = StoredPeerComparisonDocument.model_validate(stored)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_peer_comparisons_locked(as_of=now)
+                self._validate_peer_comparison_writable(value, as_of=now)
+                existing = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_peer_comparisons WHERE cache_entry_id = ?",
+                    [value.cache_key.cache_entry_id],
+                ).fetchone()
+                if existing is None:
+                    self._insert_peer_comparison(value)
+                    persisted = value
+                else:
+                    if existing[0] != value.storage_fingerprint:
+                        raise StorageConflictError(
+                            "Peer Comparison cache key contains different data"
+                        )
+                    persisted = StoredPeerComparisonDocument.model_validate_json(
+                        existing[1]
+                    )
+                    if persisted.storage_fingerprint != existing[0]:
+                        raise StorageError(
+                            "DuckDB Peer Comparison fingerprint is inconsistent"
+                        )
+                self._connection.execute("COMMIT")
+                return self._copy_peer_comparison(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to persist DuckDB Peer Comparison"
+                ) from exc
+
+    def replace_peer_comparison(
+        self,
+        stored: StoredPeerComparisonDocument,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+    ) -> StoredPeerComparisonDocument:
+        value = StoredPeerComparisonDocument.model_validate(stored)
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_peer_comparisons_locked(as_of=now)
+                if value.cache_key.repository_scope != caller_scope:
+                    raise StorageError(
+                        "Peer Comparison replacement scope does not match key"
+                    )
+                self._validate_peer_comparison_writable(value, as_of=now)
+                existing = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_peer_comparisons WHERE cache_entry_id = ?",
+                    [value.cache_key.cache_entry_id],
+                ).fetchone()
+                if existing is None:
+                    self._insert_peer_comparison(value)
+                    persisted = value
+                else:
+                    current = StoredPeerComparisonDocument.model_validate_json(
+                        existing[1]
+                    )
+                    if current.storage_fingerprint != existing[0]:
+                        raise StorageError(
+                            "DuckDB Peer Comparison fingerprint is inconsistent"
+                        )
+                    if existing[0] == value.storage_fingerprint:
+                        persisted = current
+                    else:
+                        if value.retrieved_at <= current.retrieved_at:
+                            raise StorageConflictError(
+                                "Peer Comparison replacement is not newer than cache"
+                            )
+                        self._delete_peer_comparison_locked(
+                            value.cache_key.cache_entry_id
+                        )
+                        self._insert_peer_comparison(value)
+                        persisted = value
+                self._connection.execute("COMMIT")
+                return self._copy_peer_comparison(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to replace DuckDB Peer Comparison"
+                ) from exc
+
+    def get_peer_comparison(
+        self,
+        key: PeerComparisonCacheKey,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+        as_of: datetime,
+    ) -> StoredPeerComparisonDocument | None:
+        requested_key = PeerComparisonCacheKey.model_validate(key)
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(as_of, "Peer Comparison cache read time")
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_peer_comparisons_locked(as_of=read_at)
+                row = None
+                if requested_key.repository_scope == caller_scope:
+                    row = self._connection.execute(
+                        "SELECT storage_fingerprint, payload_json "
+                        "FROM jarvis_peer_comparisons "
+                        "WHERE cache_entry_id = ? AND tenant_id = ? "
+                        "AND provider_connection_id = ? AND provider = ? "
+                        "AND stored_at <= ? AND expires_at > ?",
+                        [
+                            requested_key.cache_entry_id,
+                            caller_scope.tenant_id,
+                            caller_scope.provider_connection_id,
+                            caller_scope.provider,
+                            read_at,
+                            read_at,
+                        ],
+                    ).fetchone()
+                self._connection.execute("COMMIT")
+                if row is None:
+                    return None
+                persisted = StoredPeerComparisonDocument.model_validate_json(row[1])
+                if (
+                    persisted.storage_fingerprint != row[0]
+                    or persisted.cache_key != requested_key
+                    or persisted.cache_key.repository_scope != caller_scope
+                ):
+                    raise StorageError(
+                        "DuckDB Peer Comparison failed integrity checks"
+                    )
+                return self._copy_peer_comparison(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to load DuckDB Peer Comparison"
+                ) from exc
+
+    def get_peer_comparison_by_cache_entry_id(
+        self,
+        cache_entry_id: str,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+        as_of: datetime,
+    ) -> StoredPeerComparisonDocument | None:
+        if (
+            not isinstance(cache_entry_id, str)
+            or fullmatch(_PEER_COMPARISON_CACHE_ENTRY_ID_PATTERN, cache_entry_id)
+            is None
+        ):
+            raise ValueError("Peer Comparison cache entry ID is invalid")
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(as_of, "Peer Comparison cache read time")
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_peer_comparisons_locked(as_of=read_at)
+                row = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_peer_comparisons "
+                    "WHERE cache_entry_id = ? AND tenant_id = ? "
+                    "AND provider_connection_id = ? AND provider = ? "
+                    "AND stored_at <= ? AND expires_at > ?",
+                    [
+                        cache_entry_id,
+                        caller_scope.tenant_id,
+                        caller_scope.provider_connection_id,
+                        caller_scope.provider,
+                        read_at,
+                        read_at,
+                    ],
+                ).fetchone()
+                self._connection.execute("COMMIT")
+                if row is None:
+                    return None
+                persisted = StoredPeerComparisonDocument.model_validate_json(row[1])
+                if (
+                    persisted.storage_fingerprint != row[0]
+                    or persisted.cache_key.cache_entry_id != cache_entry_id
+                    or persisted.cache_key.repository_scope != caller_scope
+                ):
+                    raise StorageError(
+                        "DuckDB Peer Comparison failed integrity checks"
+                    )
+                return self._copy_peer_comparison(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to resolve DuckDB Peer Comparison reference"
+                ) from exc
+
+    def delete_peer_comparison(
+        self,
+        key: PeerComparisonCacheKey,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+    ) -> bool:
+        requested_key = PeerComparisonCacheKey.model_validate(key)
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_peer_comparisons_locked(as_of=now)
+                exists = None
+                if requested_key.repository_scope == caller_scope:
+                    exists = self._connection.execute(
+                        "SELECT 1 FROM jarvis_peer_comparisons "
+                        "WHERE cache_entry_id = ? AND tenant_id = ? "
+                        "AND provider_connection_id = ? AND provider = ?",
+                        [
+                            requested_key.cache_entry_id,
+                            caller_scope.tenant_id,
+                            caller_scope.provider_connection_id,
+                            caller_scope.provider,
+                        ],
+                    ).fetchone()
+                if exists is not None:
+                    self._delete_peer_comparison_locked(
+                        requested_key.cache_entry_id
+                    )
+                self._connection.execute("COMMIT")
+                return exists is not None
+            except duckdb.Error as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to delete DuckDB Peer Comparison"
+                ) from exc
+
+    def purge_expired_peer_comparisons(self, *, as_of: datetime) -> int:
+        purge_at = _require_aware_datetime(as_of, "Peer Comparison purge time")
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                removed = self._purge_expired_peer_comparisons_locked(
+                    as_of=purge_at
+                )
+                self._connection.execute("COMMIT")
+                return removed
+            except duckdb.Error as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to purge DuckDB Peer Comparisons"
+                ) from exc
+
+    def save_benchmarking_financials(
+        self,
+        stored: StoredBenchmarkingFinancialsDocument,
+    ) -> StoredBenchmarkingFinancialsDocument:
+        value = StoredBenchmarkingFinancialsDocument.model_validate(stored)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_benchmarking_financials_locked(as_of=now)
+                self._validate_benchmarking_financials_writable(
+                    value,
+                    as_of=now,
+                )
+                existing = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_benchmarking_financials "
+                    "WHERE cache_entry_id = ?",
+                    [value.cache_key.cache_entry_id],
+                ).fetchone()
+                if existing is None:
+                    self._insert_benchmarking_financials(value)
+                    persisted = value
+                else:
+                    if existing[0] != value.storage_fingerprint:
+                        raise StorageConflictError(
+                            "Benchmarking Financials cache key contains different data"
+                        )
+                    persisted = (
+                        StoredBenchmarkingFinancialsDocument.model_validate_json(
+                            existing[1]
+                        )
+                    )
+                    if persisted.storage_fingerprint != existing[0]:
+                        raise StorageError(
+                            "DuckDB Benchmarking Financials fingerprint is inconsistent"
+                        )
+                self._connection.execute("COMMIT")
+                return self._copy_benchmarking_financials(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to persist DuckDB Benchmarking Financials"
+                ) from exc
+
+    def replace_benchmarking_financials(
+        self,
+        stored: StoredBenchmarkingFinancialsDocument,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+    ) -> StoredBenchmarkingFinancialsDocument:
+        value = StoredBenchmarkingFinancialsDocument.model_validate(stored)
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_benchmarking_financials_locked(as_of=now)
+                if value.cache_key.repository_scope != caller_scope:
+                    raise StorageError(
+                        "Benchmarking Financials replacement scope does not match key"
+                    )
+                self._validate_benchmarking_financials_writable(
+                    value,
+                    as_of=now,
+                )
+                existing = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_benchmarking_financials "
+                    "WHERE cache_entry_id = ?",
+                    [value.cache_key.cache_entry_id],
+                ).fetchone()
+                if existing is None:
+                    self._insert_benchmarking_financials(value)
+                    persisted = value
+                else:
+                    current = (
+                        StoredBenchmarkingFinancialsDocument.model_validate_json(
+                            existing[1]
+                        )
+                    )
+                    if current.storage_fingerprint != existing[0]:
+                        raise StorageError(
+                            "DuckDB Benchmarking Financials fingerprint is inconsistent"
+                        )
+                    if existing[0] == value.storage_fingerprint:
+                        persisted = current
+                    else:
+                        if value.retrieved_at <= current.retrieved_at:
+                            raise StorageConflictError(
+                                "Benchmarking Financials replacement is not newer than cache"
+                            )
+                        self._delete_benchmarking_financials_locked(
+                            value.cache_key.cache_entry_id
+                        )
+                        self._insert_benchmarking_financials(value)
+                        persisted = value
+                self._connection.execute("COMMIT")
+                return self._copy_benchmarking_financials(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to replace DuckDB Benchmarking Financials"
+                ) from exc
+
+    def get_benchmarking_financials(
+        self,
+        key: BenchmarkingFinancialsCacheKey,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+        as_of: datetime,
+    ) -> StoredBenchmarkingFinancialsDocument | None:
+        requested_key = BenchmarkingFinancialsCacheKey.model_validate(key)
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(
+            as_of,
+            "Benchmarking Financials cache read time",
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_benchmarking_financials_locked(
+                    as_of=read_at
+                )
+                row = None
+                if requested_key.repository_scope == caller_scope:
+                    row = self._connection.execute(
+                        "SELECT storage_fingerprint, payload_json "
+                        "FROM jarvis_benchmarking_financials "
+                        "WHERE cache_entry_id = ? AND tenant_id = ? "
+                        "AND provider_connection_id = ? AND provider = ? "
+                        "AND stored_at <= ? AND expires_at > ?",
+                        [
+                            requested_key.cache_entry_id,
+                            caller_scope.tenant_id,
+                            caller_scope.provider_connection_id,
+                            caller_scope.provider,
+                            read_at,
+                            read_at,
+                        ],
+                    ).fetchone()
+                self._connection.execute("COMMIT")
+                if row is None:
+                    return None
+                persisted = (
+                    StoredBenchmarkingFinancialsDocument.model_validate_json(
+                        row[1]
+                    )
+                )
+                if (
+                    persisted.storage_fingerprint != row[0]
+                    or persisted.cache_key != requested_key
+                    or persisted.cache_key.repository_scope != caller_scope
+                ):
+                    raise StorageError(
+                        "DuckDB Benchmarking Financials failed integrity checks"
+                    )
+                return self._copy_benchmarking_financials(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to load DuckDB Benchmarking Financials"
+                ) from exc
+
+    def get_benchmarking_financials_by_cache_entry_id(
+        self,
+        cache_entry_id: str,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+        as_of: datetime,
+    ) -> StoredBenchmarkingFinancialsDocument | None:
+        if (
+            not isinstance(cache_entry_id, str)
+            or fullmatch(
+                _BENCHMARKING_FINANCIALS_CACHE_ENTRY_ID_PATTERN,
+                cache_entry_id,
+            )
+            is None
+        ):
+            raise ValueError(
+                "Benchmarking Financials cache entry ID is invalid"
+            )
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(
+            as_of,
+            "Benchmarking Financials cache read time",
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_benchmarking_financials_locked(
+                    as_of=read_at
+                )
+                row = self._connection.execute(
+                    "SELECT storage_fingerprint, payload_json "
+                    "FROM jarvis_benchmarking_financials "
+                    "WHERE cache_entry_id = ? AND tenant_id = ? "
+                    "AND provider_connection_id = ? AND provider = ? "
+                    "AND stored_at <= ? AND expires_at > ?",
+                    [
+                        cache_entry_id,
+                        caller_scope.tenant_id,
+                        caller_scope.provider_connection_id,
+                        caller_scope.provider,
+                        read_at,
+                        read_at,
+                    ],
+                ).fetchone()
+                self._connection.execute("COMMIT")
+                if row is None:
+                    return None
+                persisted = (
+                    StoredBenchmarkingFinancialsDocument.model_validate_json(
+                        row[1]
+                    )
+                )
+                if (
+                    persisted.storage_fingerprint != row[0]
+                    or persisted.cache_key.cache_entry_id != cache_entry_id
+                    or persisted.cache_key.repository_scope != caller_scope
+                ):
+                    raise StorageError(
+                        "DuckDB Benchmarking Financials failed integrity checks"
+                    )
+                return self._copy_benchmarking_financials(persisted)
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to resolve DuckDB Benchmarking Financials reference"
+                ) from exc
+
+    def delete_benchmarking_financials(
+        self,
+        key: BenchmarkingFinancialsCacheKey,
+        *,
+        scope: StructuredDocumentRepositoryScope,
+    ) -> bool:
+        requested_key = BenchmarkingFinancialsCacheKey.model_validate(key)
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_benchmarking_financials_locked(as_of=now)
+                exists = None
+                if requested_key.repository_scope == caller_scope:
+                    exists = self._connection.execute(
+                        "SELECT 1 FROM jarvis_benchmarking_financials "
+                        "WHERE cache_entry_id = ? AND tenant_id = ? "
+                        "AND provider_connection_id = ? AND provider = ?",
+                        [
+                            requested_key.cache_entry_id,
+                            caller_scope.tenant_id,
+                            caller_scope.provider_connection_id,
+                            caller_scope.provider,
+                        ],
+                    ).fetchone()
+                if exists is not None:
+                    self._delete_benchmarking_financials_locked(
+                        requested_key.cache_entry_id
+                    )
+                self._connection.execute("COMMIT")
+                return exists is not None
+            except duckdb.Error as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to delete DuckDB Benchmarking Financials"
+                ) from exc
+
+    def purge_expired_benchmarking_financials(
+        self,
+        *,
+        as_of: datetime,
+    ) -> int:
+        purge_at = _require_aware_datetime(
+            as_of,
+            "Benchmarking Financials purge time",
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                removed = self._purge_expired_benchmarking_financials_locked(
+                    as_of=purge_at
+                )
+                self._connection.execute("COMMIT")
+                return removed
+            except duckdb.Error as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to purge DuckDB Benchmarking Financials"
+                ) from exc
+
     def find_similar_debate_runs(
         self,
         signature: tuple[str, ...],
@@ -814,7 +1852,7 @@ class DuckDBJarvisStorage:
                     raise StorageError(
                         "Invalid DuckDB storage schema version"
                     ) from exc
-                if current_version not in (None, 1, 2, 3, _SCHEMA_VERSION):
+                if current_version not in (None, 1, 2, 3, 4, _SCHEMA_VERSION):
                     raise StorageError(
                         "Unsupported DuckDB storage schema version: "
                         f"{row[0]}"
@@ -823,6 +1861,8 @@ class DuckDBJarvisStorage:
                 self._create_normalized_tables()
                 self._create_debate_tables()
                 self._create_fundamental_tables()
+                self._create_fundamental_detail_tables()
+                self._create_structured_document_tables()
                 if current_version == 1:
                     self._backfill_normalized_schema()
                 if row is None:
@@ -977,6 +2017,8 @@ class DuckDBJarvisStorage:
             )
             """
         )
+
+    def _create_fundamental_detail_tables(self) -> None:
         self._connection.execute(
             """
             CREATE INDEX IF NOT EXISTS jarvis_fundamental_scope_lookup
@@ -1114,6 +2156,172 @@ class DuckDBJarvisStorage:
                 PRIMARY KEY (cache_entry_id, conflict_index),
                 UNIQUE (cache_entry_id, conflict_id)
             )
+            """
+        )
+
+    def _create_structured_document_tables(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_structured_financial_documents (
+                cache_entry_id VARCHAR PRIMARY KEY,
+                cache_key_fingerprint VARCHAR NOT NULL UNIQUE,
+                storage_fingerprint VARCHAR NOT NULL,
+                tenant_id VARCHAR NOT NULL,
+                provider_connection_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                isin VARCHAR,
+                provider_company_id VARCHAR,
+                provider_slug VARCHAR,
+                as_of_date DATE,
+                document_type VARCHAR NOT NULL,
+                reporting_basis VARCHAR NOT NULL,
+                request_id VARCHAR NOT NULL,
+                request_fingerprint VARCHAR NOT NULL,
+                result_fingerprint VARCHAR NOT NULL,
+                document_fingerprint VARCHAR NOT NULL,
+                retrieved_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                stored_at TIMESTAMPTZ NOT NULL,
+                period_count BIGINT NOT NULL,
+                row_count BIGINT NOT NULL,
+                payload_json VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_structured_document_scope_lookup
+            ON jarvis_structured_financial_documents (
+                tenant_id,
+                provider_connection_id,
+                provider,
+                exchange,
+                symbol,
+                document_type,
+                reporting_basis,
+                retrieved_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_structured_document_expiry_lookup
+            ON jarvis_structured_financial_documents (expires_at)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_peer_comparisons (
+                cache_entry_id VARCHAR PRIMARY KEY,
+                cache_key_fingerprint VARCHAR NOT NULL UNIQUE,
+                storage_fingerprint VARCHAR NOT NULL,
+                tenant_id VARCHAR NOT NULL,
+                provider_connection_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                isin VARCHAR,
+                provider_company_id VARCHAR,
+                provider_slug VARCHAR,
+                as_of_date DATE,
+                document_type VARCHAR NOT NULL,
+                request_id VARCHAR NOT NULL,
+                request_fingerprint VARCHAR NOT NULL,
+                result_fingerprint VARCHAR NOT NULL,
+                document_fingerprint VARCHAR NOT NULL,
+                observation_date DATE NOT NULL,
+                retrieved_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                stored_at TIMESTAMPTZ NOT NULL,
+                metric_count BIGINT NOT NULL,
+                peer_count BIGINT NOT NULL,
+                payload_json VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_peer_comparison_scope_lookup
+            ON jarvis_peer_comparisons (
+                tenant_id,
+                provider_connection_id,
+                provider,
+                exchange,
+                symbol,
+                observation_date,
+                retrieved_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_peer_comparison_fingerprint_lookup
+            ON jarvis_peer_comparisons (document_fingerprint)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_peer_comparison_expiry_lookup
+            ON jarvis_peer_comparisons (expires_at)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_benchmarking_financials (
+                cache_entry_id VARCHAR PRIMARY KEY,
+                cache_key_fingerprint VARCHAR NOT NULL UNIQUE,
+                storage_fingerprint VARCHAR NOT NULL,
+                tenant_id VARCHAR NOT NULL,
+                provider_connection_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                isin VARCHAR,
+                provider_company_id VARCHAR,
+                provider_slug VARCHAR,
+                as_of_date DATE,
+                document_type VARCHAR NOT NULL,
+                request_id VARCHAR NOT NULL,
+                request_fingerprint VARCHAR NOT NULL,
+                result_fingerprint VARCHAR NOT NULL,
+                document_fingerprint VARCHAR NOT NULL,
+                observation_date DATE NOT NULL,
+                retrieved_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                stored_at TIMESTAMPTZ NOT NULL,
+                company_count BIGINT NOT NULL,
+                row_count BIGINT NOT NULL,
+                payload_json VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_benchmarking_financials_scope_lookup
+            ON jarvis_benchmarking_financials (
+                tenant_id,
+                provider_connection_id,
+                provider,
+                exchange,
+                symbol,
+                observation_date,
+                retrieved_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            jarvis_benchmarking_financials_fingerprint_lookup
+            ON jarvis_benchmarking_financials (document_fingerprint)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_benchmarking_financials_expiry_lookup
+            ON jarvis_benchmarking_financials (expires_at)
             """
         )
 
@@ -2191,6 +3399,262 @@ class DuckDBJarvisStorage:
         for (cache_entry_id,) in rows:
             self._delete_fundamental_entry_locked(cache_entry_id)
         return len(rows)
+
+    def _insert_structured_document(
+        self,
+        stored: StoredStructuredFinancialDocument,
+    ) -> None:
+        key = stored.cache_key
+        issuer = key.issuer
+        document = stored.result.document
+        if document is None:
+            raise StorageError("stored structured result is missing its document")
+        values = [
+            key.cache_entry_id,
+            key.cache_key_fingerprint,
+            stored.storage_fingerprint,
+            key.tenant_id,
+            key.provider_connection_id,
+            key.provider,
+            issuer.exchange,
+            issuer.symbol,
+            issuer.isin,
+            issuer.provider_company_id,
+            issuer.provider_slug,
+            key.as_of_date,
+            _enum_value(key.document_type),
+            _enum_value(key.reporting_basis),
+            stored.request.request_id,
+            stored.request_fingerprint,
+            stored.result_fingerprint,
+            stored.document_fingerprint,
+            stored.retrieved_at,
+            stored.expires_at,
+            stored.stored_at,
+            len(document.periods),
+            len(document.rows),
+            stored.model_dump_json(exclude_computed_fields=True),
+        ]
+        self._connection.execute(
+            "INSERT INTO jarvis_structured_financial_documents VALUES ("
+            + ", ".join("?" for _ in values)
+            + ")",
+            values,
+        )
+
+    def _delete_structured_document_locked(self, cache_entry_id: str) -> None:
+        self._connection.execute(
+            "DELETE FROM jarvis_structured_financial_documents "
+            "WHERE cache_entry_id = ?",
+            [cache_entry_id],
+        )
+
+    def _purge_expired_structured_documents_locked(
+        self,
+        *,
+        as_of: datetime,
+    ) -> int:
+        rows = self._connection.execute(
+            "SELECT cache_entry_id FROM jarvis_structured_financial_documents "
+            "WHERE expires_at <= ? ORDER BY cache_entry_id",
+            [as_of],
+        ).fetchall()
+        for (cache_entry_id,) in rows:
+            self._delete_structured_document_locked(cache_entry_id)
+        return len(rows)
+
+    @staticmethod
+    def _validate_structured_document_writable(
+        stored: StoredStructuredFinancialDocument,
+        *,
+        as_of: datetime,
+    ) -> None:
+        if stored.stored_at > as_of:
+            raise StorageError(
+                "structured document storage time is in the future"
+            )
+        if stored.is_expired(as_of=as_of):
+            raise StorageError("expired structured document cannot be saved")
+
+    @staticmethod
+    def _copy_structured_document(
+        stored: StoredStructuredFinancialDocument,
+    ) -> StoredStructuredFinancialDocument:
+        return StoredStructuredFinancialDocument.model_validate_json(
+            stored.model_dump_json(exclude_computed_fields=True)
+        )
+
+    def _insert_peer_comparison(
+        self,
+        stored: StoredPeerComparisonDocument,
+    ) -> None:
+        key = stored.cache_key
+        issuer = key.issuer
+        document = stored.result.document
+        if document is None:
+            raise StorageError("stored Peer Comparison is missing its document")
+        values = [
+            key.cache_entry_id,
+            key.cache_key_fingerprint,
+            stored.storage_fingerprint,
+            key.tenant_id,
+            key.provider_connection_id,
+            key.provider,
+            issuer.exchange,
+            issuer.symbol,
+            issuer.isin,
+            issuer.provider_company_id,
+            issuer.provider_slug,
+            key.as_of_date,
+            key.document_type,
+            stored.request.request_id,
+            stored.request_fingerprint,
+            stored.result_fingerprint,
+            stored.document_fingerprint,
+            document.observation_date,
+            stored.retrieved_at,
+            stored.expires_at,
+            stored.stored_at,
+            len(document.metrics),
+            len(document.peers),
+            stored.model_dump_json(exclude_computed_fields=True),
+        ]
+        self._connection.execute(
+            "INSERT INTO jarvis_peer_comparisons VALUES ("
+            + ", ".join("?" for _ in values)
+            + ")",
+            values,
+        )
+
+    def _delete_peer_comparison_locked(self, cache_entry_id: str) -> None:
+        self._connection.execute(
+            "DELETE FROM jarvis_peer_comparisons WHERE cache_entry_id = ?",
+            [cache_entry_id],
+        )
+
+    def _purge_expired_peer_comparisons_locked(
+        self,
+        *,
+        as_of: datetime,
+    ) -> int:
+        rows = self._connection.execute(
+            "SELECT cache_entry_id FROM jarvis_peer_comparisons "
+            "WHERE expires_at <= ? ORDER BY cache_entry_id",
+            [as_of],
+        ).fetchall()
+        for (cache_entry_id,) in rows:
+            self._delete_peer_comparison_locked(cache_entry_id)
+        return len(rows)
+
+    @staticmethod
+    def _validate_peer_comparison_writable(
+        stored: StoredPeerComparisonDocument,
+        *,
+        as_of: datetime,
+    ) -> None:
+        if stored.stored_at > as_of:
+            raise StorageError("Peer Comparison storage time is in the future")
+        if stored.is_expired(as_of=as_of):
+            raise StorageError("expired Peer Comparison cannot be saved")
+
+    @staticmethod
+    def _copy_peer_comparison(
+        stored: StoredPeerComparisonDocument,
+    ) -> StoredPeerComparisonDocument:
+        return StoredPeerComparisonDocument.model_validate_json(
+            stored.model_dump_json(exclude_computed_fields=True)
+        )
+
+    def _insert_benchmarking_financials(
+        self,
+        stored: StoredBenchmarkingFinancialsDocument,
+    ) -> None:
+        key = stored.cache_key
+        issuer = key.issuer
+        document = stored.result.document
+        if document is None:
+            raise StorageError(
+                "stored Benchmarking Financials is missing its document"
+            )
+        values = [
+            key.cache_entry_id,
+            key.cache_key_fingerprint,
+            stored.storage_fingerprint,
+            key.tenant_id,
+            key.provider_connection_id,
+            key.provider,
+            issuer.exchange,
+            issuer.symbol,
+            issuer.isin,
+            issuer.provider_company_id,
+            issuer.provider_slug,
+            key.as_of_date,
+            key.document_type,
+            stored.request.request_id,
+            stored.request_fingerprint,
+            stored.result_fingerprint,
+            stored.document_fingerprint,
+            document.observation_date,
+            stored.retrieved_at,
+            stored.expires_at,
+            stored.stored_at,
+            len(document.companies),
+            len(document.rows),
+            stored.model_dump_json(exclude_computed_fields=True),
+        ]
+        self._connection.execute(
+            "INSERT INTO jarvis_benchmarking_financials VALUES ("
+            + ", ".join("?" for _ in values)
+            + ")",
+            values,
+        )
+
+    def _delete_benchmarking_financials_locked(
+        self,
+        cache_entry_id: str,
+    ) -> None:
+        self._connection.execute(
+            "DELETE FROM jarvis_benchmarking_financials "
+            "WHERE cache_entry_id = ?",
+            [cache_entry_id],
+        )
+
+    def _purge_expired_benchmarking_financials_locked(
+        self,
+        *,
+        as_of: datetime,
+    ) -> int:
+        rows = self._connection.execute(
+            "SELECT cache_entry_id FROM jarvis_benchmarking_financials "
+            "WHERE expires_at <= ? ORDER BY cache_entry_id",
+            [as_of],
+        ).fetchall()
+        for (cache_entry_id,) in rows:
+            self._delete_benchmarking_financials_locked(cache_entry_id)
+        return len(rows)
+
+    @staticmethod
+    def _validate_benchmarking_financials_writable(
+        stored: StoredBenchmarkingFinancialsDocument,
+        *,
+        as_of: datetime,
+    ) -> None:
+        if stored.stored_at > as_of:
+            raise StorageError(
+                "Benchmarking Financials storage time is in the future"
+            )
+        if stored.is_expired(as_of=as_of):
+            raise StorageError(
+                "expired Benchmarking Financials cannot be saved"
+            )
+
+    @staticmethod
+    def _copy_benchmarking_financials(
+        stored: StoredBenchmarkingFinancialsDocument,
+    ) -> StoredBenchmarkingFinancialsDocument:
+        return StoredBenchmarkingFinancialsDocument.model_validate_json(
+            stored.model_dump_json(exclude_computed_fields=True)
+        )
 
     def _get_payload(
         self,

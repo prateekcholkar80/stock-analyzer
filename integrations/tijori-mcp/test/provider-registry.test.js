@@ -29,7 +29,7 @@ function searchBrowser() {
     slug: 'tata-consultancy-services',
     type: 'companies',
   }];
-  const response = (payload) => {
+  const response = (payload, responseUrl = 'https://www.tijorifinance.com/') => {
     const body = Buffer.from(
       typeof payload === 'string' ? payload : JSON.stringify(payload),
     );
@@ -37,6 +37,7 @@ function searchBrowser() {
       async body() { return body; },
       async headers() { return { 'content-length': String(body.length) }; },
       status() { return 200; },
+      url() { return responseUrl; },
     };
   };
   const page = {
@@ -100,9 +101,10 @@ function searchBrowser() {
         /\/company\/([a-z0-9-]+)\/(?:financials\/|shareholding\/)?$/,
       );
       if (match) state.slug = match[1];
-      return response(match ? 'company page' : searchPayload);
+      return response(match ? 'company page' : searchPayload, url);
     },
     async waitForSelector() {},
+    async waitForFunction() {},
   };
   return {
     runner: { async run(task) { return task(page); } },

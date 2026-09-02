@@ -28,7 +28,7 @@ const OWNERSHIP_MAPPINGS = Object.freeze([
   mapping(
     ['public', 'public holding', 'public shareholding', 'retail and others'],
     'public_holding',
-    'Public holding',
+    'Non-promoter/public aggregate',
   ),
   mapping(
     ['promoter pledge', 'promoter pledged', 'pledged promoter shares', 'promoter shares pledged'],
@@ -65,12 +65,21 @@ export function createShareholdingHandler({ browserRunner, clock = () => new Dat
     try {
       const outcome = await browserRunner.run(async (page) => {
         const response = await page.goto(`${BASE_URL}/company/${slug}/shareholding/`, {
-          timeout: 15_000,
-          waitUntil: 'domcontentloaded',
+          timeout: 20_000,
+          waitUntil: 'commit',
         });
         const status = responseStatus(response);
         if (status !== null) return { status };
-        await page.waitForSelector('table', { timeout: 10_000 });
+        if (!responseMatchesIssuerPath(response, slug)) {
+          return { status: 'unavailable' };
+        }
+        await page.waitForFunction(() => (
+          Array.from(document.querySelectorAll('table')).some((table) => {
+            const text = table.textContent?.toLowerCase() ?? '';
+            return text.includes('promoter')
+              && /(public|fii|foreign|dii|institution)/.test(text);
+          })
+        ), undefined, { timeout: 20_000 });
         return { status: 'success', value: await extractShareholding(page) };
       });
       if (outcome.status !== 'success') {
@@ -143,10 +152,11 @@ async function extractShareholding(page) {
 }
 
 function normalizeShareholding(value, request, slug, observedDate) {
+  const identity = resolvedIdentity(value?.metadata, request.issuer);
   if (
     value === null
     || typeof value !== 'object'
-    || !validIdentity(value.metadata, request.issuer)
+    || identity === null
     || !Array.isArray(value.headers)
     || value.headers.length < 2
     || value.headers.length > MAX_QUARTERS + 1
@@ -235,11 +245,26 @@ function normalizeShareholding(value, request, slug, observedDate) {
   })) {
     limitations.push('Promoter pledge was requested but was not displayed by the provider and is returned as unknown.');
   }
+  if (!identity.providerExchangeObserved) {
+    limitations.push(
+      'The provider page omitted its exchange field; Jarvis retained the previously resolved issuer exchange after company-ID and symbol verification.',
+    );
+  }
+  if (identity.providerCompanyIdVaries) {
+    limitations.push(
+      'The shareholding page exposed a different provider-internal company ID; Jarvis retained the previously resolved issuer ID after slug and symbol verification.',
+    );
+  }
+  if (!identity.providerMetadataObserved) {
+    limitations.push(
+      'The shareholding page omitted issuer metadata; Jarvis retained the previously resolved issuer identity after exact provider-slug URL verification.',
+    );
+  }
 
   return {
-    company_id: String(value.metadata.company_id).trim(),
-    exchange: String(value.metadata.exchange).toUpperCase(),
-    symbol: String(value.metadata.symbol).toUpperCase(),
+    company_id: identity.companyId,
+    exchange: identity.exchange,
+    symbol: identity.symbol,
     sources: [{
       provider_source_id: sourceId,
       source_name: 'Tijori standardized shareholding history',
@@ -256,7 +281,7 @@ function normalizeShareholding(value, request, slug, observedDate) {
 function parseQuarter(value) {
   const label = boundedString(value, 80, true);
   if (label === null) return { label: '', end: null };
-  const monthMatch = label.match(/^(Mar|Jun|Sep|Dec)[ -]?(\d{2}|\d{4})$/i);
+  const monthMatch = label.match(/^(Mar|Jun|Sep|Dec)[ '\-]?(\d{2}|\d{4})$/i);
   if (monthMatch) {
     const year = normalizeYear(monthMatch[2]);
     const month = { mar: 3, jun: 6, sep: 9, dec: 12 }[monthMatch[1].toLowerCase()];
@@ -279,20 +304,53 @@ function parseQuarter(value) {
   return { label, end: null };
 }
 
-function validIdentity(value, issuer) {
-  if (value === null || typeof value !== 'object') return false;
-  const companyId = boundedString(value.company_id, 128);
-  const exchange = boundedString(value.exchange, 32)?.toUpperCase();
+function resolvedIdentity(value, issuer) {
+  if (value === null) {
+    const companyId = boundedString(issuer.provider_company_id, 128);
+    const slug = boundedString(issuer.provider_slug, 240);
+    if (
+      companyId === null
+      || !ID_PATTERN.test(companyId)
+      || slug === null
+      || !SLUG_PATTERN.test(slug)
+      || !MARKET_PATTERN.test(issuer.exchange)
+      || !MARKET_PATTERN.test(issuer.symbol)
+    ) return null;
+    return {
+      companyId,
+      exchange: issuer.exchange,
+      providerCompanyIdVaries: false,
+      providerExchangeObserved: false,
+      providerMetadataObserved: false,
+      symbol: issuer.symbol,
+    };
+  }
+  if (typeof value !== 'object') return null;
+  const providerCompanyId = boundedString(value.company_id, 128);
+  const companyId = issuer.provider_company_id ?? providerCompanyId;
+  const providerExchange = boundedString(value.exchange, 32)?.toUpperCase();
+  const exchange = providerExchange ?? issuer.exchange;
   const symbol = boundedString(value.symbol, 100)?.toUpperCase();
-  return companyId !== null
+  const valid = providerCompanyId !== null
+    && ID_PATTERN.test(providerCompanyId)
+    && companyId !== null
     && ID_PATTERN.test(companyId)
-    && exchange !== null
     && MARKET_PATTERN.test(exchange)
     && symbol !== null
     && MARKET_PATTERN.test(symbol)
     && exchange === issuer.exchange
-    && symbol === issuer.symbol
-    && (issuer.provider_company_id === null || companyId === issuer.provider_company_id);
+    && symbol === issuer.symbol;
+  return valid
+    ? {
+      companyId,
+      exchange,
+      providerCompanyIdVaries: issuer.provider_company_id !== null
+        && providerCompanyId !== issuer.provider_company_id,
+      providerExchangeObserved: providerExchange !== undefined,
+      providerMetadataObserved: true,
+      symbol,
+    }
+    : null;
 }
 
 function parsePercentage(value) {
@@ -311,6 +369,18 @@ function responseStatus(response) {
   if (status === 404) return 'not_found';
   if (status === 429) return 'rate_limited';
   return 'unavailable';
+}
+
+function responseMatchesIssuerPath(response, slug) {
+  if (typeof response?.url !== 'function') return false;
+  try {
+    const target = new URL(response.url());
+    return target.protocol === 'https:'
+      && target.hostname === 'www.tijorifinance.com'
+      && target.pathname === `/company/${slug}/shareholding/`;
+  } catch {
+    return false;
+  }
 }
 
 function mapping(labels, id, standard) {
