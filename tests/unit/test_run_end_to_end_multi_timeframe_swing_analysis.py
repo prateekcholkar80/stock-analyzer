@@ -1,5 +1,6 @@
 import unittest
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from app.agents.bear_agent import BearDebateAgent
@@ -9,6 +10,7 @@ from app.agents.trade_planning_agent import (
     TradePlanningAgent,
     TradePlanningAgentConfig,
 )
+from app.analytics.cpr_policy import evaluate_cpr_trade_policy
 from app.commands.swing_analysis import JarvisSwingAnalysisCommandHandler
 from app.models.interaction import SwingAnalysisCommand
 from app.models.market import Candle, HistoricalCandleSeries, MarketQuote
@@ -328,6 +330,9 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
             MarketCondition.BULLISH,
         )
         self.assertIs(outcome.trade_decision.decision, TradeDecision.BUY)
+        self.assertIn("CPR policy", outcome.rationale)
+        self.assertIn("daily acceptance=True", outcome.rationale)
+        self.assertIn("daily narrow expansion=bullish", outcome.rationale)
         self.assertIs(plan.evaluation.direction, TradeDirection.LONG)
         self.assertEqual(plan.evaluation.minimum_reward_to_risk, 2.0)
         self.assertAlmostEqual(
@@ -363,6 +368,45 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
         self.assertEqual(
             outcome.trade_decision.no_trade_reasons,
             (NoTradeReason.TIMEFRAME_CONFLICT,),
+        )
+        self.assertIsNone(outcome.daily_planning_result)
+
+    def test_cpr_policy_blocker_stops_trade_before_daily_planning(self):
+        timeframes = _trending_timeframes()
+        review = AgentOrchestrator().run_multi_timeframe_analysis(timeframes)
+        assessment = evaluate_cpr_trade_policy(
+            review.evidence_package.daily.cpr,
+            review.evidence_package.weekly.cpr,
+        ).model_copy(
+            update={
+                "buy_eligible": False,
+                "blocking_reasons": (
+                    NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE,
+                ),
+                "rationale": "CPR policy test blocker.",
+            }
+        )
+
+        with patch(
+            "app.use_cases.build_multi_timeframe_long_trade_plan."
+            "evaluate_cpr_trade_policy",
+            return_value=assessment,
+        ):
+            result = _use_case(timeframes=timeframes).execute(
+                "NSE",
+                "2885",
+                "RELIANCE-EQ",
+                "ONE_HOUR",
+            )
+
+        outcome = result.trade_plan_result
+        self.assertIs(
+            outcome.disposition,
+            MultiTimeframeTradeDisposition.NO_TRADE,
+        )
+        self.assertEqual(
+            outcome.trade_decision.no_trade_reasons,
+            (NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE,),
         )
         self.assertIsNone(outcome.daily_planning_result)
 

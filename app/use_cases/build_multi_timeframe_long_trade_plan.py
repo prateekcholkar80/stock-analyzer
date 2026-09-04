@@ -1,5 +1,6 @@
 from math import isclose
 
+from app.analytics.cpr_policy import evaluate_cpr_trade_policy
 from app.exceptions import AgentSubmissionRejectedError
 from app.models.agentic import (
     AgenticSwingAnalysisResult,
@@ -102,6 +103,29 @@ class BuildMultiTimeframeLongTradePlan:
                 rationale=rationale,
             )
 
+        cpr_policy = evaluate_cpr_trade_policy(
+            package.daily.cpr,
+            package.weekly.cpr,
+        )
+        if not cpr_policy.buy_eligible:
+            rationale = (
+                "No BUY decision was issued because the deterministic CPR "
+                "confirmation policy found unresolved timing or structural "
+                f"risk. {cpr_policy.rationale}"
+            )
+            return MultiTimeframeLongTradePlanResult(
+                **common,
+                disposition=MultiTimeframeTradeDisposition.NO_TRADE,
+                reason=MultiTimeframeTradeReason.TIMEFRAME_SETUP_NOT_ALIGNED,
+                trade_decision=TradeDecisionOutcome(
+                    market_condition=MarketCondition.BULLISH,
+                    decision=TradeDecision.NO_TRADE,
+                    no_trade_reasons=cpr_policy.blocking_reasons,
+                    rationale=rationale,
+                ),
+                rationale=rationale,
+            )
+
         daily_submission = analysis.daily_submission
         daily_result = AgenticSwingAnalysisResult(
             orchestrator_id=self._orchestrator.orchestrator_id,
@@ -151,7 +175,8 @@ class BuildMultiTimeframeLongTradePlan:
         rationale = (
             "The final Judge and daily profile are bullish, and the "
             "deterministic planner found a structure-aware buy setup "
-            "with a feasible 1:2 minimum target."
+            "with a feasible 1:2 minimum target. "
+            f"{cpr_policy.rationale}"
         )
         return MultiTimeframeLongTradePlanResult(
             **common,

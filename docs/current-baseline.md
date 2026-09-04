@@ -6,7 +6,7 @@ natural-language routing, instrument resolution, workflow observability, and
 wake-activated conversation. It is the authoritative implementation baseline;
 `README.md` provides the shorter project-level view.
 
-Automated test count as of this writing: **2,171 Python tests** (`tests/unit` +
+Automated test count as of this writing: **2,213 Python tests** (`tests/unit` +
 `tests/integration`), **224 local Tijori MCP tests**, and **51 frontend tests**,
 all passing without live broker, provider, or LLM credentials. The frontend
 validation includes a production build under the pinned Node 24 runtime.
@@ -1181,6 +1181,35 @@ retests, role reversals, and failed breaks. Accumulation bands show lifecycle
 and confidence; liquidity markers show side, implication, breach, reclaim,
 availability, and volume multiple when available.
 
+### CPR analytical evidence and release policy
+
+On branch `feature/cpr-analysis-evidence`, CPR is also a first-class immutable
+technical record rather than only chart geometry. `app/analytics/cpr.py` uses
+IST period keys and completed observed source periods to calculate the pivot,
+ordered central range, point-in-time width percentile/regime, latest completed
+price position, consecutive acceptance, and lifecycle. The first observed
+archive period is excluded because it may be partial; width history excludes
+both the source and target periods. The record carries explicit source,
+availability, validity, evaluation and retrieval timestamps plus qualified
+timeframe evidence IDs and a deterministic fingerprint.
+
+Lifecycle states distinguish untested/inside conditions from bullish and
+bearish break, retest, rejection, reclaim, accepted and failed-break outcomes.
+`app/analytics/cpr_policy.py` deterministically compares daily and weekly CPR
+evidence, identifies narrow-range expansion and timeframe conflict, and emits
+typed no-trade reasons. CPR evidence is projected unchanged into the released
+daily/weekly evidence packages, debate prompts, Judge context, swing
+interpretation and Jarvis presentation. An LLM never calculates CPR and cannot
+alter its values or evidence identifiers.
+
+The current CPR release policy can block an otherwise bullish setup for
+incomplete daily acceptance, bearish conditions, a daily/weekly conflict, or a
+failed bullish break; it cannot independently create a BUY. The next policy
+milestone will place this record inside a hierarchical evidence-family model:
+market structure and price context remain primary, while ordinary CPR
+confirmation and other correlated OHLC-derived indicators remain supporting
+evidence and cannot accumulate equal independent votes.
+
 Overlay preferences are stored per timeframe in browser `localStorage`.
 Corrupt or unavailable local storage is ignored and does not block rendering.
 Legacy dashboard results missing the newer chart arrays are normalized to safe
@@ -1856,7 +1885,7 @@ stored under the file system's access and retention controls.
 cd frontend && npm test
 ```
 
-Current count: **2,171 Python tests**, **224 local Tijori MCP tests**, and **51
+Current count: **2,213 Python tests**, **224 local Tijori MCP tests**, and **51
 frontend tests**, fully offline at this release boundary.
 The frontend build currently emits a non-fatal advisory that the dynamically
 loaded Plotly chunk is larger than 500 kB after minification. Conventions to
@@ -1916,7 +1945,7 @@ preserve:
   need a prospective headless recorder; historical replay needs a separately
   licensed order/trade dataset. No `OrderFlowGateway`, recorder, storage schema,
   analyzer, agent, or backtest has been implemented.
-- **No debate/verdict *quality* eval harness.** 2,171 Python tests verify the
+- **No debate/verdict *quality* eval harness.** 2,213 Python tests verify the
   pipeline is *implemented correctly* (schemas, citations, determinism,
   chain-of-custody) — none of them score whether an argument was good or
   a verdict was right against what actually happened next. The
@@ -1998,6 +2027,14 @@ User-stated direction for where Jarvis is headed, not yet fully built:
 
 ## 8. Document History
 
+- **2026-09-05**: Promoted CPR from chart geometry into immutable daily/weekly
+  agent evidence with completed-period IST calculation, point-in-time width
+  regimes, price position, consecutive acceptance, full lifecycle states,
+  qualified evidence IDs, deterministic fingerprints, multi-timeframe policy,
+  debate/Judge projection, swing interpretation, trade-release integration and
+  Jarvis explanation. Revalidated **2,213 Python tests**; the first full-suite
+  attempt exposed a transient unchanged Tijori fake-stdio process failure, its
+  22-test module passed independently, and the complete rerun passed.
 - **2026-09-02**: Added complete JSON-first structured Growth Table, Balance
   Sheet, Profit and Loss, Cash Flow, Ratios, Quarterly Results, Peer Comparison,
   and Benchmarking Financials flows; provider-neutral adapters and cache

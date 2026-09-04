@@ -43,6 +43,10 @@ class NoTradeReason(StrEnum):
     MINIMUM_TARGET_BLOCKED = "minimum_target_blocked"
     INSUFFICIENT_REWARD_TO_RISK = "insufficient_reward_to_risk"
     JUDGE_REJECTED_BULLISH_CASE = "judge_rejected_bullish_case"
+    CPR_ACCEPTANCE_INCOMPLETE = "cpr_acceptance_incomplete"
+    CPR_BEARISH_RISK = "cpr_bearish_risk"
+    CPR_FAILED_BREAK_RISK = "cpr_failed_break_risk"
+    CPR_TIMEFRAME_CONFLICT = "cpr_timeframe_conflict"
 
 
 _CONDITION_REASON = {

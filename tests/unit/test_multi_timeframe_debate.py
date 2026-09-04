@@ -65,6 +65,29 @@ class MultiTimeframeDebateTests(unittest.TestCase):
         self.assertIn(self.weekly_support_id, serialized)
         self.assertIn("Immediate support", serialized)
         self.assertIn("Latest confirmed high", serialized)
+        for context in (self.package.weekly, self.package.daily):
+            self.assertIn(
+                f"basis={context.cpr.basis.value}",
+                serialized,
+            )
+            self.assertIn(
+                f"lifecycle={context.cpr.lifecycle_state.value}",
+                serialized,
+            )
+            self.assertIn(
+                f"position={context.cpr.price_position.value}",
+                serialized,
+            )
+            self.assertIn(
+                f"width_regime={context.cpr.width_regime.value}",
+                serialized,
+            )
+            for evidence_id in context.cpr.evidence_ids:
+                self.assertIn(evidence_id, serialized)
+                self.assertIn(
+                    evidence_id,
+                    valid_multi_timeframe_evidence_ids(self.package),
+                )
         self.assertIn(
             "Qualified accumulation and liquidity-sweep evidence",
             serialized,

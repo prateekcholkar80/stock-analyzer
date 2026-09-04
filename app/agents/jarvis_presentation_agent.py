@@ -615,6 +615,37 @@ class JarvisPresentationAgent:
 def _multi_findings(package) -> dict[str, dict]:
     findings: dict[str, dict] = {}
     for context in (package.weekly, package.daily):
+        if context.cpr is not None:
+            cpr = context.cpr
+            levels_id = f"{context.timeframe.value}:cpr.levels"
+            lifecycle_id = (
+                f"{context.timeframe.value}:cpr.lifecycle."
+                f"{cpr.lifecycle_state.value}"
+            )
+            findings[levels_id] = {
+                "evidence_id": levels_id,
+                "timeframe": context.timeframe,
+                "finding_type": "signal",
+                "name": "Central Pivot Range levels",
+                "fact_explanation": (
+                    f"Pivot {cpr.pivot:g}, BC {cpr.bottom_central:g}, TC "
+                    f"{cpr.top_central:g}; width {cpr.width_percentage:g}% "
+                    f"classified {cpr.width_regime.value}."
+                ),
+            }
+            findings[lifecycle_id] = {
+                "evidence_id": lifecycle_id,
+                "timeframe": context.timeframe,
+                "finding_type": "signal",
+                "name": "Central Pivot Range lifecycle",
+                "fact_explanation": (
+                    f"Completed close {cpr.current_price:g} is "
+                    f"{cpr.price_position.value} CPR with "
+                    f"{cpr.consecutive_acceptance_candles} consecutive "
+                    f"accepted closes; lifecycle is "
+                    f"{cpr.lifecycle_state.value}."
+                ),
+            }
         for item in context.evidence:
             findings[item.qualified_evidence_id] = {
                 "evidence_id": item.qualified_evidence_id,
@@ -669,6 +700,8 @@ def _context_finding_ids(context) -> frozenset[str]:
     identifiers = {
         item.qualified_evidence_id for item in context.evidence
     }
+    if context.cpr is not None:
+        identifiers.update(context.cpr.evidence_ids)
     identifiers.update(
         item.qualified_pivot_id for item in context.recent_confirmed_pivots
     )
