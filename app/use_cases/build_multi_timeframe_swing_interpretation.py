@@ -1,5 +1,9 @@
 from collections.abc import Iterable
 
+from app.analytics.cpr_policy import (
+    CPRDirectionalBias,
+    evaluate_cpr_trade_policy,
+)
 from app.models.accumulation import LiquidityPoolSide
 from app.models.agentic import TradePlanningReason
 from app.models.multi_timeframe_evidence import (
@@ -93,8 +97,12 @@ class BuildMultiTimeframeSwingInterpretation:
                 "timeframe profiles"
             )
 
+        cpr_policy = evaluate_cpr_trade_policy(
+            package.daily.cpr,
+            package.weekly.cpr,
+        )
         tactical = _tactical_readiness(decision)
-        structural = _structural_risk(weekly, decision)
+        structural = _structural_risk(weekly, decision, cpr_policy)
         risk_reward = _risk_reward(package.daily, trade_plan)
         decisive_ids = tuple(
             dict.fromkeys(
@@ -122,7 +130,7 @@ class BuildMultiTimeframeSwingInterpretation:
                 f"{daily.market_condition.value}, weekly is "
                 f"{weekly.market_condition.value}, and the resulting "
                 f"decision is {decision.decision.value}. "
-                f"{decision.rationale}"
+                f"{decision.rationale} {cpr_policy.rationale}"
             ),
             interpreted_at=max(daily.evaluated_at, weekly.evaluated_at),
         )
@@ -156,7 +164,8 @@ class BuildMultiTimeframeSwingInterpretation:
             ),
             rationale=(
                 f"The deterministic {context.timeframe.value} swing profile "
-                f"is {condition.value}. {profile.rationale}"
+                f"is {condition.value}. {profile.rationale} "
+                f"{_timeframe_cpr_rationale(context)}"
             ),
         )
 
@@ -831,7 +840,21 @@ def _decisive_evidence_ids(context, condition):
         ]
     if not selected:
         selected = list(context.evidence[:1])
-    return tuple(item.qualified_evidence_id for item in selected)
+    signal_ids = tuple(item.qualified_evidence_id for item in selected)
+    cpr_ids = context.cpr.evidence_ids if context.cpr is not None else ()
+    return tuple(dict.fromkeys(signal_ids + cpr_ids))
+
+
+def _timeframe_cpr_rationale(context):
+    cpr = context.cpr
+    if cpr is None:
+        return "CPR evidence is unavailable and was not inferred."
+    return (
+        f"CPR is {cpr.width_regime.value} with completed close "
+        f"{cpr.price_position.value}, acceptance count "
+        f"{cpr.consecutive_acceptance_candles}, and lifecycle "
+        f"{cpr.lifecycle_state.value}."
+    )
 
 
 def _tactical_readiness(decision):
@@ -851,15 +874,32 @@ def _tactical_readiness(decision):
         return TacticalReadiness.BLOCKED
     if NoTradeReason.DAILY_TRIGGER_INCOMPLETE in reasons:
         return TacticalReadiness.DEVELOPING
+    if NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE in reasons:
+        return TacticalReadiness.DEVELOPING
+    if reasons & {
+        NoTradeReason.CPR_BEARISH_RISK,
+        NoTradeReason.CPR_FAILED_BREAK_RISK,
+        NoTradeReason.CPR_TIMEFRAME_CONFLICT,
+    }:
+        return TacticalReadiness.BLOCKED
     return TacticalReadiness.READY
 
 
-def _structural_risk(weekly, decision):
+def _structural_risk(weekly, decision, cpr_policy):
     reasons = set(decision.no_trade_reasons)
     if NoTradeReason.STRUCTURAL_STOP_UNAVAILABLE in reasons:
         return StructuralRisk.HIGH
     if weekly.market_condition is MarketCondition.INSUFFICIENT:
         return StructuralRisk.UNKNOWN
+    if cpr_policy.weekly_bias is CPRDirectionalBias.BEARISH:
+        return StructuralRisk.PROHIBITIVE
+    if reasons & {
+        NoTradeReason.CPR_FAILED_BREAK_RISK,
+        NoTradeReason.CPR_TIMEFRAME_CONFLICT,
+    }:
+        return StructuralRisk.HIGH
+    if NoTradeReason.CPR_BEARISH_RISK in reasons:
+        return StructuralRisk.HIGH
     if weekly.market_condition is MarketCondition.BEARISH:
         return StructuralRisk.PROHIBITIVE
     if weekly.market_condition is MarketCondition.CONFLICTED:
@@ -999,5 +1039,21 @@ def _decision_change_conditions(decision):
             "objections."
         ),
         NoTradeReason.STALE_DATA: "Refresh market data before reassessment.",
+        NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE: (
+            "Wait for at least two completed daily closes above CPR, or a "
+            "confirmed bullish retest after acceptance."
+        ),
+        NoTradeReason.CPR_BEARISH_RISK: (
+            "Wait for the bearish CPR lifecycle to reverse and establish "
+            "completed-close acceptance above CPR."
+        ),
+        NoTradeReason.CPR_FAILED_BREAK_RISK: (
+            "Wait for the failed bullish CPR break to be reclaimed and then "
+            "confirmed by consecutive closes."
+        ),
+        NoTradeReason.CPR_TIMEFRAME_CONFLICT: (
+            "Wait for daily and weekly CPR direction to stop opposing each "
+            "other."
+        ),
     }
     return tuple(mapping[reason] for reason in decision.no_trade_reasons)

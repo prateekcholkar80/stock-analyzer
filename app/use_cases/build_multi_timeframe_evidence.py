@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from app.analytics.cpr import calculate_latest_cpr
 from app.analytics.support_resistance import (
     detect_support_resistance_zones,
 )
@@ -147,6 +148,11 @@ class BuildMultiTimeframeEvidence:
             evaluated_at=evaluated_at,
             current_close=current_close,
             accumulation=accumulation,
+            cpr=calculate_latest_cpr(
+                series,
+                timeframe=timeframe,
+                evaluated_at=evaluated_at,
+            ),
             evidence=tuple(
                 QualifiedTechnicalEvidence(
                     timeframe=timeframe,

@@ -355,6 +355,21 @@ class JarvisPresentationAgentTests(unittest.TestCase):
                 )
             ),
         )
+        cpr_findings = [
+            item
+            for item in explanation.technical_findings
+            if ":cpr." in item.evidence_id
+        ]
+        self.assertEqual(len(cpr_findings), 4)
+        self.assertTrue(
+            any(item.name == "Central Pivot Range levels" for item in cpr_findings)
+        )
+        self.assertTrue(
+            any(
+                item.name == "Central Pivot Range lifecycle"
+                for item in cpr_findings
+            )
+        )
 
     def test_multi_timeframe_bearish_verdict_is_presented_as_no_trade(self):
         result = _multi_use_case(winner="bearish").execute(

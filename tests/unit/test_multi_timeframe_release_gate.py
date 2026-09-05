@@ -89,6 +89,10 @@ class MultiTimeframeReleaseGateTests(unittest.TestCase):
             "daily_and_weekly_accumulation_verified",
             result.decision.passed_checks,
         )
+        self.assertIn(
+            "daily_and_weekly_cpr_verified",
+            result.decision.passed_checks,
+        )
 
     def test_builder_runs_only_after_parallel_result_is_complete(self):
         runner = _FixedTechnicalRunner(self.analysis)
@@ -126,6 +130,29 @@ class MultiTimeframeReleaseGateTests(unittest.TestCase):
             **(
                 decision.model_dump(exclude_computed_fields=True)
                 | {"passed_checks": ("multi_timeframe_package_schema_valid",)}
+            )
+        )
+
+        with self.assertRaisesRegex(ValidationError, "missing gate checks"):
+            MultiTimeframeEvidenceReview(
+                evidence_package=self.package,
+                decision=incomplete_decision,
+            )
+
+    def test_cannot_release_package_without_cpr_verification_check(self):
+        decision = AgentOrchestrator().judge.review_multi_timeframe(
+            self.package,
+            self.analysis,
+        )
+        without_cpr_check = tuple(
+            check
+            for check in decision.passed_checks
+            if check != "daily_and_weekly_cpr_verified"
+        )
+        incomplete_decision = JarvisJudgeDecision(
+            **(
+                decision.model_dump(exclude_computed_fields=True)
+                | {"passed_checks": without_cpr_check}
             )
         )
 
@@ -240,6 +267,35 @@ class MultiTimeframeReleaseGateTests(unittest.TestCase):
         self.assertIn(
             "weekly accumulation evidence does not match deterministic "
             "recalculation",
+            decision.reasons,
+        )
+
+    def test_judge_recomputes_cpr_before_debate_release(self):
+        forged_cpr = self.package.daily.cpr.model_copy(
+            update={"calculation_fingerprint": "f" * 64}
+        )
+        forged_daily = self.package.daily.model_copy(
+            update={"cpr": forged_cpr}
+        )
+        forged_package = MultiTimeframeEvidencePackage(
+            technical_analysis=self.analysis,
+            daily=forged_daily,
+            weekly=self.package.weekly,
+            package_fingerprint=multi_timeframe_evidence_fingerprint(
+                self.analysis,
+                forged_daily,
+                self.package.weekly,
+            ),
+        )
+
+        decision = AgentOrchestrator().judge.review_multi_timeframe(
+            forged_package,
+            self.analysis,
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertIn(
+            "daily CPR evidence does not match deterministic recalculation",
             decision.reasons,
         )
 

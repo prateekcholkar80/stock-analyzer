@@ -460,6 +460,10 @@ class MultiTimeframeSwingInterpretation(TechnicalModel):
                 NoTradeReason.DAILY_TRIGGER_INCOMPLETE,
                 NoTradeReason.BUY_SETUP_INVALIDATED,
                 NoTradeReason.JUDGE_REJECTED_BULLISH_CASE,
+                NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE,
+                NoTradeReason.CPR_BEARISH_RISK,
+                NoTradeReason.CPR_FAILED_BREAK_RISK,
+                NoTradeReason.CPR_TIMEFRAME_CONFLICT,
             }:
                 raise ValueError(
                     "unready bullish setup requires a tactical no-trade reason"
@@ -473,6 +477,9 @@ class MultiTimeframeSwingInterpretation(TechnicalModel):
                 NoTradeReason.ACTIVE_BEARISH_BREAK,
                 NoTradeReason.STRUCTURAL_STOP_UNAVAILABLE,
                 NoTradeReason.BUY_SETUP_INVALIDATED,
+                NoTradeReason.CPR_BEARISH_RISK,
+                NoTradeReason.CPR_FAILED_BREAK_RISK,
+                NoTradeReason.CPR_TIMEFRAME_CONFLICT,
             }:
                 raise ValueError(
                     "unsafe bullish structure requires a structural reason"

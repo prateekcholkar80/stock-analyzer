@@ -16,6 +16,7 @@ from app.agents.trade_planning_agent import (
 )
 from app.analytics.trade_execution import simulate_historical_trade
 from app.analytics.accumulation import detect_accumulation_zones
+from app.analytics.cpr import calculate_latest_cpr
 from app.exceptions import AgentSubmissionRejectedError
 from app.models.agentic import (
     AgenticHistoricalExecutionResult,
@@ -163,13 +164,15 @@ class JarvisSwingJudge:
         else:
             reasons.append("daily and weekly execution was not parallel")
         accumulation_verified = True
-        for label, submission, receipt, series, accumulation in (
+        cpr_verified = True
+        for label, submission, receipt, series, accumulation, context in (
             (
                 "daily",
                 analysis.daily_submission,
                 analysis.daily_validation,
                 analysis.timeframes.daily,
                 analysis.daily_accumulation,
+                evidence_package.daily,
             ),
             (
                 "weekly",
@@ -177,6 +180,7 @@ class JarvisSwingJudge:
                 analysis.weekly_validation,
                 analysis.timeframes.weekly,
                 analysis.weekly_accumulation,
+                evidence_package.weekly,
             ),
         ):
             _, recomputed_checks, submission_reasons = (
@@ -217,11 +221,24 @@ class JarvisSwingJudge:
                     f"{label} accumulation evidence does not match "
                     "deterministic recalculation"
                 )
+            expected_cpr = calculate_latest_cpr(
+                series,
+                timeframe=context.timeframe,
+                evaluated_at=submission.evaluated_at,
+            )
+            if context.cpr != expected_cpr:
+                cpr_verified = False
+                reasons.append(
+                    f"{label} CPR evidence does not match deterministic "
+                    "recalculation"
+                )
 
         if accumulation_verified:
             passed_checks.append(
                 "daily_and_weekly_accumulation_verified"
             )
+        if cpr_verified:
+            passed_checks.append("daily_and_weekly_cpr_verified")
 
         daily_ids = {
             item.qualified_evidence_id

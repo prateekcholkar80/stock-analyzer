@@ -1,11 +1,54 @@
 # Jarvis Implementation Continuation Handoff
 
-Last updated: **2026-09-02 (Asia/Kolkata)**
+Last updated: **2026-09-05 (Asia/Kolkata)**
 
 Use this file to resume implementation without relying on chat history. The
 authoritative architectural detail remains in `docs/current-baseline.md`; this
 document captures the current decisions, exact executable path, validation
 evidence, local artifacts, known gaps, and recommended next work.
+
+## Current CPR Release Candidate
+
+Branch `feature/cpr-analysis-evidence` promotes CPR from a chart-only overlay
+to immutable, provider-neutral analytical evidence. Daily analysis derives its
+CPR from the preceding completed observed week; weekly analysis derives it
+from the preceding completed observed month. Period boundaries are calculated
+in `Asia/Kolkata`, the archive-boundary period is excluded, a later target
+period proves that the source period completed, and width classification uses
+only earlier comparable periods. Target-period extremes cannot alter the
+source CPR or its historical width rank.
+
+`CPRAnalysisRecord` preserves source OHLC, source/availability/validity times,
+the pivot and ordered central range, width percentage and point-in-time
+percentile regime, completed-candle price position, consecutive acceptance,
+lifecycle state, qualified daily/weekly evidence IDs, retrieval lineage, and
+a deterministic calculation fingerprint. Lifecycle coverage includes
+breakout, breakdown, retest, rejection, reclaim, failed break, acceptance,
+inside-range and untested states.
+
+The daily and weekly evidence packages carry their own CPR records into Bull,
+Bear and Judge prompts without allowing an LLM to calculate or modify them.
+The deterministic swing interpretation exposes CPR direction, confluence,
+narrow-range expansion and explicit no-trade reasons. The current release
+policy treats incomplete daily bullish acceptance, bearish CPR conditions,
+daily/weekly conflict and failed bullish breaks as possible blockers; CPR can
+confirm or block an otherwise-qualified setup but cannot create a BUY.
+
+Phase 1 must revisit only the *policy role*, not the calculation contract: the
+newly agreed hierarchy makes market structure and price context primary, with
+CPR and correlated indicators serving as supporting evidence. Ordinary CPR
+non-confirmation must not be counted as an equal independent vote. Clear
+adverse lifecycle evidence may remain a risk condition after the hierarchical
+evidence-family and anti-double-counting rules are formalized.
+
+Focused validation on 2026-09-05 passed 36 CPR calculation/model/policy tests
+and 75 affected evidence, interpretation, presentation, debate, release,
+end-to-end and trade-decision tests. Changed CPR modules compile successfully
+and `git diff --check` is clean. The complete offline Python regression then
+passed all 2,213 tests. An initial full-suite attempt encountered two transient
+fake-process failures in the unchanged Tijori stdio transport tests; that
+module passed all 22 tests in isolation and the immediate complete-suite rerun
+was green.
 
 ## Current Structured-Fundamentals Release Candidate
 
@@ -1129,35 +1172,38 @@ the established composition without an explicit design-revision request:
 
 ## 12. Recommended Next Steps, One at a Time
 
-1. Promote CPR from a chart-only prior-period overlay into a provider-neutral,
-   look-ahead-safe `CPRAnalysisRecord`: width regime, price location,
-   acceptance, breakout/retest/rejection/failed-break lifecycle, qualified
-   evidence IDs, and daily-weekly swing confluence.
-2. Add versioned project-owned runtime skills for Bull, Bear, the existing
+1. Finish Phase 0 for the current CPR release candidate: inspect the final
+   branch diff and prepare it for explicit staging/commit approval.
+2. Introduce the hierarchical evidence-family policy: market structure and
+   price context first; participation, trend, momentum, CPR and candlesticks as
+   correlated supporting evidence; entry trigger and realistic 2R/3R space as
+   mandatory release gates. Prevent correlated OHLC-derived signals from being
+   counted as independent votes.
+3. Add versioned project-owned runtime skills for Bull, Bear, the existing
    Judge, and the Fundamental Analyst. Enforce allowed evidence, required
    citations, output schemas, abstention, skill version/hash audit, and
    provider-neutral LLM composition.
-3. Build the deterministic normalized fundamental metric engine and preliminary
+4. Build the deterministic normalized fundamental metric engine and preliminary
    scorecard from the cached structured JSON, explicitly excluding annual
    reports and qualitative management/moat conclusions.
-4. Add database-agnostic repository models/ports for the complete
+5. Add database-agnostic repository models/ports for the complete
    `MultiTimeframeEndToEndSwingAnalysisResult`, then implement in-memory and
    DuckDB adapters with normalized daily/weekly evidence, verdict, trade plan,
    and presentation tables.
-5. Persist the completed dashboard aggregate and add historical-run queries;
+6. Persist the completed dashboard aggregate and add historical-run queries;
    the live completed-operation read model is implemented.
-6. If genuine order flow is prioritized, define a database-neutral
+7. If genuine order flow is prioritized, define a database-neutral
    `MarketMicrostructureGateway`/`OrderFlowGateway` and immutable tick/book
    contracts before selecting Angel best-five prospective capture or licensed
    historical NSE order/trade data. Never backfill “real order flow” from
    candles.
-7. Browser microphone capture, speech-to-text, the provider-neutral TTS/STT
+8. Browser microphone capture, speech-to-text, the provider-neutral TTS/STT
    ports, and the Google/ElevenLabs adapters are implemented. Remaining audio
    work: exercise the adapters and catalog downloads against live
    endpoints/credentials, add an acoustic wake-word engine, and add rate
    limiting to `/speech` and `/transcribe` — all while keeping transcript
    handling and financial logic vendor-neutral.
-8. Annual-report ingestion, citation-preserving RAG, and qualitative
+9. Annual-report ingestion, citation-preserving RAG, and qualitative
    management/moat analysis remain explicitly deferred from the current
    fundamental milestone.
 

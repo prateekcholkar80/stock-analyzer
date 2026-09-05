@@ -14,6 +14,7 @@ from app.models.analysis_timeframe import (
     SwingAnalysisTimeframe,
     timeframe_interval,
 )
+from app.models.cpr import CPRAnalysisRecord
 from app.models.market import HistoricalCandleSeries
 from app.models.price_action import (
     PriceZoneLifecycleStatus,
@@ -36,6 +37,7 @@ MULTI_TIMEFRAME_RELEASE_CHECKS = frozenset(
         "daily_technical_submission_approved",
         "weekly_technical_submission_approved",
         "daily_and_weekly_accumulation_verified",
+        "daily_and_weekly_cpr_verified",
         "complete_daily_and_weekly_evidence",
         "timeframe_evidence_ids_disjoint",
         "timeframe_lineage_verified",
@@ -176,6 +178,7 @@ class TimeframeTechnicalEvidenceContext(TechnicalModel):
     evaluated_at: datetime
     current_close: float = Field(gt=0)
     accumulation: TimeframeAccumulationAnalysis
+    cpr: CPRAnalysisRecord | None = None
     evidence: tuple[QualifiedTechnicalEvidence, ...] = Field(min_length=1)
     recent_confirmed_pivots: tuple[ConfirmedPivotSummary, ...] = ()
     latest_confirmed_high: ConfirmedPivotSummary | None = None
@@ -209,6 +212,16 @@ class TimeframeTechnicalEvidenceContext(TechnicalModel):
             raise ValueError(
                 "accumulation analysis must match its timeframe context"
             )
+        if self.cpr is not None:
+            if (
+                self.cpr.timeframe is not self.timeframe
+                or self.cpr.interval != self.interval
+                or self.cpr.evaluated_at != self.evaluated_at
+                or not isclose(self.cpr.current_price, self.current_close)
+            ):
+                raise ValueError(
+                    "CPR analysis must match its timeframe context"
+                )
         evidence_ids = [item.qualified_evidence_id for item in self.evidence]
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("timeframe evidence ids must be unique")
@@ -380,6 +393,27 @@ class MultiTimeframeEvidencePackage(TechnicalModel):
             raise ValueError(
                 "context accumulation must match its assigned market series"
             )
+        if context.cpr is not None:
+            cpr_identity = (
+                context.cpr.exchange,
+                context.cpr.symbol_token,
+                context.cpr.symbol,
+                context.cpr.interval,
+                context.cpr.source,
+                context.cpr.source_retrieved_at,
+            )
+            expected_cpr_identity = (
+                series.exchange,
+                series.symbol_token,
+                series.symbol,
+                series.interval,
+                series.source,
+                series.retrieved_at,
+            )
+            if cpr_identity != expected_cpr_identity:
+                raise ValueError(
+                    "context CPR must match its assigned market series"
+                )
         available = [
             candle
             for candle in series.candles

@@ -16,6 +16,25 @@ from app.models.multi_timeframe_trade import (
 
 
 class TradeDecisionOutcomeTests(unittest.TestCase):
+    def test_bullish_no_trade_accepts_explicit_cpr_policy_blockers(self):
+        decision = TradeDecisionOutcome(
+            market_condition=MarketCondition.BULLISH,
+            decision=TradeDecision.NO_TRADE,
+            no_trade_reasons=(
+                NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE,
+                NoTradeReason.CPR_TIMEFRAME_CONFLICT,
+            ),
+            rationale="CPR confirmation is incomplete and conflicted.",
+        )
+
+        self.assertEqual(
+            decision.no_trade_reasons,
+            (
+                NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE,
+                NoTradeReason.CPR_TIMEFRAME_CONFLICT,
+            ),
+        )
+
     def test_accepts_buy_only_for_bullish_market_condition(self):
         outcome = TradeDecisionOutcome(
             market_condition=MarketCondition.BULLISH,

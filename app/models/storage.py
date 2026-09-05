@@ -481,6 +481,8 @@ class MultiTimeframeEndToEndSwingAnalysisResult(StorageModel):
                 for pivot in context.recent_confirmed_pivots
             )
             for context in (package.daily, package.weekly):
+                if context.cpr is not None:
+                    available_evidence.update(context.cpr.evidence_ids)
                 for zone in context.accumulation.zones:
                     available_evidence.add(zone.zone_id)
                     available_evidence.update(zone.evidence_ids)

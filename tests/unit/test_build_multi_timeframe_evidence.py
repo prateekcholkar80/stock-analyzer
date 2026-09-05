@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
+from app.analytics.cpr import calculate_latest_cpr
 from app.models.market import Candle, HistoricalCandleSeries
 from app.models.multi_timeframe_evidence import (
     MultiTimeframeEvidencePackage,
@@ -146,6 +147,17 @@ class BuildMultiTimeframeEvidenceTests(unittest.TestCase):
 
     def test_exposes_confirmed_pivots_and_immediate_levels(self):
         for context in (self.package.daily, self.package.weekly):
+            self.assertIsNotNone(context.cpr)
+            self.assertEqual(context.cpr.timeframe, context.timeframe)
+            self.assertEqual(context.cpr.interval, context.interval)
+            self.assertEqual(context.cpr.evaluated_at, context.evaluated_at)
+            self.assertEqual(context.cpr.current_price, context.current_close)
+            self.assertTrue(
+                all(
+                    evidence_id.startswith(f"{context.timeframe.value}:")
+                    for evidence_id in context.cpr.evidence_ids
+                )
+            )
             self.assertIsNotNone(context.latest_confirmed_high)
             self.assertIsNotNone(context.latest_confirmed_low)
             self.assertIsNotNone(context.nearest_support)
@@ -169,6 +181,33 @@ class BuildMultiTimeframeEvidenceTests(unittest.TestCase):
             self.assertGreaterEqual(
                 context.nearest_resistance.lifecycle.zone.upper_price,
                 context.current_close,
+            )
+
+    def test_validates_optional_cpr_context_and_market_lineage(self):
+        context = self.package.daily
+        cpr = calculate_latest_cpr(
+            self.analysis.timeframes.daily,
+            timeframe=SwingAnalysisTimeframe.DAILY,
+            evaluated_at=context.evaluated_at,
+        )
+        projected = context.__class__(
+            **(
+                context.model_dump(exclude_computed_fields=True)
+                | {"cpr": cpr}
+            )
+        )
+
+        self.assertEqual(projected.cpr.current_price, context.current_close)
+        with self.assertRaisesRegex(ValidationError, "timeframe context"):
+            context.__class__(
+                **(
+                    context.model_dump(exclude_computed_fields=True)
+                    | {
+                        "cpr": cpr.model_copy(
+                            update={"current_price": cpr.current_price + 1}
+                        )
+                    }
+                )
             )
 
     def test_absent_market_structure_is_explicitly_none(self):

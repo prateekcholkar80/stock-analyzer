@@ -286,6 +286,26 @@ class TimeframeInterpretationContractTests(unittest.TestCase):
             RewardRiskFeasibility.BLOCKED_BY_STRUCTURE,
         )
 
+    def test_bullish_no_trade_accepts_cpr_acceptance_blocker(self):
+        decision = TradeDecisionOutcome(
+            market_condition=MarketCondition.BULLISH,
+            decision=TradeDecision.NO_TRADE,
+            no_trade_reasons=(
+                NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE,
+            ),
+            rationale="Daily CPR acceptance is incomplete.",
+        )
+
+        interpretation = self.build_combined(
+            tactical_readiness=TacticalReadiness.DEVELOPING,
+            trade_decision=decision,
+        )
+
+        self.assertIs(
+            interpretation.trade_decision.decision,
+            TradeDecision.NO_TRADE,
+        )
+
     def test_timeframe_contract_rejects_assignment_and_evidence_errors(self):
         daily = self.build_timeframe(
             SwingAnalysisTimeframe.DAILY,

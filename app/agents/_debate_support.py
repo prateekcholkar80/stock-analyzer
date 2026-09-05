@@ -48,6 +48,8 @@ def valid_multi_timeframe_evidence_ids(
         for item in context.evidence
     }
     for context in (package.weekly, package.daily):
+        if context.cpr is not None:
+            identifiers.update(context.cpr.evidence_ids)
         identifiers.update(
             item.qualified_pivot_id
             for item in context.recent_confirmed_pivots
@@ -113,6 +115,7 @@ def _serialize_timeframe_context(
         ),
         f"Profile rationale: {profile.rationale}",
         f"Current completed-candle close: {context.current_close}",
+        _serialize_cpr(context),
         _serialize_zone("Immediate support", context.nearest_support),
         _serialize_zone("Immediate resistance", context.nearest_resistance),
         _serialize_latest_pivot("Latest confirmed high", context.latest_confirmed_high),
@@ -144,6 +147,35 @@ def _serialize_timeframe_context(
             for item in context.recent_confirmed_pivots
         )
     return "\n".join(lines)
+
+
+def _serialize_cpr(context: TimeframeTechnicalEvidenceContext) -> str:
+    cpr = context.cpr
+    if cpr is None:
+        return "CPR evidence: unavailable; do not infer CPR levels or state."
+    percentile = (
+        "unavailable"
+        if cpr.width_percentile is None
+        else str(cpr.width_percentile)
+    )
+    return (
+        "CPR evidence: "
+        f"ids={list(cpr.evidence_ids)} "
+        f"basis={cpr.basis.value} "
+        f"source_period={cpr.source_period_started_at.isoformat()}.."
+        f"{cpr.source_period_ended_at.isoformat()} "
+        f"pivot={cpr.pivot} bottom={cpr.bottom_central} "
+        f"top={cpr.top_central} "
+        f"width_pct={cpr.width_percentage} "
+        f"width_percentile={percentile} "
+        f"width_sample_count={cpr.width_sample_count} "
+        f"width_regime={cpr.width_regime.value} "
+        f"completed_close={cpr.current_price} "
+        f"position={cpr.price_position.value} "
+        f"consecutive_acceptance_candles="
+        f"{cpr.consecutive_acceptance_candles} "
+        f"lifecycle={cpr.lifecycle_state.value}"
+    )
 
 
 def _serialize_accumulation(

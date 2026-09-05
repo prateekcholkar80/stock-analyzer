@@ -156,6 +156,23 @@ class BuildMultiTimeframeSwingInterpretationTests(unittest.TestCase):
             interpretation.risk_reward.target_2r.feasibility,
             RewardRiskFeasibility.FEASIBLE,
         )
+        for context, interpreted in (
+            (
+                self.actionable.technical_review.evidence_package.daily,
+                interpretation.daily,
+            ),
+            (
+                self.actionable.technical_review.evidence_package.weekly,
+                interpretation.weekly,
+            ),
+        ):
+            for evidence_id in context.cpr.evidence_ids:
+                self.assertIn(
+                    evidence_id,
+                    interpreted.decisive_evidence_ids,
+                )
+            self.assertIn("CPR is narrow", interpreted.rationale)
+        self.assertIn("CPR policy", interpretation.rationale)
 
     def test_judge_cannot_rewrite_bullish_timeframe_character(self):
         result = _use_case(
