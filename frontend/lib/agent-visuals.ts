@@ -61,12 +61,13 @@ export const PARKED_AGENT_VISUAL_KEYS = Object.freeze([
 ] satisfies AgentVisualKey[]);
 
 export function agentVisualState(status: ProgressStatus): AgentVisualState {
-  return {
+  const states: Record<ProgressStatus, AgentVisualState> = {
     standby: "idle",
     active: "acquiring",
     complete: "linked",
     failed: "fault",
-  }[status];
+  };
+  return states[status];
 }
 
 function agent(

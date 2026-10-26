@@ -121,8 +121,10 @@ class _ApiHandler:
         blocking=False,
         structured_entry=None,
         benchmarking_entry=None,
+        clock=None,
     ):
         self.blocking = blocking
+        self.clock = clock or (lambda: datetime.now(IST))
         self.calls = 0
         self.started = threading.Event()
         self.release = threading.Event()
@@ -150,7 +152,7 @@ class _ApiHandler:
                 operation_id=request.operation_id,
                 session_id=request.session_id,
                 kind=request.kind,
-                completed_at=datetime.now(IST),
+                completed_at=self.clock(),
                 judge_follow_up=JudgeFollowUpAnswer(
                     question=request.message,
                     answer="Weekly support remains at the cited support zone.",
@@ -161,10 +163,10 @@ class _ApiHandler:
                     ),
                     judge_agent_id="jarvis.debate_judge_agent.v1",
                     model_id="fake-judge",
-                    generated_at=datetime.now(IST),
+                    generated_at=self.clock(),
                 ),
             )
-        reference_time = datetime.now(IST)
+        reference_time = self.clock()
         if self.structured_entry is None:
             reference_values = {
                 "cache_entry_id": "financial_document:aaaaaaaa",
@@ -218,7 +220,7 @@ class _ApiHandler:
             operation_id=request.operation_id,
             session_id=request.session_id,
             kind=request.kind,
-            completed_at=datetime.now(IST),
+            completed_at=self.clock(),
             research_response=JarvisSwingAnalysisResponse.completed(
                 operation_id=request.operation_id,
                 result=self.result,
@@ -278,15 +280,6 @@ class JarvisHttpApiTests(unittest.TestCase):
         self.registry = InMemoryBrowserOperationRegistry()
         self.results = InMemoryBrowserOperationResultStore()
         self.structured_entry = build_entry()
-        self.document_clock = MutableClock(
-            self.structured_entry.stored_at + timedelta(minutes=1)
-        )
-        self.structured_documents = (
-            InMemoryStructuredFinancialDocumentRepository(
-                clock=self.document_clock,
-                initial_entries=(self.structured_entry,),
-            )
-        )
         connection = ProviderConnectionScope(
             tenant_id="tenant.prateek",
             provider_connection_id="provider.tijori.prateek",
@@ -307,20 +300,43 @@ class JarvisHttpApiTests(unittest.TestCase):
             benchmark_result,
             stored_at=benchmark_result.completed_at + timedelta(seconds=1),
         )
+        # Both fixture records must exist and be unexpired at the shared time.
+        self.document_clock = MutableClock(
+            max(
+                self.structured_entry.stored_at,
+                self.benchmarking_entry.stored_at,
+            ) + timedelta(minutes=1)
+        )
+        self.assertLess(
+            self.document_clock.now,
+            min(
+                self.structured_entry.expires_at,
+                self.benchmarking_entry.expires_at,
+            ),
+        )
+        self.structured_documents = (
+            InMemoryStructuredFinancialDocumentRepository(
+                clock=self.document_clock,
+                initial_entries=(self.structured_entry,),
+            )
+        )
         self.benchmarking_documents = (
             InMemoryBenchmarkingFinancialsRepository(
+                clock=self.document_clock,
                 initial_entries=(self.benchmarking_entry,)
             )
         )
         self.handler = _ApiHandler(
             structured_entry=self.structured_entry,
             benchmarking_entry=self.benchmarking_entry,
+            clock=self.document_clock,
         )
         self.runner = AsyncBrowserOperationRunner(
             self.registry,
             self.handler,
             self.results,
             max_workers=1,
+            clock=self.document_clock,
         )
         self.authorizer = InMemoryBrowserSessionAuthorizer()
         self.provider_sessions = _ProviderSessions()
@@ -352,6 +368,7 @@ class JarvisHttpApiTests(unittest.TestCase):
             create_jarvis_http_app(
                 self.runner,
                 conversation=self.conversation,
+                clock=self.document_clock,
                 provider_sessions=self.provider_sessions,
                 provider_connection_scope_resolver=self.resolve_scope,
                 browser_session_ownership=self.connection_registry,
@@ -850,6 +867,42 @@ class JarvisHttpApiTests(unittest.TestCase):
             headers=self._headers(token),
         )
         self.assertEqual(unavailable.status_code, 410)
+
+    def test_document_references_expire_at_the_exact_boundary(self):
+        session_id, token = self._session()
+        operations_path = f"/api/v1/sessions/{session_id}/operations"
+        self.client.post(
+            operations_path,
+            json=self._operation_body(),
+            headers=self._headers(token),
+        )
+        self._wait_for_status(session_id, token, "operation-1", "completed")
+
+        for resource, entry in (
+            ("financial-documents", self.structured_entry),
+            ("benchmarking-financials", self.benchmarking_entry),
+        ):
+            document_path = (
+                f"{operations_path}/operation-1/{resource}/"
+                f"{entry.cache_key.cache_entry_id}"
+            )
+            for offset, expected_status in (
+                (timedelta(microseconds=-1), 200),
+                (timedelta(0), 410),
+                (timedelta(microseconds=1), 410),
+            ):
+                with self.subTest(resource=resource, offset=offset):
+                    self.document_clock.now = entry.expires_at + offset
+                    response = self.client.get(
+                        document_path,
+                        headers=self._headers(token),
+                    )
+                    self.assertEqual(response.status_code, expected_status)
+                    if expected_status == 200:
+                        self.assertEqual(
+                            response.json()["reference"]["cache_entry_id"],
+                            entry.cache_key.cache_entry_id,
+                        )
 
     def test_completed_analysis_exposes_dashboard_read_model(self):
         session_id, token = self._session()

@@ -21,7 +21,7 @@ button,input { font:inherit; } button { color:inherit; }
 .command-deck { min-height:680px; display:grid; grid-template-columns:minmax(270px,340px) minmax(400px,1fr) minmax(270px,340px); align-items:center; gap:clamp(20px,3.2vw,58px); padding:42px 0 30px; }
 .command-deck>.agent-column,.command-deck>.reactor-zone { position:relative; z-index:2; }
 .communication-network { position:absolute; z-index:1; inset:42px 0 30px; overflow:hidden; pointer-events:none; }
-.communication-link { --signal:var(--cyan); position:absolute; display:block; width:29%; height:20px; opacity:.22; transform-origin:0 50%; transition:opacity .3s,filter .3s; }
+.communication-link { --signal:var(--cyan); position:absolute; display:block; width:29%; height:20px; opacity:.22; transform-origin:0 50%; transition:opacity .3s,filter .3s; pointer-events:none; }
 .communication-track { position:absolute; inset:9px 0 auto; height:1px; background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--signal),transparent 35%) 14% 86%,transparent); }
 .communication-track::after { content:""; position:absolute; inset:-2px 10% auto; height:5px; opacity:.36; background:repeating-linear-gradient(90deg,var(--signal) 0 2px,transparent 2px 11px); mask-image:linear-gradient(90deg,transparent,#000 18% 82%,transparent); }
 .signal-packet { position:absolute; z-index:2; top:6px; left:0; width:7px; height:7px; border-radius:50%; opacity:0; background:var(--signal); box-shadow:0 0 7px var(--signal),0 0 15px color-mix(in srgb,var(--signal),transparent 28%); }

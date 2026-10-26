@@ -12,6 +12,7 @@ from app.models.fundamental_storage import (
     FundamentalRepositoryScope,
     FundamentalSnapshotQuery,
 )
+from app.models.storage import market_series_summary, stored_market_series
 from app.storage.adapters.duckdb import DuckDBJarvisStorage
 from app.storage.adapters.fundamental_in_memory import (
     InMemoryFundamentalSnapshotRepository,
@@ -33,6 +34,7 @@ from tests.unit.test_fundamental_storage_contracts import (
     build_stored,
     rebuild,
 )
+from tests.unit.test_storage_adapters import _market_series
 
 
 FUNDAMENTAL_TABLES = {
@@ -75,7 +77,8 @@ class DuckDBFundamentalSnapshotRepositoryTests(unittest.TestCase):
     def test_implements_contract_and_creates_current_schema(self):
         with self.storage() as storage:
             self.assertIsInstance(storage, FundamentalSnapshotRepository)
-            self.assertEqual(storage.schema_version, 6)
+            self.assertEqual(storage.schema_version, 9)
+            expected_version = str(storage.schema_version)
 
         connection = duckdb.connect(str(self.database), read_only=True)
         try:
@@ -90,7 +93,7 @@ class DuckDBFundamentalSnapshotRepositoryTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(version, "6")
+        self.assertEqual(version, expected_version)
         self.assertTrue(FUNDAMENTAL_TABLES.issubset(tables))
 
     def test_persists_envelope_and_normalized_evidence_relations(self):
@@ -633,6 +636,9 @@ class DuckDBFundamentalSnapshotRepositoryTests(unittest.TestCase):
                 )
 
     def test_migrates_version_three_database_without_provider_access(self):
+        market = stored_market_series(
+            _market_series(), stored_at=self.clock.now,
+        )
         connection = duckdb.connect(str(self.database))
         try:
             connection.execute(
@@ -644,10 +650,39 @@ class DuckDBFundamentalSnapshotRepositoryTests(unittest.TestCase):
                 "INSERT INTO jarvis_storage_metadata VALUES (?, ?)",
                 ["schema_version", "3"],
             )
+            # Seed the legacy envelope directly, without initializing v9 first.
+            connection.execute(
+                "CREATE TABLE jarvis_market_series ("
+                "dataset_id VARCHAR PRIMARY KEY, "
+                "payload_fingerprint VARCHAR NOT NULL, "
+                "stored_at TIMESTAMPTZ NOT NULL, exchange VARCHAR NOT NULL, "
+                "symbol_token VARCHAR NOT NULL, interval VARCHAR NOT NULL, "
+                "source VARCHAR NOT NULL, summary_json VARCHAR NOT NULL, "
+                "payload_json VARCHAR NOT NULL, instrument_id VARCHAR, "
+                "symbol VARCHAR)"
+            )
+            connection.execute(
+                "INSERT INTO jarvis_market_series "
+                "(dataset_id, payload_fingerprint, stored_at, exchange, "
+                "symbol_token, interval, source, summary_json, payload_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    market.dataset_id,
+                    market.payload_fingerprint,
+                    market.stored_at,
+                    market.series.exchange,
+                    market.series.symbol_token,
+                    market.series.interval,
+                    market.series.source,
+                    market_series_summary(market).model_dump_json(),
+                    market.model_dump_json(),
+                ],
+            )
         finally:
             connection.close()
 
         with self.storage() as migrated:
+            self.assertEqual(migrated.schema_version, 9)
             version = migrated._connection.execute(
                 "SELECT metadata_value FROM jarvis_storage_metadata "
                 "WHERE metadata_key = 'schema_version'"
@@ -658,9 +693,26 @@ class DuckDBFundamentalSnapshotRepositoryTests(unittest.TestCase):
                     "SHOW TABLES"
                 ).fetchall()
             }
+            self.assertEqual(migrated.get_market_series(market.dataset_id), market)
+            saved = migrated.save_fundamental_snapshot(build_stored())
 
-        self.assertEqual(version, "6")
+        self.assertEqual(version, "9")
         self.assertTrue(FUNDAMENTAL_TABLES.issubset(tables))
+        with self.storage() as reopened:
+            self.assertEqual(reopened.get_market_series(market.dataset_id), market)
+            self.assertEqual(
+                reopened.get_fundamental_snapshot(
+                    saved.cache_key, scope=self.scope, as_of=self.clock.now,
+                ),
+                saved,
+            )
+            self.assertEqual(
+                reopened._connection.execute(
+                    "SELECT metadata_value FROM jarvis_storage_metadata "
+                    "WHERE metadata_key = 'schema_version'"
+                ).fetchone()[0],
+                "9",
+            )
 
     def test_concurrent_identical_and_conflicting_saves_are_atomic(self):
         first = build_stored()

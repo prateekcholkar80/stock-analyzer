@@ -43,10 +43,15 @@ class DuckDBBenchmarkingFinancialsRepositoryTests(unittest.TestCase):
     def test_implements_port_and_creates_indexed_table(self):
         with self.storage() as storage:
             self.assertIsInstance(storage, BenchmarkingFinancialsRepository)
-            self.assertEqual(storage.schema_version, 5)
+            self.assertEqual(storage.schema_version, 9)
+            expected_version = str(storage.schema_version)
 
         connection = duckdb.connect(str(self.database), read_only=True)
         try:
+            version = connection.execute(
+                "SELECT metadata_value FROM jarvis_storage_metadata "
+                "WHERE metadata_key = 'schema_version'"
+            ).fetchone()[0]
             tables = {
                 row[0] for row in connection.execute("SHOW TABLES").fetchall()
             }
@@ -60,6 +65,7 @@ class DuckDBBenchmarkingFinancialsRepositoryTests(unittest.TestCase):
         finally:
             connection.close()
 
+        self.assertEqual(version, expected_version)
         self.assertIn("jarvis_benchmarking_financials", tables)
         self.assertTrue(
             {

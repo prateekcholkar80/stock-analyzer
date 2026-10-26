@@ -7,6 +7,235 @@ authoritative architectural detail remains in `docs/current-baseline.md`; this
 document captures the current decisions, exact executable path, validation
 evidence, local artifacts, known gaps, and recommended next work.
 
+## PR #3 merge preparation — 2026-10-26
+
+The user authorized committing and pushing the accumulated fixes, updating
+PR #3 for review, and merging it into `main` with a merge commit. The original
+checkpoint `28dab46` and its branch are to be retained for revisiting this
+state. The fetched `origin/main` remains `ff8050f`; no integration changes or
+repeat regression run are needed before publishing the tested fixes.
+
+Final evidence: **2,865 Python tests**, **75 frontend tests** and the production
+build passed; TypeScript and changed-TypeScript-file lint passed; package/
+analyst split and normal wake-button clicks passed deterministic browser
+verification. Whitespace checks pass across the complete PR diff. A limited
+credential-pattern and artifact-path scan of the 233-file PR inventory found
+no matches. It is not a comprehensive security or independent code review.
+Ignored local screenshots, test logs, downloaded PDFs, databases and sessions
+remain outside Git. Live provider/LLM validation was not run for this merge.
+
+This handoff is included in the fix commit before publication; the merge SHA
+is recorded by the GitHub PR and the completion report. Earlier sections below
+describe the historical unstaged state. After publication and merge, resume
+from a clean local `main`. No deployment is included. Single recommended next
+step after merge: prepare the provider-neutral forecasting experiment contract
+before installing Kronos or downloading model weights.
+
+## PR #3 wake-button remediation and final validation — 2026-10-26
+
+The decorative `.communication-link` rule in `frontend/app/globals.css` now
+sets `pointer-events:none`. Links and their inherited decorative descendants
+remain visible while pointer hit-testing reaches the underlying controls.
+This resolves the desktop reactor wake-button interception discovered below
+without changing conversation, workflow or backend logic.
+
+The actual frontend was exercised against the loopback-only fixture API with
+normal animations enabled at 1600px, 1280px and 390px viewport widths. At each
+width, browser hit-testing reached the wake button, a normal unforced click
+returned HTTP 200 with conversation outcome `activated`, and the UI changed to
+`listening` with the analysis input enabled. All link pointer styles were
+`none`; no browser JavaScript errors or external requests were observed.
+Desktop/mobile screenshots were inspected and are ignored under
+`logs/visual-qa/wake-button-2026-10-26/`, with a JSON report. The temporary
+harness is `/private/tmp/jarvis_wake_verify.mjs`. No live provider or LLM was
+called, and temporary servers were stopped after verification.
+
+Validation evidence for the accumulated fixes:
+
+- The full Python regression, run during the preceding readiness review,
+  passed **2,865/2,865 tests** in 105.794 seconds. No Python code or tests
+  changed afterward, so this CSS-only fix does not require repeating it.
+- After the CSS change, frontend production build and **75/75 tests passed**.
+  The existing non-fatal Plotly chunk-size advisory remains.
+- Latest TypeScript and changed-TypeScript-file lint checks passed during
+  the frontend type-remediation step; no TypeScript changed afterward.
+- `git diff --check` passed.
+
+The recorded Python failures, frontend type errors, package/analyst visual
+verification and wake-button interception have been addressed. All accumulated
+fixes remain unstaged, uncommitted and unpushed; draft PR #3 still contains the
+original checkpoint. Single recommended next step: stage and commit the
+reviewed fixes on the checkpoint branch, then push them to PR #3 before
+considering its merge into `main`.
+
+## PR #3 deterministic visual verification — 2026-10-26
+
+The real frontend was exercised through its normal text wake, conversation,
+operation/SSE and authenticated audit flow against a temporary, loopback-only
+fixture API. It returned a synthetic committed-package reference and an
+intentionally unavailable Fundamental Analyst alongside deterministic research
+output. This verifies presentation of the package/analyst split; it does not
+exercise live provider retrieval or a real 16-dataset persistence transaction.
+The fixture uses its historical September test clock. No live provider,
+authentication flow or LLM was called; browser requests outside the two local
+fixture servers were blocked by the harness.
+
+Desktop (1600px viewport) and narrow-screen (390px) screenshots were inspected:
+
+- The green `Complete package committed · 16 datasets` row and red
+  `Fundamental Analyst explanation failed` row are separately visible.
+- The Fundamental Analyst card is in its failed state and displays `FAILED`.
+- The completed-document inventory remains visible independently of failure.
+- Text wraps within the panel; narrow-screen document width equals the 390px
+  viewport. No browser JavaScript errors were observed.
+
+Ignored local screenshots and the machine-readable report are under
+`logs/visual-qa/package-analyst-2026-10-26/`. The temporary fixture harness is
+under `/private/tmp/jarvis_visual_fixture.py` and
+`/private/tmp/jarvis_visual_verify.mjs`. No product code was changed for this
+visual check, and full regression suites were not repeated.
+
+A separate existing interaction issue was discovered: at the desktop viewport,
+the decorative `communication-link link-judge` span intercepts pointer events
+over the reactor's `Wake Jarvis` button. The check continued successfully using
+the supported text wake flow, without forced clicks. This issue remains open.
+
+All accumulated fixes and this handoff remain unstaged, uncommitted and
+unpushed to draft PR #3. Complete Python regression is still required before
+staging. Single recommended next step: make decorative communication links
+ignore pointer events, then verify normal reactor wake-button clicks.
+
+## PR #3 frontend type remediation — 2026-10-26
+
+All four recorded frontend type errors are resolved locally in
+`TechnicalChart.tsx` and `agent-visuals.ts`, without dependency changes or
+disabling type checks. A narrow candle-direction style extends the installed
+Plotly typing with its supported `fillcolor` field, preserving candle colors.
+Structure labels use grouped high/low traces with typed scalar above/below
+positions and one shared legend item. Break markers use the equivalent typed
+`text+markers` mode. The agent status map explicitly maps every
+`ProgressStatus` to an `AgentVisualState` instead of widening values to strings.
+
+Validation: frontend TypeScript **passed with zero errors**; **7/7 focused
+agent/chart tests passed**; ESLint passed for both changed files; the frontend
+production build and **75/75 frontend tests passed**; `git diff --check` passed.
+The existing non-fatal Plotly chunk-size advisory remains. No Python regression
+or live provider validation was rerun for this frontend step.
+
+The accumulated Python test fixes and these frontend fixes remain unstaged,
+uncommitted and unpushed to draft PR #3. The previously recorded Python
+failure/error cases pass in their affected modules, but complete Python
+regression is still required before staging. Deterministic UI verification
+also remains outstanding. Single recommended next step: visually verify a
+committed fundamental package alongside an intentionally unavailable
+Fundamental Analyst using a deterministic fixture.
+
+## PR #3 presentation-fixture remediation — 2026-10-26
+
+The missing trade result in
+`test_multi_timeframe_briefing_exposes_exact_long_two_r_plan` was an outdated
+fixture assumption. The monotonically rising candle fixture has no confirmed
+daily or weekly pivots: its market-structure family is neutral, so current
+hierarchy policy correctly returns `NO_TRADE` before daily planning. The
+presenter already handles that state safely; the test dereferenced the absent
+planning result afterward.
+
+The actionable presentation test now uses an explicitly named synthetic
+eligible fixture with a narrowly scoped bullish market-structure finding stub,
+following the existing actionable workflow test pattern. Actual stop/target
+planning and hierarchy validation still run; the test asserts an approved,
+release-eligible plan before checking exact presented prices and the 2R target.
+This fixture isolates presentation behavior and does not establish that the
+original candle sequence has confirmed bullish structure.
+
+A separate unpatched regression retains that original sequence and proves
+that a bullish Judge cannot override neutral primary structure: planning is
+absent, the explanation reports `NO_TRADE` with
+`timeframe_setup_not_aligned`, and entry, stop, risk and target prices remain
+absent. Production calculations, eligibility gates and presentation code are
+unchanged. No live provider, broker or LLM was called.
+
+Validation: **9/9 presentation tests passed**; combined presentation and
+end-to-end multi-timeframe swing workflow modules passed **24/24 tests**.
+`git diff --check` passed. Full Python regression and frontend checks were not
+rerun for this test-only step; the earlier checkpoint counts are historical.
+
+All schema, HTTP-clock and presentation fixes remain unstaged, uncommitted and
+unpushed to draft PR #3. All nine original Python failure/error cases now pass
+in their affected modules, but a new complete regression result is still
+required before staging. The remaining recorded blockers are four frontend
+type errors and deterministic UI verification. Single recommended next step:
+diagnose and fix the frontend type errors in `TechnicalChart.tsx` and
+`agent-visuals.ts`.
+
+## PR #3 HTTP reference-clock remediation — 2026-10-26
+
+The two expired-reference HTTP failures are resolved locally in
+`tests/unit/test_http_api.py`. Both document fixtures are built before one
+mutable clock is chosen after their storage times and before either expires.
+That clock is injected into both repositories, the API, the background runner
+and the fake operation handler. Previously, the API used wall-clock time and
+the benchmarking repository discarded its already-expired historical fixture
+during initialization. The financial-document fixture clock alone also
+preceded the benchmarking record's storage time. The shared clock preserves
+the session chronology required by conversation follow-up tests.
+
+One new parameterized HTTP test checks both document endpoints one microsecond
+before expiry (200), at expiry (410) and one microsecond afterward (410).
+Existing authentication, operation ownership, scope and deleted-document
+checks remain. Production expiry, authorization and storage code are unchanged;
+no live provider, broker or LLM was called.
+
+Validation: **3/3 focused tests passed**; after aligning the runner and fake
+handler clocks, the complete HTTP module passed **40/40 tests**, including all
+six expiry-boundary cases. `git diff --check` passed. Full Python regression
+and frontend validation were not rerun for this test-only step; earlier full
+counts remain historical.
+
+These changes and the schema-test fixes below remain unstaged and uncommitted;
+they have not been pushed to draft PR #3. The remaining recorded blockers are
+the presentation-fixture error, four frontend type errors and deterministic UI
+verification. Single recommended next step: diagnose
+`test_multi_timeframe_briefing_exposes_exact_long_two_r_plan` before changing
+its expected trade outcome.
+
+## PR #3 schema-test remediation — 2026-10-26
+
+The six checkpoint schema failures are resolved locally. Four repository test
+modules still asserted historical DuckDB versions 5/6 even though the shared
+adapter and central storage contract use version 9. Their initialization
+assertions now explicitly expect 9 and compare persisted metadata with the
+adapter's reported version. Existing protocol, table and index checks remain.
+No production adapter, schema version or migration behavior was changed.
+
+The v3/v4 migration tests now create representative legacy market-envelope
+tables and populate them directly with synthetic records, rather than testing
+only an old metadata row. They verify exact record preservation through the
+upgrade and a second reopen, successful writes/reads in the newly created
+fundamental/financial-document repositories, and persistent version-9
+metadata. These are focused fixtures, not exhaustive historical-schema dumps.
+Only temporary test databases are used; no local research database or live
+provider was accessed.
+
+Validation executed:
+
+- Benchmarking and peer-comparison pair: **12/12 tests passed**.
+- Financial-document and fundamental pair: **26/26 tests passed**.
+- Combined four repository modules plus central DuckDB storage suite:
+  **78/78 tests passed**, including all six previously failing tests and the
+  existing central version/migration safeguards.
+- `git diff --check` passed.
+- Full Python and frontend suites were not rerun for this test-only step.
+  The 2,863-test checkpoint result below remains historical; it is not a
+  post-fix full-regression result.
+
+Changes are unstaged and uncommitted. Draft PR #3 was previously pushed at
+checkpoint `28dab46`; these local fixes have not been published to it.
+The remaining recorded blockers are two HTTP expired-reference failures, one
+presentation-fixture error, four frontend type errors and pending deterministic
+UI verification. Single recommended next step: diagnose the two HTTP
+expired-reference failures using an explicit test clock.
+
 ## Local checkpoint and draft PR plan — 2026-10-26
 
 Checkpoint branch: `checkpoint/fundamental-intelligence-2026-10-26`, created
