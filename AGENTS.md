@@ -16,6 +16,27 @@ Do not duplicate detailed architecture or implementation history here.
 - Search with `rg` first; if unavailable, use `grep` or `find`.
 - Avoid printing whole large files or full successful test logs.
 
+## Project Skill Router
+
+- For substantial Stock Analyzer architecture, market-data, technical-analysis,
+  price-action, strategy, backtesting, risk, ML, MLOps, or fundamental-research
+  work, load
+  `stock-analyzer-skills/skills/stock-analyzer-quant-architect/SKILL.md`.
+- Read its `PROJECT_CONTEXT.md`, then use `ROUTING.md` to load only the primary
+  subskill and genuinely required supporting subskills. Do not load every
+  subskill by default.
+- Repository instructions and current domain contracts override stale or
+  conflicting bundled context.
+- Project subskills guide engineering and research work. They are not the
+  deployed Bull, Bear, Judge, or Fundamental Analyst runtime personas.
+- Treat active skills as versioned policy. Agents may record sanitized
+  improvement candidates, but must not silently rewrite or promote an active
+  skill. Promotion requires deterministic or forward-safe validation, a new
+  version and content hash, human approval, and a rollback path.
+- Loading a skill does not authorize live-provider access, authentication,
+  staging, committing, pushing, deployment, order placement, or portfolio
+  mutation.
+
 ## Communication
 
 - Keep progress updates concise and outcome-oriented.

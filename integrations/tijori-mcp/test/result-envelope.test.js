@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  APPROVED_RESULT_TOOL_NAMES,
   APPROVED_TOOL_NAMES,
   MAX_JSON_NODES,
   failureResult,
@@ -46,6 +47,51 @@ test('supports every approved tool and failure status', () => {
         tool_name: toolName,
       });
     }
+  }
+});
+
+test('activates issuer-bound filing discovery and download envelopes', () => {
+  assert.equal(APPROVED_TOOL_NAMES.includes('list_company_filings'), true);
+  assert.equal(APPROVED_TOOL_NAMES.includes('download_company_filing'), true);
+  assert.deepEqual(APPROVED_RESULT_TOOL_NAMES, APPROVED_TOOL_NAMES);
+
+  const listing = successResult('list_company_filings', {
+    discovery_fingerprint: 'a'.repeat(64),
+    filings: [{
+      filing_reference_id: 'filing.coforge.fy2027.q1.er',
+      category: 'earnings_release',
+    }],
+  });
+  assert.equal(listing.tool_name, 'list_company_filings');
+  assert.equal(Object.isFrozen(listing.payload.filings[0]), true);
+
+  assert.deepEqual(
+    failureResult('download_company_filing', 'unavailable'),
+    {
+      payload: null,
+      status: 'unavailable',
+      tool_name: 'download_company_filing',
+    },
+  );
+});
+
+test('filing envelopes reject secret material and filesystem paths', () => {
+  for (const key of [
+    'cookie',
+    'session_token',
+    'absolute_path',
+    'file_path',
+    'filesystem_path',
+    'local_path',
+    'safe_relative_path',
+    'staging_path',
+  ]) {
+    assert.throws(
+      () => successResult('download_company_filing', {
+        artifact: { [key]: '/private/provider-file.pdf' },
+      }),
+      /prohibited sensitive field/,
+    );
   }
 });
 

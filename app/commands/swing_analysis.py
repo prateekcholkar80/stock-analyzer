@@ -11,6 +11,7 @@ from app.models.interaction import (
 from app.models.storage import (
     EndToEndSwingAnalysisResult,
     MultiTimeframeEndToEndSwingAnalysisResult,
+    MultiTimeframeResearchDivisionResult,
 )
 from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.presentation.llm_failures import present_llm_failure
@@ -38,6 +39,31 @@ class SwingAnalysisExecutor(Protocol):
 
 
 SwingAnalysisExecutorFactory = Callable[[], SwingAnalysisExecutor]
+
+
+@runtime_checkable
+class IncrementalMultiTimeframeSwingAnalysisExecutor(Protocol):
+    """Executor that exposes a safe checkpoint before dependent LLM agents."""
+
+    def prepare_research_division(
+        self,
+        exchange: str,
+        symbol_token: str,
+        symbol: str,
+        interval: str = "ONE_HOUR",
+        *,
+        to_date: datetime | None = None,
+        event_emitter: WorkflowEventEmitter | None = None,
+    ) -> MultiTimeframeResearchDivisionResult:
+        ...
+
+    def complete_research_division(
+        self,
+        research: MultiTimeframeResearchDivisionResult,
+        *,
+        event_emitter: WorkflowEventEmitter | None = None,
+    ) -> MultiTimeframeEndToEndSwingAnalysisResult:
+        ...
 
 
 class JarvisSwingAnalysisCommandHandler:
@@ -87,20 +113,48 @@ class JarvisSwingAnalysisCommandHandler:
                 raise ValueError(
                     "command event emitter operation ID does not match"
                 )
+            research_division_result = None
             try:
                 executor = self._executor_factory()
                 if not isinstance(executor, SwingAnalysisExecutor):
                     raise ValueError(
                         "swing-analysis factory returned an invalid executor"
                     )
-                result = executor.execute(
-                    exchange=command.exchange,
-                    symbol_token=command.symbol_token,
-                    symbol=command.symbol,
-                    interval=command.interval,
-                    to_date=command.to_date,
-                    event_emitter=active_emitter,
-                )
+                if isinstance(
+                    executor,
+                    IncrementalMultiTimeframeSwingAnalysisExecutor,
+                ):
+                    research_division_result = (
+                        executor.prepare_research_division(
+                            exchange=command.exchange,
+                            symbol_token=command.symbol_token,
+                            symbol=command.symbol,
+                            interval=command.interval,
+                            to_date=command.to_date,
+                            event_emitter=active_emitter,
+                        )
+                    )
+                    if not isinstance(
+                        research_division_result,
+                        MultiTimeframeResearchDivisionResult,
+                    ):
+                        raise ValueError(
+                            "incremental swing-analysis executor returned "
+                            "an invalid Research Division result"
+                        )
+                    result = executor.complete_research_division(
+                        research_division_result,
+                        event_emitter=active_emitter,
+                    )
+                else:
+                    result = executor.execute(
+                        exchange=command.exchange,
+                        symbol_token=command.symbol_token,
+                        symbol=command.symbol,
+                        interval=command.interval,
+                        to_date=command.to_date,
+                        event_emitter=active_emitter,
+                    )
                 if not isinstance(
                     result,
                     (
@@ -139,6 +193,7 @@ class JarvisSwingAnalysisCommandHandler:
                 return JarvisSwingAnalysisResponse.llm_failure(
                     operation_id=active_operation_id,
                     failure=failure,
+                    research_division_result=research_division_result,
                 )
             except Exception:
                 if emit_terminal_event:

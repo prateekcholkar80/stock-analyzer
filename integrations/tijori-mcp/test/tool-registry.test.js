@@ -14,6 +14,8 @@ const TOOL_NAMES = [
   'get_company_overview',
   'get_financials',
   'get_shareholding',
+  'list_company_filings',
+  'download_company_filing',
 ];
 const ISSUER = {
   exchange: 'NSE',
@@ -28,7 +30,7 @@ function handlers(overrides = {}) {
   ]));
 }
 
-test('exposes only the five approved immutable tool definitions', () => {
+test('exposes only the seven approved immutable tool definitions', () => {
   const registry = createToolRegistry(handlers());
 
   assert.deepEqual(
@@ -53,6 +55,13 @@ test('requires one callable handler for every approved tool', () => {
 
   assert.throws(
     () => createToolRegistry({ ...handlers(), fetch_report: () => ({}) }),
+    /exact tool allow-list/,
+  );
+  assert.throws(
+    () => createToolRegistry({
+      ...handlers(),
+      download_report: () => ({}),
+    }),
     /exact tool allow-list/,
   );
   assert.throws(

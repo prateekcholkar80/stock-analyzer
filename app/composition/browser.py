@@ -10,6 +10,9 @@ from app.composition.conversation import LazyJarvisResearchPresenter
 from app.composition.research import compose_jarvis_swing_research
 from app.conversation.browser import BrowserConversationCoordinator
 from app.conversation.config import JarvisConversationConfig
+from app.fundamentals.sector_profile import (
+    NseFundamentalSectorEvidenceResolver,
+)
 from app.models.fundamentals import ProviderConnectionScope
 from app.workflow.browser_runner import (
     AsyncBrowserOperationRunner,
@@ -17,7 +20,9 @@ from app.workflow.browser_runner import (
     BrowserResearchContextStore,
     InMemoryBrowserOperationResultStore,
     JarvisBrowserOperationHandler,
+    BrowserFundamentalAnalyst,
     BrowserFundamentalEvidenceExecutor,
+    BrowserFundamentalFilingEvidenceExecutor,
 )
 from app.workflow.operations import (
     BrowserOperationRegistry,
@@ -53,9 +58,13 @@ def compose_jarvis_browser_operations(
     fundamental_evidence_executor: (
         BrowserFundamentalEvidenceExecutor | None
     ) = None,
+    fundamental_filing_evidence_executor: (
+        BrowserFundamentalFilingEvidenceExecutor | None
+    ) = None,
     provider_scope_resolver: (
         Callable[[str], ProviderConnectionScope] | None
     ) = None,
+    fundamental_analyst: BrowserFundamentalAnalyst | None = None,
     max_workers: int = 2,
     **research_dependencies: Any,
 ) -> JarvisBrowserApplication:
@@ -79,6 +88,13 @@ def compose_jarvis_browser_operations(
     ):
         raise ValueError(
             "browser fundamental composition requires executor and resolver"
+        )
+    if (
+        fundamental_filing_evidence_executor is not None
+        and fundamental_evidence_executor is None
+    ):
+        raise ValueError(
+            "browser filing composition requires fundamental issuer resolution"
         )
     if "prompt_audit_sink" in research_dependencies:
         raise ValueError(
@@ -110,6 +126,12 @@ def compose_jarvis_browser_operations(
         gateway_builder=research_dependencies.get("gateway_builder"),
         prompt_audit_sink=resolved_audit_sink,
     )
+    nse_sector_catalog = research_dependencies.get("nse_sector_catalog")
+    sector_evidence_resolver = (
+        NseFundamentalSectorEvidenceResolver(nse_sector_catalog)
+        if nse_sector_catalog is not None
+        else None
+    )
     handler = JarvisBrowserOperationHandler(
         research,
         presenter,
@@ -117,7 +139,12 @@ def compose_jarvis_browser_operations(
         user_name=resolved_config.user_name,
         context_store=context_store,
         fundamental_evidence_executor=fundamental_evidence_executor,
+        fundamental_filing_evidence_executor=(
+            fundamental_filing_evidence_executor
+        ),
         provider_scope_resolver=provider_scope_resolver,
+        fundamental_analyst=fundamental_analyst,
+        fundamental_sector_evidence_resolver=sector_evidence_resolver,
     )
     runner = AsyncBrowserOperationRunner(
         resolved_registry,

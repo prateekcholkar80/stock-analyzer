@@ -128,6 +128,63 @@ class WorkflowEventEmitterTests(unittest.TestCase):
                 message="message",
             )
 
+    def test_agent_invocation_has_one_atomic_terminal_outcome(self):
+        emitter = WorkflowEventEmitter(
+            "operation",
+            InMemoryWorkflowEventSink(),
+            clock=lambda: FIXED_TIME,
+        )
+        started = emitter.emit(
+            WorkflowStage.BULL_DEBATING,
+            WorkflowEventState.STARTED,
+            round_number=1,
+        )
+        failed = emitter.emit(
+            WorkflowStage.BULL_DEBATING,
+            WorkflowEventState.FAILED,
+            round_number=1,
+        )
+
+        self.assertEqual(started.activity.participant_id, "debate.bull")
+        self.assertEqual(failed.activity.participant_id, "debate.bull")
+        with self.assertRaisesRegex(ValueError, "exactly one started"):
+            emitter.emit(
+                WorkflowStage.BULL_DEBATING,
+                WorkflowEventState.COMPLETED,
+                round_number=1,
+            )
+        with self.assertRaisesRegex(ValueError, "exactly one started"):
+            emitter.emit(
+                WorkflowStage.BEAR_DEBATING,
+                WorkflowEventState.FAILED,
+                round_number=1,
+            )
+
+    def test_debate_rounds_are_independent_agent_invocations(self):
+        sink = InMemoryWorkflowEventSink()
+        emitter = WorkflowEventEmitter(
+            "operation",
+            sink,
+            clock=lambda: FIXED_TIME,
+        )
+
+        for round_number in (1, 2):
+            emitter.emit(
+                WorkflowStage.BEAR_DEBATING,
+                WorkflowEventState.STARTED,
+                round_number=round_number,
+            )
+            emitter.emit(
+                WorkflowStage.BEAR_DEBATING,
+                WorkflowEventState.COMPLETED,
+                round_number=round_number,
+            )
+
+        self.assertEqual(
+            [event.round_number for event in sink.events],
+            [1, 1, 2, 2],
+        )
+
     def test_rejects_unsupported_stage_state_and_invalid_dependencies(self):
         emitter = WorkflowEventEmitter(
             "operation",
@@ -196,9 +253,17 @@ class WorkflowEventEmitterTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=4) as pool:
             tuple(
                 pool.map(
-                    lambda _: emitter.emit(
+                    lambda number: emitter.emit(
                         WorkflowStage.MARKET_DATA_LOADING,
                         WorkflowEventState.STARTED,
+                        activity=WorkflowActivityDescriptor(
+                            activity_id=f"market.concurrent_{number}.load",
+                            participant_id=(
+                                f"research.concurrent_{number}_service"
+                            ),
+                            participant_kind=WorkflowParticipantKind.SERVICE,
+                            participant_label=f"Concurrent Service {number}",
+                        ),
                     ),
                     range(20),
                 )

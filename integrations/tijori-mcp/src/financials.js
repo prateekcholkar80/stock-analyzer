@@ -1,6 +1,7 @@
 import { failureResult, successResult } from './result-envelope.js';
 import { createBalanceSheetSnapshotExtractor } from './balance-sheet.js';
 import { createCashFlowSnapshotExtractor } from './cash-flow.js';
+import { createFinancialDocumentPackageExtractor } from './financial-document-package.js';
 import { createGrowthTableSnapshotExtractor } from './growth-table.js';
 import { createProfitAndLossSnapshotExtractor } from './profit-and-loss.js';
 import { createQuarterlyResultsSnapshotExtractor } from './quarterly-results.js';
@@ -83,6 +84,18 @@ export function createFinancialsHandler({ browserRunner, clock = () => new Date(
     }
     if (request.as_of_date !== null && request.as_of_date !== observedDate) {
       return failureResult('get_financials', 'unavailable');
+    }
+    if (request.document_type === 'financial_package') {
+      try {
+        const extractPackage = createFinancialDocumentPackageExtractor({
+          browserRunner,
+          clock: () => observedAt,
+        });
+        const financialPackage = await extractPackage({ issuer: request.issuer });
+        return successResult('get_financials', { package: financialPackage });
+      } catch {
+        return failureResult('get_financials', 'unavailable');
+      }
     }
     if (Object.hasOwn(STRUCTURED_DOCUMENT_EXTRACTORS, request.document_type)) {
       try {

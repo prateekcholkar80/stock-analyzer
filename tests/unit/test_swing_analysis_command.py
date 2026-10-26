@@ -17,6 +17,9 @@ from app.models.interaction import (
 )
 from app.models.llm import LLMFailureCode
 from app.models.storage import EndToEndSwingAnalysisResult
+from tests.unit.test_run_end_to_end_multi_timeframe_swing_analysis import (
+    _use_case as _multi_timeframe_use_case,
+)
 
 
 def _result():
@@ -29,6 +32,15 @@ def _result():
     )
 
 
+def _research_division_result():
+    return _multi_timeframe_use_case().prepare_research_division(
+        "NSE",
+        "2885",
+        "RELIANCE-EQ",
+        "ONE_HOUR",
+    )
+
+
 class StubExecutor:
     def __init__(self, *, result=None, failure=None):
         self.result = result
@@ -37,6 +49,24 @@ class StubExecutor:
 
     def execute(self, **kwargs):
         self.calls.append((kwargs, get_operation_id()))
+        if self.failure is not None:
+            raise self.failure
+        return self.result
+
+
+class IncrementalStubExecutor(StubExecutor):
+    def __init__(self, *, research, result=None, failure=None):
+        super().__init__(result=result, failure=failure)
+        self.research = research
+
+    def prepare_research_division(self, **kwargs):
+        self.calls.append(("prepare", kwargs, get_operation_id()))
+        return self.research
+
+    def complete_research_division(self, research, **kwargs):
+        self.calls.append(
+            ("complete", research, kwargs, get_operation_id())
+        )
         if self.failure is not None:
             raise self.failure
         return self.result
@@ -136,6 +166,74 @@ class JarvisSwingAnalysisCommandTests(unittest.TestCase):
         self.assertTrue(response.failure.retryable)
         self.assertEqual(response.failure.failed_role.value, "bear")
         self.assertNotIn("provider secret", response.model_dump_json())
+
+    def test_llm_failure_can_retain_completed_research_without_conclusion(self):
+        research = _research_division_result()
+        executor = IncrementalStubExecutor(
+            research=research,
+            failure=LLMRateLimitError(
+                "provider secret",
+                role="bull",
+                retryable=True,
+            ),
+        )
+
+        response = JarvisSwingAnalysisCommandHandler(
+            lambda: executor
+        ).execute(self.command)
+
+        self.assertEqual(
+            [call[0] for call in executor.calls],
+            ["prepare", "complete"],
+        )
+        self.assertIs(executor.calls[1][1], research)
+        self.assertIs(response.research_division_result, research)
+        self.assertEqual(response.failure.failed_role.value, "bull")
+        self.assertIsNone(response.result)
+        self.assertIsNone(response.multi_timeframe_review)
+        self.assertIsNone(response.multi_timeframe_debate)
+
+    def test_incremental_success_runs_dependencies_in_order(self):
+        research = _research_division_result()
+        result = _result()
+        executor = IncrementalStubExecutor(
+            research=research,
+            result=result,
+        )
+
+        response = JarvisSwingAnalysisCommandHandler(
+            lambda: executor
+        ).execute(self.command)
+
+        self.assertEqual(
+            [call[0] for call in executor.calls],
+            ["prepare", "complete"],
+        )
+        self.assertIs(response.result, result)
+        self.assertIsNone(response.research_division_result)
+
+    def test_response_contract_accepts_retained_research_artifact(self):
+        research = _research_division_result()
+        failure = JarvisSwingAnalysisCommandHandler(
+            lambda: StubExecutor(
+                failure=LLMRateLimitError(
+                    "provider secret",
+                    role="bull",
+                    retryable=True,
+                )
+            )
+        ).execute(self.command).failure
+
+        response = JarvisSwingAnalysisResponse.llm_failure(
+            operation_id=failure.operation_id,
+            failure=failure,
+            research_division_result=research,
+        )
+
+        self.assertIs(response.research_division_result, research)
+        self.assertIsNone(response.result)
+        self.assertIsNone(response.multi_timeframe_review)
+        self.assertIsNone(response.multi_timeframe_debate)
 
     def test_boundary_operation_id_replaces_stale_failure_operation_id(self):
         executor = StubExecutor(

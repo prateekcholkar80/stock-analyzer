@@ -12,8 +12,11 @@ import os
 from collections.abc import Mapping
 
 from app.composition.fundamentals import (
+    compose_fundamental_analyst,
+    compose_tijori_filing_evidence_coordinator,
     compose_tijori_fundamental_coordinator,
     compose_tijori_session_service,
+    load_fundamental_filing_artifact_root,
     load_tijori_stdio_settings,
 )
 from app.api.models import ProviderSessionTargetRequest
@@ -62,13 +65,21 @@ def _provider_session_http_dependencies(
             account_hash = account_hash.strip() or None
 
         settings = load_tijori_stdio_settings(source)
+        filing_artifact_root = load_fundamental_filing_artifact_root(source)
         service = compose_tijori_session_service(
             transport_settings=settings,
         )
         evidence = compose_tijori_fundamental_coordinator(
             transport_settings=settings,
             repository=repository,
+            filing_artifact_root=filing_artifact_root,
         )
+        filing_evidence = compose_tijori_filing_evidence_coordinator(
+            transport_settings=settings,
+            storage=repository,
+            filing_artifact_root=filing_artifact_root,
+        )
+        analyst = compose_fundamental_analyst()
         registry = InMemoryProviderConnectionRegistry()
         registry.register_connection(
             ProviderConnectionScope(
@@ -93,6 +104,8 @@ def _provider_session_http_dependencies(
 
     return {
         "fundamental_evidence_coordinator": evidence,
+        "fundamental_filing_evidence_coordinator": filing_evidence,
+        "fundamental_analyst": analyst,
         "fundamental_provider_scope_resolver": fundamental_scope_resolver,
         "structured_document_repository": repository,
         "benchmarking_financials_repository": repository,
@@ -146,6 +159,14 @@ def create_app():
         "fundamental_provider_scope_resolver",
         None,
     )
+    fundamental_filing_evidence = provider_session_dependencies.pop(
+        "fundamental_filing_evidence_coordinator",
+        None,
+    )
+    fundamental_analyst = provider_session_dependencies.pop(
+        "fundamental_analyst",
+        None,
+    )
     archive = ResearchArchiveService(storage)
     rolling_fetch = PullRollingMarketSeries(market_service, archive)
     conversation_config = JarvisConversationConfig.from_environment()
@@ -160,7 +181,9 @@ def create_app():
         amfi_catalog=AmfiMarketCapCatalog(),
         nse_sector_catalog=NseSectorMasterCatalog(),
         fundamental_evidence_executor=fundamental_evidence,
+        fundamental_filing_evidence_executor=fundamental_filing_evidence,
         provider_scope_resolver=fundamental_scope_resolver,
+        fundamental_analyst=fundamental_analyst,
         max_workers=int(os.environ.get("JARVIS_BROWSER_WORKERS", "2")),
     )
     # TTS/STT are composed independently, not threaded through the
@@ -195,4 +218,7 @@ def create_app():
         **provider_session_dependencies,
     )
     application.state.fundamental_evidence_coordinator = fundamental_evidence
+    application.state.fundamental_filing_evidence_coordinator = (
+        fundamental_filing_evidence
+    )
     return application

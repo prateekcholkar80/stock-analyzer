@@ -6,16 +6,33 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from app.composition.fundamentals import (
+    compose_corporate_filings_analysis_coordinator,
+    compose_corporate_filings_analysis_workflow,
+    compose_corporate_filings_analyst,
+    compose_fundamental_analyst,
+    compose_tijori_filing_evidence_coordinator,
     compose_tijori_fundamental_coordinator,
     compose_tijori_session_service,
     compose_tijori_session_provisioner,
     compose_tijori_fundamental_gateway,
+    load_fundamental_filing_artifact_root,
     load_tijori_stdio_settings,
 )
+from app.agents.corporate_filings_analyst_agent import (
+    CorporateFilingsAnalystAgent,
+)
+from app.agents.fundamental_analyst_agent import FundamentalAnalystAgent
 from app.exceptions import ConfigurationError
 from app.fundamentals.adapters.tijori_mcp import TijoriMcpAdapter
+from app.fundamentals.filing_evidence_validator import (
+    DeterministicFundamentalFilingEvidenceValidator,
+)
+from app.fundamentals.filing_extractor import (
+    DeterministicFundamentalFilingExtractor,
+)
 from app.fundamentals.session_provisioning import (
     ProviderSessionInspectionRequest,
     ProviderSessionProvisioner,
@@ -28,20 +45,48 @@ from app.fundamentals.tijori_mcp_contracts import (
     TijoriMcpTransportInspection,
 )
 from app.fundamentals.transports.stdio_mcp import TijoriStdioMcpSettings
-from app.gateways.fundamentals import FundamentalEvidenceGateway
+from app.gateways.fundamentals import (
+    FundamentalEvidenceGateway,
+    FundamentalFilingGateway,
+    FundamentalFinancialDocumentPackageGateway,
+)
+from app.llm.config import LLMRole, LLMSettings
+from app.models.fundamental_frameworks import FundamentalFramework
 from app.models.fundamentals import ProviderConnectionScope
+from app.models.runtime_skill import RuntimeAgentRole
 from app.services.provider_sessions import ProviderSessionService
+from app.services.corporate_filings_analysis import (
+    CorporateFilingsAnalysisCoordinator,
+)
+from app.services.corporate_filings_analysis_workflow import (
+    CorporateFilingsAnalysisWorkflow,
+)
 from app.services.fundamental_evidence import (
     FundamentalEvidenceCoordinator,
     FundamentalEvidenceSource,
 )
+from app.services.fundamental_filing_evidence import (
+    FundamentalFilingEvidenceCoordinator,
+)
 from app.storage.adapters.duckdb import DuckDBJarvisStorage
+from app.storage.corporate_filings_analysis_repositories import (
+    CorporateFilingsAnalysisRepository,
+)
 from app.storage.financial_document_repositories import (
     StructuredFinancialDocumentRepository,
 )
 from app.storage.peer_comparison_repositories import PeerComparisonRepository
 from app.storage.benchmarking_financials_repositories import (
     BenchmarkingFinancialsRepository,
+)
+from app.storage.fundamental_package_repositories import (
+    FundamentalPackageRepository,
+)
+from app.storage.fundamental_filing_evidence_repositories import (
+    FundamentalFilingEvidenceRepository,
+)
+from app.storage.fundamental_filing_repositories import (
+    FundamentalFilingRepository,
 )
 from tests.unit.test_financial_document_in_memory_repository import (
     build_entry as build_structured_entry,
@@ -82,6 +127,18 @@ class FakeTransport:
         raise AssertionError("Composition must not invoke a provider tool")
 
 
+class FakeLLMGateway:
+    def __init__(self, settings):
+        self.settings = settings
+
+    @property
+    def configuration_fingerprint(self):
+        return "f" * 64
+
+    def generate(self, *, system, messages, response_model):
+        raise AssertionError("Composition must not generate LLM output")
+
+
 class TijoriFundamentalCompositionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -111,9 +168,268 @@ class TijoriFundamentalCompositionTests(unittest.TestCase):
         cli.parent.mkdir(parents=True)
         cli.write_text("// synthetic provisioning CLI", encoding="utf-8")
         cli.chmod(0o600)
+        self.filing_staging_root = root / "filing-staging"
+        self.filing_staging_root.mkdir(mode=0o700)
+        self.filing_artifact_root = root / "filing-artifacts"
+        self.filing_artifact_root.mkdir(mode=0o700)
+        self.filing_settings = self.settings.model_copy(
+            update={
+                "filing_staging_directory": self.filing_staging_root,
+            }
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_composes_verified_role_bound_fundamental_analyst(self):
+        received = []
+
+        def builder(settings):
+            received.append(settings)
+            return FakeLLMGateway(settings)
+
+        analyst = compose_fundamental_analyst(
+            settings=LLMSettings.from_environment(
+                {
+                    "JARVIS_LLM_MODEL": "provider/shared",
+                    "JARVIS_FUNDAMENTAL_ANALYST_LLM_MODEL": (
+                        "provider/fundamental"
+                    ),
+                }
+            ),
+            gateway_builder=builder,
+        )
+
+        self.assertIsInstance(analyst, FundamentalAnalystAgent)
+        self.assertEqual(len(received), 1)
+        self.assertIs(received[0].role, LLMRole.FUNDAMENTAL_ANALYST)
+        self.assertEqual(received[0].model, "provider/fundamental")
+        self.assertIs(
+            analyst.runtime_skill.contract.agent_role,
+            RuntimeAgentRole.FUNDAMENTAL_ANALYST,
+        )
+        self.assertEqual(len(analyst.runtime_skill.prompt_content_sha256), 64)
+
+    def test_fundamental_analyst_composition_fails_before_gateway_build(self):
+        builds = []
+        settings = LLMSettings.from_environment(
+            {
+                "JARVIS_BULL_LLM_MODEL": "provider/bull",
+                "JARVIS_BEAR_LLM_MODEL": "provider/bear",
+                "JARVIS_JUDGE_LLM_MODEL": "provider/judge",
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "fundamental_analyst"):
+            compose_fundamental_analyst(
+                settings=settings,
+                gateway_builder=lambda role_settings: builds.append(
+                    role_settings
+                ),
+            )
+
+        self.assertEqual(builds, [])
+
+        with self.assertRaisesRegex(ValueError, "runtime-skill loader"):
+            compose_fundamental_analyst(
+                settings=LLMSettings.from_environment(
+                    {"JARVIS_LLM_MODEL": "provider/shared"}
+                ),
+                gateway_builder=lambda role_settings: builds.append(
+                    role_settings
+                ),
+                runtime_skill_loader=object(),
+            )
+
+        self.assertEqual(builds, [])
+
+    def test_composes_verified_role_bound_corporate_filings_analyst(self):
+        received = []
+
+        def builder(settings):
+            received.append(settings)
+            return FakeLLMGateway(settings)
+
+        analyst = compose_corporate_filings_analyst(
+            settings=LLMSettings.from_environment(
+                {
+                    "JARVIS_LLM_MODEL": "provider/shared",
+                    "JARVIS_CORPORATE_FILINGS_ANALYST_LLM_MODEL": (
+                        "provider/corporate-filings"
+                    ),
+                    "JARVIS_CORPORATE_FILINGS_ANALYST_LLM_MAX_TOKENS": "3200",
+                }
+            ),
+            gateway_builder=builder,
+        )
+
+        self.assertIsInstance(analyst, CorporateFilingsAnalystAgent)
+        self.assertEqual(len(received), 1)
+        self.assertIs(
+            received[0].role,
+            LLMRole.CORPORATE_FILINGS_ANALYST,
+        )
+        self.assertEqual(received[0].model, "provider/corporate-filings")
+        self.assertIs(
+            analyst.framework_skill.contract.framework,
+            FundamentalFramework.JHUNJHUNWALA_STYLE,
+        )
+        self.assertIsNotNone(analyst.framework_skill.doctrine)
+        self.assertEqual(len(analyst.framework_skill.skill_content_sha256), 64)
+        self.assertEqual(len(analyst.prompt_sha256), 64)
+        self.assertEqual(
+            analyst.build_analysis_policy().max_output_tokens,
+            3_200,
+        )
+        self.assertEqual(
+            analyst.build_analysis_policy().model_configuration_fingerprint,
+            "f" * 64,
+        )
+
+    def test_corporate_filings_composition_fails_before_gateway_build(self):
+        builds = []
+        settings = LLMSettings.from_environment(
+            {
+                "JARVIS_BULL_LLM_MODEL": "provider/bull",
+                "JARVIS_BEAR_LLM_MODEL": "provider/bear",
+                "JARVIS_JUDGE_LLM_MODEL": "provider/judge",
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "corporate_filings_analyst"):
+            compose_corporate_filings_analyst(
+                settings=settings,
+                gateway_builder=lambda role_settings: builds.append(
+                    role_settings
+                ),
+            )
+
+        self.assertEqual(builds, [])
+
+        with self.assertRaisesRegex(ValueError, "framework-skill loader"):
+            compose_corporate_filings_analyst(
+                settings=LLMSettings.from_environment(
+                    {"JARVIS_LLM_MODEL": "provider/shared"}
+                ),
+                gateway_builder=lambda role_settings: builds.append(
+                    role_settings
+                ),
+                framework_skill_loader=object(),
+            )
+
+        self.assertEqual(builds, [])
+
+    def test_composes_filings_coordinator_with_existing_duckdb(self):
+        received = []
+
+        def builder(settings):
+            received.append(settings)
+            return FakeLLMGateway(settings)
+
+        database = Path(self.temporary.name) / "filings-analysis.duckdb"
+        with DuckDBJarvisStorage(database, clock=lambda: NOW) as repository:
+            coordinator = compose_corporate_filings_analysis_coordinator(
+                repository=repository,
+                settings=LLMSettings.from_environment(
+                    {
+                        "JARVIS_LLM_MODEL": "provider/shared",
+                        "JARVIS_CORPORATE_FILINGS_ANALYST_LLM_MODEL": (
+                            "provider/corporate-filings"
+                        ),
+                    }
+                ),
+                gateway_builder=builder,
+                clock=lambda: NOW,
+            )
+
+            self.assertIsInstance(
+                repository,
+                CorporateFilingsAnalysisRepository,
+            )
+            self.assertIsInstance(
+                coordinator,
+                CorporateFilingsAnalysisCoordinator,
+            )
+            self.assertIs(coordinator._repository, repository)
+            self.assertIsInstance(
+                coordinator._analyzer,
+                CorporateFilingsAnalystAgent,
+            )
+            self.assertEqual(len(received), 1)
+            self.assertIs(
+                received[0].role,
+                LLMRole.CORPORATE_FILINGS_ANALYST,
+            )
+            self.assertEqual(
+                received[0].model,
+                "provider/corporate-filings",
+            )
+
+    def test_filings_coordinator_rejects_repository_before_gateway_build(self):
+        builds = []
+
+        with self.assertRaisesRegex(TypeError, "requires its repository"):
+            compose_corporate_filings_analysis_coordinator(
+                repository=object(),
+                settings=LLMSettings.from_environment(
+                    {"JARVIS_LLM_MODEL": "provider/shared"}
+                ),
+                gateway_builder=lambda settings: builds.append(settings),
+            )
+
+        self.assertEqual(builds, [])
+
+    def test_composes_single_filings_workflow_with_existing_duckdb(self):
+        received = []
+
+        def builder(settings):
+            received.append(settings)
+            return FakeLLMGateway(settings)
+
+        database = Path(self.temporary.name) / "filings-workflow.duckdb"
+        with DuckDBJarvisStorage(database, clock=lambda: NOW) as storage:
+            workflow = compose_corporate_filings_analysis_workflow(
+                storage=storage,
+                settings=LLMSettings.from_environment(
+                    {
+                        "JARVIS_LLM_MODEL": "provider/shared",
+                        "JARVIS_CORPORATE_FILINGS_ANALYST_LLM_MODEL": (
+                            "provider/corporate-filings"
+                        ),
+                    }
+                ),
+                gateway_builder=builder,
+                clock=lambda: NOW,
+            )
+
+            self.assertIsInstance(workflow, CorporateFilingsAnalysisWorkflow)
+            self.assertIs(workflow._assembler._filing_repository, storage)
+            self.assertIs(workflow._assembler._evidence_repository, storage)
+            self.assertIs(workflow._coordinator._repository, storage)
+            self.assertIs(workflow._analyst, workflow._assembler._policy_provider)
+            self.assertIs(workflow._analyst, workflow._coordinator._analyzer)
+            self.assertEqual(len(received), 1)
+            self.assertIs(
+                received[0].role,
+                LLMRole.CORPORATE_FILINGS_ANALYST,
+            )
+
+    def test_filings_workflow_rejects_storage_before_gateway_build(self):
+        builds = []
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "filing artifact/package storage",
+        ):
+            compose_corporate_filings_analysis_workflow(
+                storage=object(),
+                settings=LLMSettings.from_environment(
+                    {"JARVIS_LLM_MODEL": "provider/shared"}
+                ),
+                gateway_builder=lambda settings: builds.append(settings),
+            )
+
+        self.assertEqual(builds, [])
 
     def test_composes_provider_neutral_gateway_without_provider_io(self):
         received = []
@@ -132,6 +448,10 @@ class TijoriFundamentalCompositionTests(unittest.TestCase):
         )
 
         self.assertIsInstance(gateway, FundamentalEvidenceGateway)
+        self.assertIsInstance(
+            gateway,
+            FundamentalFinancialDocumentPackageGateway,
+        )
         self.assertIsInstance(gateway, TijoriMcpAdapter)
         self.assertEqual(received, [self.settings])
         self.assertEqual(len(gateway.configuration_fingerprint), 64)
@@ -144,6 +464,120 @@ class TijoriFundamentalCompositionTests(unittest.TestCase):
 
         self.assertIsInstance(gateway, FundamentalEvidenceGateway)
         self.assertEqual(len(gateway.configuration_fingerprint), 64)
+
+    def test_composes_secure_filing_importer_without_provider_io(self):
+        gateway = compose_tijori_fundamental_gateway(
+            transport_settings=self.filing_settings,
+            filing_artifact_root=self.filing_artifact_root,
+            clock=lambda: NOW,
+            transport_builder=lambda settings: FakeTransport(),
+        )
+
+        self.assertIsInstance(gateway, TijoriMcpAdapter)
+        self.assertIsNotNone(gateway._filing_artifact_importer)
+        self.assertRegex(
+            gateway._filing_artifact_importer.configuration_fingerprint,
+            r"^[a-f0-9]{64}$",
+        )
+
+    def test_composes_cache_first_filing_pipeline_with_existing_duckdb(self):
+        transports = []
+
+        def builder(settings):
+            transports.append(settings)
+            return FakeTransport()
+
+        database = Path(self.temporary.name) / "filing-evidence.duckdb"
+        with DuckDBJarvisStorage(database, clock=lambda: NOW) as storage:
+            coordinator = compose_tijori_filing_evidence_coordinator(
+                transport_settings=self.filing_settings,
+                storage=storage,
+                filing_artifact_root=self.filing_artifact_root,
+                clock=lambda: NOW,
+                transport_builder=builder,
+            )
+
+            self.assertIsInstance(storage, FundamentalFilingRepository)
+            self.assertIsInstance(
+                storage,
+                FundamentalFilingEvidenceRepository,
+            )
+            self.assertIsInstance(
+                coordinator,
+                FundamentalFilingEvidenceCoordinator,
+            )
+            self.assertIsInstance(coordinator._gateway, FundamentalFilingGateway)
+            self.assertIsInstance(coordinator._gateway, TijoriMcpAdapter)
+            self.assertIsNotNone(
+                coordinator._gateway._filing_artifact_importer
+            )
+            self.assertIs(coordinator._filing_repository, storage)
+            self.assertIs(coordinator._evidence_repository, storage)
+            self.assertIsInstance(
+                coordinator._extractor,
+                DeterministicFundamentalFilingExtractor,
+            )
+            self.assertEqual(
+                coordinator._extractor._artifact_root,
+                self.filing_artifact_root,
+            )
+            self.assertIsInstance(
+                coordinator._validator,
+                DeterministicFundamentalFilingEvidenceValidator,
+            )
+
+        self.assertEqual(transports, [self.filing_settings])
+
+    def test_filing_pipeline_rejects_storage_before_gateway_build(self):
+        transports = []
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "filing artifact/package storage",
+        ):
+            compose_tijori_filing_evidence_coordinator(
+                transport_settings=self.filing_settings,
+                storage=object(),
+                filing_artifact_root=self.filing_artifact_root,
+                transport_builder=lambda settings: transports.append(settings),
+            )
+
+        self.assertEqual(transports, [])
+
+    def test_filing_pipeline_requires_gateway_filing_capability(self):
+        database = Path(self.temporary.name) / "invalid-filing-gateway.duckdb"
+        with DuckDBJarvisStorage(database, clock=lambda: NOW) as storage:
+            with patch(
+                "app.composition.fundamentals.compose_tijori_fundamental_gateway",
+                return_value=object(),
+            ):
+                with self.assertRaisesRegex(
+                    ConfigurationError,
+                    "filing discovery and acquisition",
+                ):
+                    compose_tijori_filing_evidence_coordinator(
+                        transport_settings=self.filing_settings,
+                        storage=storage,
+                        filing_artifact_root=self.filing_artifact_root,
+                    )
+
+    def test_filing_roots_are_all_or_nothing_and_fail_closed(self):
+        for settings, artifact_root in (
+            (self.filing_settings, None),
+            (self.settings, self.filing_artifact_root),
+        ):
+            with self.subTest(
+                staging=settings.filing_staging_directory is not None
+            ):
+                with self.assertRaisesRegex(
+                    ConfigurationError,
+                    "configured together",
+                ):
+                    compose_tijori_fundamental_gateway(
+                        transport_settings=settings,
+                        filing_artifact_root=artifact_root,
+                        transport_builder=lambda value: FakeTransport(),
+                    )
 
     def test_composes_coordinator_with_existing_duckdb_and_reuses_cache(self):
         database = Path(self.temporary.name) / "fundamentals.duckdb"
@@ -159,9 +593,41 @@ class TijoriFundamentalCompositionTests(unittest.TestCase):
 
             result = coordinator.load(stored.request)
 
+            self.assertIsInstance(repository, FundamentalPackageRepository)
+            self.assertIs(coordinator._package_repository, repository)
+            self.assertIsInstance(
+                repository,
+                FundamentalFilingEvidenceRepository,
+            )
+            self.assertIs(
+                coordinator._filing_evidence_repository,
+                repository,
+            )
+            self.assertIs(
+                coordinator._financial_document_package_gateway,
+                coordinator._gateway,
+            )
+
         self.assertIsInstance(coordinator, FundamentalEvidenceCoordinator)
         self.assertEqual(result.source, FundamentalEvidenceSource.CACHE)
         self.assertEqual(result.stored_snapshot, stored)
+
+    def test_coordinator_bootstrap_rejects_gateway_without_package_capability(self):
+        database = Path(self.temporary.name) / "missing-package-gateway.duckdb"
+        with DuckDBJarvisStorage(database, clock=lambda: NOW) as repository:
+            with patch(
+                "app.composition.fundamentals.compose_tijori_fundamental_gateway",
+                return_value=object(),
+            ):
+                with self.assertRaisesRegex(
+                    ConfigurationError,
+                    "complete financial package retrieval",
+                ):
+                    compose_tijori_fundamental_coordinator(
+                        transport_settings=self.settings,
+                        repository=repository,
+                        clock=lambda: NOW,
+                    )
 
     def test_reuses_same_open_duckdb_for_structured_document_cache(self):
         database = Path(self.temporary.name) / "structured-fundamentals.duckdb"
@@ -278,6 +744,12 @@ class TijoriFundamentalCompositionTests(unittest.TestCase):
             ),
             "JARVIS_TIJORI_TIMEOUT_SECONDS": "20",
             "JARVIS_TIJORI_MAX_CONCURRENCY": "2",
+            "JARVIS_TIJORI_FILING_STAGING_DIRECTORY": str(
+                self.filing_staging_root
+            ),
+            "JARVIS_FUNDAMENTAL_FILING_ARTIFACT_DIRECTORY": str(
+                self.filing_artifact_root
+            ),
             "TIJORI_PASSWORD": "must-not-be-read",
         }
 
@@ -288,6 +760,14 @@ class TijoriFundamentalCompositionTests(unittest.TestCase):
         self.assertEqual(
             loaded.provider_contract_version,
             "tijori.local_contract.v1",
+        )
+        self.assertEqual(
+            loaded.filing_staging_directory,
+            self.filing_staging_root,
+        )
+        self.assertEqual(
+            load_fundamental_filing_artifact_root(environment),
+            self.filing_artifact_root,
         )
         self.assertNotIn("must-not-be-read", loaded.model_dump_json())
 
@@ -316,6 +796,19 @@ class TijoriFundamentalCompositionTests(unittest.TestCase):
                 ),
                 transport_builder=lambda settings: FakeTransport(),
             )
+
+        for value in (None, "", "relative-artifacts"):
+            with self.subTest(filing_artifact_root=value):
+                with self.assertRaises(ConfigurationError):
+                    load_fundamental_filing_artifact_root(
+                        {
+                            "JARVIS_FUNDAMENTAL_FILING_ARTIFACT_DIRECTORY": (
+                                value
+                            )
+                        }
+                        if value is not None
+                        else {}
+                    )
 
     def test_composes_session_provisioner_with_pinned_runtime_and_scoped_path(self):
         calls = []

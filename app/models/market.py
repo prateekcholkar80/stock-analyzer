@@ -95,13 +95,41 @@ class HistoricalCandleSeries(MarketModel):
     candles: list[Candle]
     retrieved_at: datetime
     source: str = Field(default="angel_one", min_length=1)
+    history_requested_from: datetime | None = None
+    history_requested_to: datetime | None = None
 
-    @field_validator("retrieved_at")
+    @field_validator(
+        "retrieved_at",
+        "history_requested_from",
+        "history_requested_to",
+    )
     @classmethod
-    def require_timezone(cls, value: datetime) -> datetime:
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError(
-                "retrieval time must include timezone information"
+                "historical-series timestamps must include timezone information"
             )
 
         return value
+
+    @model_validator(mode="after")
+    def validate_requested_history_range(self) -> Self:
+        boundaries = (
+            self.history_requested_from,
+            self.history_requested_to,
+        )
+        if (boundaries[0] is None) != (boundaries[1] is None):
+            raise ValueError(
+                "historical request coverage requires both boundaries"
+            )
+        if (
+            boundaries[0] is not None
+            and boundaries[1] is not None
+            and boundaries[0] > boundaries[1]
+        ):
+            raise ValueError(
+                "historical request coverage start cannot follow its end"
+            )
+        return self

@@ -2,27 +2,52 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta
+from hashlib import sha256
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from app.exceptions import IntentRecognitionError, MarketDataError
+from app.exceptions import (
+    FundamentalProviderUnavailableError,
+    IntentRecognitionError,
+    LLMError,
+    MarketDataError,
+)
+from app.analytics.fundamental_checks import FinancialHealthSectorProfile
+from app.analytics.fundamental_sector_profile import (
+    FundamentalSectorEvidence,
+    FundamentalSectorSourceAuthority,
+    FundamentalSectorTaxonomy,
+)
 from app.gateways.fundamentals import (
     FundamentalBenchmarkingFinancialsResult,
+    FundamentalPeerComparisonResult,
 )
 from app.models.browser_operations import (
+    BrowserAgentExecutionStatus,
     BrowserOperationFailure,
     BrowserOperationKind,
     BrowserOperationOutput,
     BrowserOperationRequest,
+    BrowserOperationSnapshot,
     BrowserOperationStatus,
     BrowserSessionSnapshot,
+    BrowserFundamentalPackageReference,
     BrowserStructuredDocumentReference,
     WorkflowEventReplayCursor,
+)
+from app.models.fundamental_filings import (
+    FundamentalFilingDiscoverySnapshot,
+    FundamentalFilingFailure,
+    FundamentalFilingFailureCategory,
+    FundamentalFilingFailureStage,
+    FundamentalFilingPackage,
+    FundamentalFilingPackageManifest,
 )
 from app.models.financial_documents import (
     FinancialDocumentType,
     FinancialReportingBasis,
 )
+from app.models.fundamental_analysis import FundamentalAnalysis
 from app.models.conversation import InputChannel
 from app.models.interaction import (
     JarvisSwingAnalysisResponse,
@@ -30,6 +55,7 @@ from app.models.interaction import (
 )
 from app.models.llm import JarvisLLMFailureResponse, LLMFailureCode
 from app.models.fundamental_storage import FundamentalSnapshotQuery
+from app.models.fundamentals import FundamentalValidationStatus
 from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.services.fundamental_cache_policy import FundamentalCachePolicy
 from app.services.fundamental_evidence import (
@@ -45,7 +71,24 @@ from app.storage.adapters.financial_document_in_memory import (
 from app.storage.adapters.benchmarking_financials_in_memory import (
     InMemoryBenchmarkingFinancialsRepository,
 )
+from app.storage.adapters.peer_comparison_in_memory import (
+    InMemoryPeerComparisonRepository,
+)
+from app.storage.adapters.fundamental_package_in_memory import (
+    InMemoryFundamentalPackageRepository,
+)
+from app.storage.fundamental_package_repositories import (
+    FundamentalPackageRepositoryScope,
+)
 from app.services.fundamental_evidence import FundamentalEvidenceCoordinator
+from app.services.fundamental_filing_evidence import (
+    FundamentalFilingEvidenceCoordinationResult,
+    FundamentalFilingEvidenceCoordinationStatus,
+)
+from app.storage.fundamental_filing_repositories import (
+    FundamentalFilingRepositoryScope,
+)
+from app.workflow.agent_outcomes import build_agent_execution_outcomes
 from app.workflow.browser_runner import (
     AsyncBrowserOperationRunner,
     BrowserOperationHandledFailure,
@@ -71,12 +114,56 @@ from tests.unit.test_benchmarking_financials_gateway import (
     document as benchmarking_document,
     result_values as benchmarking_result_values,
 )
+from tests.unit.test_peer_comparison_gateway import (
+    document as peer_document,
+    result_values as peer_result_values,
+)
 
 
 IST = ZoneInfo("Asia/Kolkata")
 
 
 class _BrowserFundamentalGateway(FakeFundamentalGateway):
+    def retrieve_peer_comparison(self, *, request):
+        self.calls.append("peer_comparison")
+        retrieved_at = request.requested_at + timedelta(seconds=1)
+        template = peer_document()
+        subject = template.peers[0]
+        peers = (
+            subject.model_copy(
+                update={
+                    "peer_key": (
+                        "peer_" + request.issuer.provider_slug.replace("-", "_")
+                    ),
+                    "legal_name": request.issuer.legal_name,
+                    "provider_slug": request.issuer.provider_slug,
+                }
+            ),
+            *template.peers[1:],
+        )
+        result_document = peer_document(
+            connection=request.connection,
+            issuer=request.issuer,
+            observation_date=(
+                request.as_of_date or request.requested_at.date()
+            ),
+            retrieved_at=retrieved_at,
+            expires_at=retrieved_at + timedelta(days=10),
+            peers=peers,
+        )
+        values = peer_result_values(request)
+        values.update(
+            {
+                "connection": request.connection,
+                "requested_at": request.requested_at,
+                "started_at": request.requested_at,
+                "completed_at": request.requested_at + timedelta(seconds=2),
+                "issuer": request.issuer,
+                "document": result_document,
+            }
+        )
+        return FundamentalPeerComparisonResult(**values)
+
     def retrieve_benchmarking_financials(self, *, request):
         self.calls.append("benchmarking_financials")
         retrieved_at = request.requested_at + timedelta(seconds=1)
@@ -147,6 +234,175 @@ class _RecordingStructuredFundamentalGateway(_BrowserFundamentalGateway):
             (request.document_type.value, request.reporting_basis.value)
         )
         return super().retrieve_structured_financial_document(request=request)
+
+    def retrieve_financial_document_package(self, *, request):
+        result = super().retrieve_financial_document_package(request=request)
+        if result.package is not None:
+            self.structured_scenarios.extend(
+                (
+                    document.document_type.value,
+                    document.reporting_basis.value,
+                )
+                for document in result.package.documents
+            )
+        return result
+
+
+class _FailingCashFlowGateway(_RecordingStructuredFundamentalGateway):
+    def retrieve_financial_document_package(self, *, request):
+        raise FundamentalProviderUnavailableError(
+            "raw provider details must not cross the boundary",
+            capability=request.capability.value,
+        )
+
+
+class _RecordingFundamentalAnalyst:
+    def __init__(self):
+        self.calls = []
+
+    def analyze(self, *, evidence, intelligence, as_of):
+        self.calls.append((evidence, intelligence, as_of))
+        return FundamentalAnalysis(
+            analysis_id="fundamental-analysis-1",
+            evidence_coverage_and_freshness="All cached documents are current.",
+            financial_strengths=("Revenue growth is positive.",),
+            financial_risks_and_conflicts=(),
+            preliminary_financial_health="Preliminary health is stable.",
+            confidence_percentage=60.0,
+            valuation_observations=(),
+            missing_evidence_and_limitations=("Annual report unavailable.",),
+            document_citations=(evidence[0].reference_id,),
+            runtime_skill_id="jarvis-fundamental-analyst",
+            runtime_skill_version="1.0.0",
+            runtime_skill_prompt_sha256="a" * 64,
+            model_id="test-model",
+            generated_at=as_of,
+        )
+
+
+class _InvalidFundamentalAnalyst:
+    def analyze(self, *, evidence, intelligence, as_of):
+        return object()
+
+
+class _FailingFundamentalAnalyst:
+    def analyze(self, *, evidence, intelligence, as_of):
+        raise LLMError(
+            "private provider credential detail",
+            role="fundamental_analyst",
+            retryable=False,
+        )
+
+
+class _RecordingFilingEvidenceCoordinator:
+    def __init__(self, *, fail=False):
+        self.fail = fail
+        self.calls = []
+
+    def coordinate(self, request, *, refresh_requested=False):
+        self.calls.append((request, refresh_requested))
+        completed_at = request.requested_at + timedelta(seconds=1)
+        scope = FundamentalFilingRepositoryScope(
+            connection=request.connection,
+            issuer=request.issuer,
+        )
+        if self.fail:
+            return FundamentalFilingEvidenceCoordinationResult(
+                status=(
+                    FundamentalFilingEvidenceCoordinationStatus.
+                    REFRESH_FAILED_NO_ACTIVE
+                ),
+                request_fingerprint=request.request_fingerprint,
+                scope=scope,
+                refresh_requested=refresh_requested,
+                provider_called=True,
+                started_at=request.requested_at,
+                completed_at=completed_at,
+                failure=FundamentalFilingFailure(
+                    operation_id=request.operation_id,
+                    connection=request.connection,
+                    issuer=request.issuer,
+                    stage=FundamentalFilingFailureStage.DISCOVERY,
+                    category=(
+                        FundamentalFilingFailureCategory.PROVIDER_UNAVAILABLE
+                    ),
+                    retryable=True,
+                    occurred_at=completed_at,
+                    sanitized_message=(
+                        "Corporate filing discovery is temporarily unavailable."
+                    ),
+                ),
+            )
+
+        discovery = FundamentalFilingDiscoverySnapshot(
+            discovery_id=(
+                f"filing.discovery.{request.issuer.symbol.casefold()}"
+            ),
+            connection=request.connection,
+            issuer=request.issuer,
+            categories=request.categories,
+            from_fiscal_year=request.from_fiscal_year,
+            through_date=request.through_date,
+            max_documents=request.max_documents,
+            discovered_at=completed_at,
+            references=(),
+            validation_status=FundamentalValidationStatus.VALIDATED,
+        )
+        manifest = FundamentalFilingPackageManifest(
+            operation_id=request.operation_id,
+            connection=request.connection,
+            issuer=request.issuer,
+            requested_at=request.requested_at,
+            committed_at=completed_at,
+            discovery_fingerprint=discovery.discovery_fingerprint,
+            artifact_ids=(),
+            recheck_after=completed_at + timedelta(days=10),
+        )
+        package = FundamentalFilingPackage(
+            manifest=manifest,
+            discovery=discovery,
+            artifacts=(),
+        )
+        return FundamentalFilingEvidenceCoordinationResult(
+            status=(
+                FundamentalFilingEvidenceCoordinationStatus.PACKAGE_PUBLISHED
+            ),
+            request_fingerprint=request.request_fingerprint,
+            scope=scope,
+            refresh_requested=refresh_requested,
+            provider_called=True,
+            started_at=request.requested_at,
+            completed_at=completed_at,
+            selected_package=package,
+            evidence_records=(),
+        )
+
+
+class _TcsSectorEvidenceResolver:
+    def __init__(self):
+        self.calls = []
+
+    def resolve(self, *, issuer, symbol, as_of):
+        self.calls.append((issuer, symbol, as_of))
+        return (
+            FundamentalSectorEvidence(
+                issuer=issuer,
+                taxonomy=FundamentalSectorTaxonomy.NSE_SECTOR_INDUSTRY,
+                source_authority=(
+                    FundamentalSectorSourceAuthority.EXCHANGE_OFFICIAL
+                ),
+                source_reference_id="nse-sector-master:TCS",
+                source_name="NSE equity sector master",
+                source_location="https://www.nseindia.com/market-data",
+                source_record_fingerprint=sha256(
+                    b"TCS|IT|Software"
+                ).hexdigest(),
+                sector="IT",
+                industry="Software",
+                retrieved_at=as_of - timedelta(days=1),
+                expires_at=as_of + timedelta(days=30),
+            ),
+        )
 
 
 def _now():
@@ -314,6 +570,66 @@ class BrowserOperationOutputTests(unittest.TestCase):
                 ),
             )
 
+    def test_decision_failure_retains_completed_fundamental_package(self):
+        response = JarvisSwingAnalysisResponse.llm_failure(
+            operation_id="operation-1",
+            failure=JarvisLLMFailureResponse(
+                code=LLMFailureCode.AUTHENTICATION,
+                title="The debate could not start",
+                display_message="The debate provider rejected its credential.",
+                spoken_message="The debate could not start.",
+                recovery_action="Update the configured LLM credential.",
+                retryable=False,
+                operation_id="operation-1",
+            ),
+        )
+        completed_at = _now()
+        package_reference = BrowserFundamentalPackageReference(
+            package_id="fundamental_package:" + "a" * 64,
+            manifest_fingerprint="a" * 64,
+            expires_at=completed_at + timedelta(days=10),
+        )
+
+        output = BrowserOperationOutput(
+            operation_id="operation-1",
+            session_id="session-1",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            completed_at=completed_at,
+            research_response=response,
+            decision_failure=BrowserOperationFailure(
+                code="llm.authentication",
+                message="The debate provider rejected its credential.",
+                retryable=False,
+            ),
+            fundamental_package_reference=package_reference,
+        )
+
+        self.assertEqual(output.decision_failure.code, "llm.authentication")
+        self.assertEqual(
+            output.fundamental_package_reference,
+            package_reference,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "decision failure must match",
+        ):
+            BrowserOperationOutput(
+                operation_id="operation-1",
+                session_id="session-1",
+                kind=BrowserOperationKind.SWING_ANALYSIS,
+                completed_at=completed_at,
+                research_response=response,
+                decision_failure=BrowserOperationFailure(
+                    code="llm.provider_unavailable",
+                    message=(
+                        "The debate provider rejected its credential."
+                    ),
+                    retryable=False,
+                ),
+                fundamental_package_reference=package_reference,
+            )
+
     def test_swing_output_retains_unique_fundamental_evidence(self):
         response = _completed_response()
         explanation = RecordingPresenter().explain(
@@ -342,6 +658,48 @@ class BrowserOperationOutputTests(unittest.TestCase):
                 research_response=response,
                 research_explanation=explanation,
                 fundamental_evidence=(fundamental, fundamental),
+            )
+
+    def test_fundamental_package_reference_is_bound_and_unexpired(self):
+        response = _completed_response()
+        explanation = RecordingPresenter().explain(
+            response.result,
+            user_name="Prateek",
+        )
+        completed_at = _now()
+        reference = BrowserFundamentalPackageReference(
+            package_id="fundamental_package:" + "a" * 64,
+            manifest_fingerprint="a" * 64,
+            expires_at=completed_at + timedelta(days=10),
+        )
+        output = BrowserOperationOutput(
+            operation_id="operation-1",
+            session_id="session-1",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            completed_at=completed_at,
+            research_response=response,
+            research_explanation=explanation,
+            fundamental_package_reference=reference,
+        )
+
+        self.assertEqual(output.fundamental_package_reference, reference)
+        with self.assertRaisesRegex(ValueError, "manifest fingerprint"):
+            BrowserFundamentalPackageReference(
+                package_id="fundamental_package:" + "b" * 64,
+                manifest_fingerprint="a" * 64,
+                expires_at=completed_at + timedelta(days=10),
+            )
+        with self.assertRaisesRegex(ValueError, "expired fundamental package"):
+            BrowserOperationOutput(
+                operation_id="operation-1",
+                session_id="session-1",
+                kind=BrowserOperationKind.SWING_ANALYSIS,
+                completed_at=completed_at,
+                research_response=response,
+                research_explanation=explanation,
+                fundamental_package_reference=reference.model_copy(
+                    update={"expires_at": completed_at}
+                ),
             )
 
     @staticmethod
@@ -417,6 +775,64 @@ class BrowserOperationOutputTests(unittest.TestCase):
                         structured_document_references=(reference, duplicate),
                     )
 
+    @staticmethod
+    def _fundamental_analysis(*, citations):
+        return FundamentalAnalysis(
+            analysis_id="fundamental-analysis-1",
+            evidence_coverage_and_freshness="Current cached financial data.",
+            financial_strengths=("Revenue growth is positive.",),
+            financial_risks_and_conflicts=(),
+            preliminary_financial_health="Preliminary health is stable.",
+            confidence_percentage=60.0,
+            valuation_observations=(),
+            missing_evidence_and_limitations=("Annual report unavailable.",),
+            document_citations=citations,
+            runtime_skill_id="jarvis-fundamental-analyst",
+            runtime_skill_version="1.0.0",
+            runtime_skill_prompt_sha256="a" * 64,
+            model_id="test-model",
+            generated_at=_now(),
+        )
+
+    def test_swing_output_binds_fundamental_analysis_to_exposed_reference(self):
+        response = _completed_response()
+        explanation = RecordingPresenter().explain(
+            response.result,
+            user_name="Prateek",
+        )
+        reference = self._structured_reference()
+        analysis = self._fundamental_analysis(
+            citations=(reference.cache_entry_id,)
+        )
+
+        output = BrowserOperationOutput(
+            operation_id="operation-1",
+            session_id="session-1",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            completed_at=_now(),
+            research_response=response,
+            research_explanation=explanation,
+            structured_document_references=(reference,),
+            fundamental_analysis=analysis,
+        )
+
+        self.assertIs(output.fundamental_analysis, analysis)
+
+        invented = analysis.model_copy(
+            update={"document_citations": ("financial_document:invented",)}
+        )
+        with self.assertRaisesRegex(ValueError, "only exposed cached"):
+            BrowserOperationOutput(
+                operation_id="operation-1",
+                session_id="session-1",
+                kind=BrowserOperationKind.SWING_ANALYSIS,
+                completed_at=_now(),
+                research_response=response,
+                research_explanation=explanation,
+                structured_document_references=(reference,),
+                fundamental_analysis=invented,
+            )
+
 
 class JarvisBrowserOperationHandlerTests(unittest.TestCase):
     def test_technical_only_analysis_never_invokes_fundamental_executor(self):
@@ -431,6 +847,8 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
             benchmarking_financials_repository=(
                 InMemoryBenchmarkingFinancialsRepository()
             ),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(),
+            package_repository=InMemoryFundamentalPackageRepository(),
         )
         handler = JarvisBrowserOperationHandler(
             _ResearchExecutor(_completed_response()),
@@ -455,18 +873,24 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
         self.assertEqual(gateway.calls, [])
         self.assertEqual(output.fundamental_evidence, ())
 
-    def test_requested_fundamentals_dispatch_all_capabilities_and_retain_results(self):
+    def test_filing_evidence_runs_after_verified_issuer_without_browser_payload(self):
         clock = _AdvancingClock()
         gateway = _RecordingStructuredFundamentalGateway()
-        repository = InMemoryFundamentalSnapshotRepository(clock=clock)
+        filing_coordinator = _RecordingFilingEvidenceCoordinator()
         coordinator = FundamentalEvidenceCoordinator(
             gateway=gateway,
-            repository=repository,
+            repository=InMemoryFundamentalSnapshotRepository(clock=clock),
             structured_document_repository=(
                 InMemoryStructuredFinancialDocumentRepository(clock=clock)
             ),
             benchmarking_financials_repository=(
                 InMemoryBenchmarkingFinancialsRepository(clock=clock)
+            ),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(
+                clock=clock
+            ),
+            package_repository=InMemoryFundamentalPackageRepository(
+                clock=clock
             ),
             clock=clock,
         )
@@ -476,7 +900,164 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
             RecordingJudgeFollowUpExecutor(),
             user_name="Prateek",
             fundamental_evidence_executor=coordinator,
+            fundamental_filing_evidence_executor=filing_coordinator,
             provider_scope_resolver=lambda session_id: build_connection(),
+            clock=clock,
+        )
+        from app.workflow.events import (
+            InMemoryWorkflowEventSink,
+            WorkflowEventEmitter,
+        )
+        from app.workflow.browser_runner import BrowserCancellationToken
+
+        request = _request().model_copy(
+            update={
+                "fundamentals_requested": True,
+                "refresh_requested": True,
+            }
+        )
+        sink = InMemoryWorkflowEventSink()
+        output = handler.execute(
+            request,
+            event_emitter=WorkflowEventEmitter("operation-1", sink),
+            cancellation_token=BrowserCancellationToken(),
+        )
+
+        self.assertEqual(len(filing_coordinator.calls), 1)
+        filing_request, refresh_requested = filing_coordinator.calls[0]
+        self.assertTrue(refresh_requested)
+        self.assertEqual(filing_request.operation_id, request.operation_id)
+        self.assertEqual(filing_request.issuer.symbol, "TCS")
+        self.assertEqual(filing_request.issuer.provider_company_id, "1364")
+        self.assertEqual(filing_request.through_date, filing_request.requested_at.date())
+        self.assertEqual(len(filing_request.categories), 2)
+        filing_events = [
+            event
+            for event in sink.events
+            if event.activity.participant_id
+            == "fundamentals.corporate_filings_analyst"
+        ]
+        self.assertEqual(
+            [event.state for event in filing_events],
+            [WorkflowEventState.STARTED, WorkflowEventState.COMPLETED],
+        )
+        browser_json = repr(output)
+        self.assertNotIn("safe_relative_path", browser_json)
+        self.assertNotIn("artifact_url", browser_json)
+        self.assertNotIn("filing_artifact", browser_json)
+
+    def test_filing_failure_is_an_independent_agent_outcome(self):
+        clock = _AdvancingClock()
+        gateway = _RecordingStructuredFundamentalGateway()
+        filing_coordinator = _RecordingFilingEvidenceCoordinator(fail=True)
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=gateway,
+            repository=InMemoryFundamentalSnapshotRepository(clock=clock),
+            structured_document_repository=(
+                InMemoryStructuredFinancialDocumentRepository(clock=clock)
+            ),
+            benchmarking_financials_repository=(
+                InMemoryBenchmarkingFinancialsRepository(clock=clock)
+            ),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(
+                clock=clock
+            ),
+            package_repository=InMemoryFundamentalPackageRepository(
+                clock=clock
+            ),
+            clock=clock,
+        )
+        handler = JarvisBrowserOperationHandler(
+            _ResearchExecutor(_completed_response_with_series()),
+            RecordingPresenter(),
+            RecordingJudgeFollowUpExecutor(),
+            user_name="Prateek",
+            fundamental_evidence_executor=coordinator,
+            fundamental_filing_evidence_executor=filing_coordinator,
+            provider_scope_resolver=lambda session_id: build_connection(),
+            clock=clock,
+        )
+        from app.workflow.events import (
+            InMemoryWorkflowEventSink,
+            WorkflowEventEmitter,
+        )
+        from app.workflow.browser_runner import BrowserCancellationToken
+
+        request = _request().model_copy(
+            update={
+                "fundamentals_requested": True,
+                "refresh_requested": True,
+            }
+        )
+        sink = InMemoryWorkflowEventSink()
+        output = handler.execute(
+            request,
+            event_emitter=WorkflowEventEmitter("operation-1", sink),
+            cancellation_token=BrowserCancellationToken(),
+        )
+
+        self.assertIsNone(output.fundamental_failure)
+        self.assertEqual(len(output.fundamental_evidence), 3)
+        snapshot = BrowserOperationSnapshot(
+            request=request,
+            status=BrowserOperationStatus.COMPLETED,
+            updated_at=output.completed_at,
+            last_event_sequence=len(sink.events),
+            result_available=True,
+        )
+        outcomes = {
+            outcome.participant_id: outcome
+            for outcome in build_agent_execution_outcomes(
+                snapshot,
+                sink.events,
+                output,
+            )
+        }
+        filing_outcome = outcomes["fundamentals.corporate_filings_analyst"]
+        self.assertIs(
+            filing_outcome.status,
+            BrowserAgentExecutionStatus.FAILED,
+        )
+        self.assertEqual(
+            filing_outcome.failure.message,
+            "Corporate filing discovery is temporarily unavailable.",
+        )
+        self.assertIs(
+            outcomes["fundamentals.fundamental_analyst"].status,
+            BrowserAgentExecutionStatus.COMPLETED,
+        )
+
+    def test_requested_fundamentals_dispatch_all_capabilities_and_retain_results(self):
+        clock = _AdvancingClock()
+        gateway = _RecordingStructuredFundamentalGateway()
+        analyst = _RecordingFundamentalAnalyst()
+        sector_resolver = _TcsSectorEvidenceResolver()
+        repository = InMemoryFundamentalSnapshotRepository(clock=clock)
+        package_repository = InMemoryFundamentalPackageRepository(clock=clock)
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=gateway,
+            repository=repository,
+            structured_document_repository=(
+                InMemoryStructuredFinancialDocumentRepository(clock=clock)
+            ),
+            benchmarking_financials_repository=(
+                InMemoryBenchmarkingFinancialsRepository(clock=clock)
+            ),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(
+                clock=clock
+            ),
+            package_repository=package_repository,
+            clock=clock,
+        )
+        handler = JarvisBrowserOperationHandler(
+            _ResearchExecutor(_completed_response_with_series()),
+            RecordingPresenter(),
+            RecordingJudgeFollowUpExecutor(),
+            user_name="Prateek",
+            fundamental_evidence_executor=coordinator,
+            provider_scope_resolver=lambda session_id: build_connection(),
+            fundamental_analyst=analyst,
+            fundamental_sector_evidence_resolver=sector_resolver,
             clock=clock,
         )
         from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
@@ -504,22 +1085,54 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
                 "overview",
                 "financials",
                 "shareholding",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
+                "financial_package",
+                "peer_comparison",
                 "benchmarking_financials",
             ],
         )
         self.assertEqual(len(output.fundamental_evidence), 3)
         self.assertEqual(len(output.structured_document_references), 11)
+        package_reference = output.fundamental_package_reference
+        self.assertIsNotNone(package_reference)
+        self.assertEqual(
+            package_reference.package_id,
+            "fundamental_package:" + package_reference.manifest_fingerprint,
+        )
+        self.assertGreater(package_reference.expires_at, output.completed_at)
+        self.assertIsNotNone(output.fundamental_analysis)
+        self.assertEqual(len(analyst.calls), 1)
+        analyst_evidence, intelligence, analyst_as_of = analyst.calls[0]
+        self.assertEqual(len(analyst_evidence), 13)
+        self.assertTrue(
+            all(item.document.expires_at > analyst_as_of for item in analyst_evidence)
+        )
+        self.assertEqual(
+            intelligence.scorecard.decision_influence_mode.value,
+            "shadow",
+        )
+        self.assertEqual(
+            intelligence.scorecard.package_id,
+            package_reference.package_id,
+        )
+        self.assertEqual(len(sector_resolver.calls), 1)
+        self.assertEqual(sector_resolver.calls[0][1], "TCS-EQ")
+        self.assertIsNotNone(intelligence.sector_classification)
+        self.assertEqual(
+            intelligence.sector_classification.profile,
+            FinancialHealthSectorProfile.NON_FINANCIAL,
+        )
+        self.assertEqual(
+            intelligence.sector_classification.evidence[0].source_reference_id,
+            "nse-sector-master:TCS",
+        )
+        self.assertEqual(
+            intelligence.scorecard.applicability_assessment_fingerprint,
+            intelligence.applicability_assessment.assessment_fingerprint,
+        )
+        self.assertEqual(
+            output.fundamental_analysis.document_citations,
+            (output.structured_document_references[0].cache_entry_id,),
+        )
         benchmarking_reference = output.benchmarking_financials_reference
         self.assertIsNotNone(benchmarking_reference)
         self.assertEqual(
@@ -569,12 +1182,151 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
                 for item in output.fundamental_evidence
             )
         )
+        expected_scope = FundamentalPackageRepositoryScope(
+            connection=build_connection(),
+            issuer=output.fundamental_evidence[0].retrieval.issuer,
+        )
+        active_package = package_repository.get_active_fundamental_package(
+            scope=expected_scope,
+            as_of=clock(),
+        )
+        self.assertIsNotNone(active_package)
+        self.assertEqual(len(active_package.manifest.items), 16)
         self.assertTrue(
             all(
                 item.decision.reason == "explicit_refresh"
                 for item in output.fundamental_evidence
             )
         )
+
+    def test_fundamental_failure_names_safe_dataset_without_provider_details(self):
+        clock = _AdvancingClock()
+        gateway = _FailingCashFlowGateway()
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=gateway,
+            repository=InMemoryFundamentalSnapshotRepository(clock=clock),
+            structured_document_repository=(
+                InMemoryStructuredFinancialDocumentRepository(clock=clock)
+            ),
+            benchmarking_financials_repository=(
+                InMemoryBenchmarkingFinancialsRepository(clock=clock)
+            ),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(
+                clock=clock
+            ),
+            package_repository=InMemoryFundamentalPackageRepository(
+                clock=clock
+            ),
+            clock=clock,
+        )
+        handler = JarvisBrowserOperationHandler(
+            _ResearchExecutor(_completed_response_with_series()),
+            RecordingPresenter(),
+            RecordingJudgeFollowUpExecutor(),
+            user_name="Prateek",
+            fundamental_evidence_executor=coordinator,
+            provider_scope_resolver=lambda session_id: build_connection(),
+            clock=clock,
+        )
+        from app.workflow.events import (
+            InMemoryWorkflowEventSink,
+            WorkflowEventEmitter,
+        )
+        from app.workflow.browser_runner import BrowserCancellationToken
+
+        request = _request().model_copy(
+            update={
+                "fundamentals_requested": True,
+                "refresh_requested": True,
+            }
+        )
+        sink = InMemoryWorkflowEventSink()
+        output = handler.execute(
+            request,
+            event_emitter=WorkflowEventEmitter(
+                "operation-1",
+                sink,
+            ),
+            cancellation_token=BrowserCancellationToken(),
+        )
+
+        failure = output.fundamental_failure
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.code, "fundamentals.unavailable")
+        self.assertIsNotNone(output.research_response.result)
+        self.assertIsNotNone(output.research_explanation)
+        self.assertIn("financial document package", failure.message)
+        self.assertNotIn("raw provider details", failure.message)
+        fundamental_events = [
+            event
+            for event in sink.events
+            if event.activity.participant_id
+            == "fundamentals.fundamental_analyst"
+        ]
+        self.assertEqual(
+            [event.state for event in fundamental_events],
+            [WorkflowEventState.STARTED, WorkflowEventState.FAILED],
+        )
+
+    def test_fundamental_validation_failure_names_safe_runtime_stage(self):
+        clock = _AdvancingClock()
+        gateway = _RecordingStructuredFundamentalGateway()
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=gateway,
+            repository=InMemoryFundamentalSnapshotRepository(clock=clock),
+            structured_document_repository=(
+                InMemoryStructuredFinancialDocumentRepository(clock=clock)
+            ),
+            benchmarking_financials_repository=(
+                InMemoryBenchmarkingFinancialsRepository(clock=clock)
+            ),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(
+                clock=clock
+            ),
+            package_repository=InMemoryFundamentalPackageRepository(
+                clock=clock
+            ),
+            clock=clock,
+        )
+        handler = JarvisBrowserOperationHandler(
+            _ResearchExecutor(_completed_response_with_series()),
+            RecordingPresenter(),
+            RecordingJudgeFollowUpExecutor(),
+            user_name="Prateek",
+            fundamental_evidence_executor=coordinator,
+            provider_scope_resolver=lambda session_id: build_connection(),
+            fundamental_analyst=_InvalidFundamentalAnalyst(),
+            clock=clock,
+        )
+        from app.workflow.events import (
+            InMemoryWorkflowEventSink,
+            WorkflowEventEmitter,
+        )
+        from app.workflow.browser_runner import BrowserCancellationToken
+
+        request = _request().model_copy(
+            update={
+                "fundamentals_requested": True,
+                "refresh_requested": True,
+            }
+        )
+        output = handler.execute(
+            request,
+            event_emitter=WorkflowEventEmitter(
+                "operation-1",
+                InMemoryWorkflowEventSink(),
+            ),
+            cancellation_token=BrowserCancellationToken(),
+        )
+
+        failure = output.fundamental_failure
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.code, "fundamentals.analyst_unavailable")
+        self.assertIn("Fundamental Analyst", failure.message)
+        self.assertNotIn("object", failure.message)
+        self.assertIsNotNone(output.fundamental_package_reference)
+        self.assertEqual(len(output.structured_document_references), 11)
+        self.assertIsNone(output.fundamental_analysis)
 
     def test_repeated_fundamental_analysis_reuses_identity_and_evidence_cache(self):
         clock = _AdvancingClock()
@@ -588,6 +1340,12 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
             ),
             benchmarking_financials_repository=(
                 InMemoryBenchmarkingFinancialsRepository(clock=clock)
+            ),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(
+                clock=clock
+            ),
+            package_repository=InMemoryFundamentalPackageRepository(
+                clock=clock
             ),
             clock=clock,
         )
@@ -632,6 +1390,7 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
                 "structured_document",
                 "structured_document",
                 "structured_document",
+                "peer_comparison",
                 "benchmarking_financials",
             ],
         )
@@ -647,6 +1406,7 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
 
         self.assertEqual(len(first.fundamental_evidence), 3)
         self.assertEqual(len(first.structured_document_references), 11)
+        self.assertIsNone(first.fundamental_package_reference)
         self.assertIs(
             first.benchmarking_financials_reference.source,
             FundamentalEvidenceSource.PROVIDER,
@@ -659,6 +1419,7 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
             )
         )
         self.assertEqual(len(second.structured_document_references), 11)
+        self.assertIsNone(second.fundamental_package_reference)
         self.assertIs(
             second.benchmarking_financials_reference.source,
             FundamentalEvidenceSource.CACHE,
@@ -686,6 +1447,7 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
 
         self.assertEqual(len(third.fundamental_evidence), 3)
         self.assertEqual(len(third.structured_document_references), 11)
+        self.assertIsNone(third.fundamental_package_reference)
         self.assertIs(
             third.benchmarking_financials_reference.source,
             FundamentalEvidenceSource.PROVIDER,
@@ -714,8 +1476,91 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
                 "structured_document",
                 "structured_document",
                 "structured_document",
+                "peer_comparison",
                 "benchmarking_financials",
             ],
+        )
+
+    def test_incomplete_browser_refresh_preserves_active_package(self):
+        clock = _AdvancingClock()
+        gateway = _RecordingStructuredFundamentalGateway()
+        snapshot_repository = InMemoryFundamentalSnapshotRepository(clock=clock)
+        package_repository = InMemoryFundamentalPackageRepository(clock=clock)
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=gateway,
+            repository=snapshot_repository,
+            structured_document_repository=(
+                InMemoryStructuredFinancialDocumentRepository(clock=clock)
+            ),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(
+                clock=clock
+            ),
+            benchmarking_financials_repository=(
+                InMemoryBenchmarkingFinancialsRepository(clock=clock)
+            ),
+            package_repository=package_repository,
+            clock=clock,
+        )
+        research = _ResearchExecutor(_completed_response_with_series())
+        handler = JarvisBrowserOperationHandler(
+            research,
+            RecordingPresenter(),
+            RecordingJudgeFollowUpExecutor(),
+            user_name="Prateek",
+            fundamental_evidence_executor=coordinator,
+            provider_scope_resolver=lambda session_id: build_connection(),
+            clock=clock,
+        )
+        from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
+        from app.workflow.browser_runner import BrowserCancellationToken
+
+        first_request = _request().model_copy(
+            update={"fundamentals_requested": True, "refresh_requested": True}
+        )
+        first_output = handler.execute(
+            first_request,
+            event_emitter=WorkflowEventEmitter(
+                first_request.operation_id,
+                InMemoryWorkflowEventSink(),
+            ),
+            cancellation_token=BrowserCancellationToken(),
+        )
+        scope = FundamentalPackageRepositoryScope(
+            connection=build_connection(),
+            issuer=first_output.fundamental_evidence[0].retrieval.issuer,
+        )
+        first_package = package_repository.get_active_fundamental_package(
+            scope=scope,
+            as_of=clock(),
+        )
+        self.assertIsNotNone(first_package)
+
+        gateway.failure = True
+        second_request = first_request.model_copy(
+            update={"operation_id": "operation-2"}
+        )
+        research.response = research.response.model_copy(
+            update={"operation_id": second_request.operation_id}
+        )
+        second_output = handler.execute(
+            second_request,
+            event_emitter=WorkflowEventEmitter(
+                second_request.operation_id,
+                InMemoryWorkflowEventSink(),
+            ),
+            cancellation_token=BrowserCancellationToken(),
+        )
+
+        self.assertEqual(
+            second_output.fundamental_failure.code,
+            "fundamentals.refresh_incomplete",
+        )
+        self.assertEqual(
+            package_repository.get_active_fundamental_package(
+                scope=scope,
+                as_of=clock(),
+            ),
+            first_package,
         )
 
     def test_intent_failure_becomes_candid_safe_browser_failure(self):
@@ -745,7 +1590,7 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
         self.assertIn("Analyse TCS for me", failure.message)
         self.assertNotIn("private parser detail", failure.message)
 
-    def test_llm_failure_becomes_safe_browser_failure(self):
+    def test_llm_failure_returns_safe_output_without_a_conclusion(self):
         response = JarvisSwingAnalysisResponse.llm_failure(
             operation_id="operation-1",
             failure=JarvisLLMFailureResponse(
@@ -767,26 +1612,27 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
         from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
         from app.workflow.browser_runner import BrowserCancellationToken
 
-        with self.assertRaises(BrowserOperationHandledFailure) as captured:
-            handler.execute(
-                _request(),
-                event_emitter=WorkflowEventEmitter(
-                    "operation-1",
-                    InMemoryWorkflowEventSink(),
-                ),
-                cancellation_token=BrowserCancellationToken(),
-            )
+        output = handler.execute(
+            _request(),
+            event_emitter=WorkflowEventEmitter(
+                "operation-1",
+                InMemoryWorkflowEventSink(),
+            ),
+            cancellation_token=BrowserCancellationToken(),
+        )
 
         self.assertEqual(
-            captured.exception.failure.code,
+            output.decision_failure.code,
             "llm.provider_unavailable",
         )
-        self.assertTrue(captured.exception.failure.retryable)
+        self.assertTrue(output.decision_failure.retryable)
+        self.assertIsNone(output.research_response.result)
 
     def test_fundamentals_persist_before_subsequent_llm_failure(self):
         clock = _AdvancingClock()
         gateway = _BrowserFundamentalGateway()
         repository = InMemoryFundamentalSnapshotRepository(clock=clock)
+        package_repository = InMemoryFundamentalPackageRepository(clock=clock)
         coordinator = FundamentalEvidenceCoordinator(
             gateway=gateway,
             repository=repository,
@@ -796,6 +1642,10 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
             benchmarking_financials_repository=(
                 InMemoryBenchmarkingFinancialsRepository(clock=clock)
             ),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(
+                clock=clock
+            ),
+            package_repository=package_repository,
             clock=clock,
         )
         response = JarvisSwingAnalysisResponse.llm_failure(
@@ -829,15 +1679,15 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
             }
         )
 
-        with self.assertRaises(BrowserOperationHandledFailure) as captured:
-            handler.execute(
-                request,
-                event_emitter=WorkflowEventEmitter(
-                    "operation-1",
-                    InMemoryWorkflowEventSink(),
-                ),
-                cancellation_token=BrowserCancellationToken(),
-            )
+        sink = InMemoryWorkflowEventSink()
+        output = handler.execute(
+            request,
+            event_emitter=WorkflowEventEmitter(
+                "operation-1",
+                sink,
+            ),
+            cancellation_token=BrowserCancellationToken(),
+        )
 
         self.assertEqual(
             gateway.calls,
@@ -846,23 +1696,28 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
                 "overview",
                 "financials",
                 "shareholding",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
-                "structured_document",
+                "financial_package",
+                "peer_comparison",
                 "benchmarking_financials",
             ],
         )
         self.assertEqual(
-            captured.exception.failure.code,
+            output.decision_failure.code,
             "llm.authentication",
+        )
+        self.assertEqual(len(output.fundamental_evidence), 3)
+        self.assertEqual(len(output.structured_document_references), 11)
+        self.assertIsNotNone(output.benchmarking_financials_reference)
+        self.assertIsNotNone(output.fundamental_package_reference)
+        fundamental_events = [
+            event
+            for event in sink.events
+            if event.activity.participant_id
+            == "fundamentals.fundamental_analyst"
+        ]
+        self.assertEqual(
+            [event.state for event in fundamental_events],
+            [WorkflowEventState.STARTED, WorkflowEventState.COMPLETED],
         )
         stored = repository.list_fundamental_snapshots(
             FundamentalSnapshotQuery(
@@ -875,6 +1730,90 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
             as_of=clock(),
         )
         self.assertEqual(len(stored), 3)
+
+    def test_fundamental_analyst_llm_failure_retains_committed_refresh_and_debate_failure(self):
+        clock = _AdvancingClock()
+        gateway = _RecordingStructuredFundamentalGateway()
+        package_repository = InMemoryFundamentalPackageRepository(clock=clock)
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=gateway,
+            repository=InMemoryFundamentalSnapshotRepository(clock=clock),
+            structured_document_repository=(
+                InMemoryStructuredFinancialDocumentRepository(clock=clock)
+            ),
+            benchmarking_financials_repository=(
+                InMemoryBenchmarkingFinancialsRepository(clock=clock)
+            ),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(clock=clock),
+            package_repository=package_repository,
+            clock=clock,
+        )
+        response = JarvisSwingAnalysisResponse.llm_failure(
+            operation_id="operation-1",
+            failure=JarvisLLMFailureResponse(
+                code=LLMFailureCode.AUTHENTICATION,
+                title="The panel is unavailable",
+                display_message="The debate panel could not authenticate.",
+                spoken_message="The panel is unavailable.",
+                recovery_action="Check the configured LLM credential.",
+                retryable=False,
+                operation_id="operation-1",
+            ),
+        )
+        connection = build_connection()
+        handler = JarvisBrowserOperationHandler(
+            _ResearchExecutor(response),
+            RecordingPresenter(),
+            RecordingJudgeFollowUpExecutor(),
+            user_name="Prateek",
+            fundamental_evidence_executor=coordinator,
+            provider_scope_resolver=lambda session_id: connection,
+            fundamental_analyst=_FailingFundamentalAnalyst(),
+            clock=clock,
+        )
+        from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
+        from app.workflow.browser_runner import BrowserCancellationToken
+
+        request = _request().model_copy(
+            update={"fundamentals_requested": True, "refresh_requested": True}
+        )
+        sink = InMemoryWorkflowEventSink()
+        output = handler.execute(
+            request,
+            event_emitter=WorkflowEventEmitter("operation-1", sink),
+            cancellation_token=BrowserCancellationToken(),
+        )
+
+        self.assertEqual(output.decision_failure.code, "llm.authentication")
+        self.assertEqual(
+            output.fundamental_failure.code,
+            "fundamentals.analyst_unavailable",
+        )
+        self.assertNotIn("private provider credential detail", repr(output))
+        self.assertIsNone(output.fundamental_analysis)
+        self.assertEqual(len(output.fundamental_evidence), 3)
+        self.assertEqual(len(output.structured_document_references), 11)
+        self.assertIsNotNone(output.benchmarking_financials_reference)
+        reference = output.fundamental_package_reference
+        self.assertIsNotNone(reference)
+        active_package = package_repository.get_active_fundamental_package(
+            scope=FundamentalPackageRepositoryScope(
+                connection=connection,
+                issuer=output.fundamental_evidence[0].retrieval.issuer,
+            ),
+            as_of=clock(),
+        )
+        self.assertIsNotNone(active_package)
+        self.assertEqual(active_package.package_id, reference.package_id)
+        self.assertEqual(len(active_package.manifest.items), 16)
+        fundamental_events = [
+            event for event in sink.events
+            if event.activity.participant_id == "fundamentals.fundamental_analyst"
+        ]
+        self.assertEqual(
+            [event.state for event in fundamental_events],
+            [WorkflowEventState.STARTED, WorkflowEventState.FAILED],
+        )
 
     def test_analysis_uses_one_operation_and_presents_result(self):
         research = _ResearchExecutor(_completed_response())

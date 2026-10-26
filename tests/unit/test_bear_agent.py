@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from tests.unit._debate_fixtures import (
     build_approved_technical_result,
@@ -9,17 +10,32 @@ from app.agents.bear_agent import BearDebateAgent
 from app.exceptions import LLMResponseValidationError
 from app.llm.gateway import StructuredGeneration
 from app.models.debate import DebateSide
+from app.models.runtime_skill import RuntimeAgentRole
+from app.orchestration.agent_orchestrator import AgentOrchestrator
+from app.runtime_skill_loader import RuntimeSkillLoader
+from tests.unit.test_build_multi_timeframe_evidence import (
+    _cyclical_timeframes,
+)
+
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class FakeGateway:
-    def __init__(self, draft_payloads, model="fake-bear-model"):
+    def __init__(
+        self,
+        draft_payloads,
+        model="fake-bear-model",
+        fingerprint="b" * 64,
+    ):
         self.draft_payloads = list(draft_payloads)
         self.calls = []
         self.model = model
+        self.fingerprint = fingerprint
 
     @property
     def configuration_fingerprint(self):
-        return "b" * 64
+        return self.fingerprint
 
     def generate(self, *, system, messages, response_model):
         self.calls.append({"system": system, "messages": messages})
@@ -33,6 +49,17 @@ class FakeGateway:
 
 
 class BearDebateAgentTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        skills = RuntimeSkillLoader(
+            _REPOSITORY_ROOT / "runtime-skills" / "manifest.yaml"
+        ).load()
+        cls.bear_runtime_skill = skills.skill_for(RuntimeAgentRole.BEAR)
+        cls.bull_runtime_skill = skills.skill_for(RuntimeAgentRole.BULL)
+        cls.technical_review = AgentOrchestrator().run_multi_timeframe_analysis(
+            _cyclical_timeframes()
+        )
+
     def setUp(self):
         technical_result = build_approved_technical_result()
         self.profile = technical_result.submission.profile
@@ -44,9 +71,67 @@ class BearDebateAgentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "validated configuration"):
             BearDebateAgent(FakeGateway([]), config=object())
 
+    def test_rejects_unverified_or_wrong_role_runtime_skill(self):
+        with self.assertRaisesRegex(ValueError, "must be verified"):
+            BearDebateAgent(FakeGateway([]), runtime_skill=object())
+        with self.assertRaisesRegex(ValueError, "requires the Bear"):
+            BearDebateAgent(
+                FakeGateway([]),
+                runtime_skill=self.bull_runtime_skill,
+            )
+
     def test_rejects_non_gateway_dependency(self):
         with self.assertRaisesRegex(ValueError, "structured LLM gateway"):
             BearDebateAgent(object())
+
+    def test_configuration_fingerprint_includes_runtime_skill(self):
+        embedded = BearDebateAgent(FakeGateway([]))
+        static = BearDebateAgent(
+            FakeGateway([]),
+            runtime_skill=self.bear_runtime_skill,
+        )
+
+        self.assertNotEqual(
+            embedded.configuration_fingerprint,
+            static.configuration_fingerprint,
+        )
+
+    def test_verified_skill_is_multi_timeframe_system_instruction(self):
+        package = self.technical_review.released_evidence
+        evidence_id = package.daily.evidence[0].qualified_evidence_id
+        gateway = FakeGateway(
+            [
+                {
+                    "thesis": "Daily weakness increases long-entry risk.",
+                    "evidence_citations": [evidence_id],
+                    "rebuts_argument_id": None,
+                    "timeframe_relationship": "mixed",
+                }
+            ]
+        )
+        agent = BearDebateAgent(
+            gateway,
+            runtime_skill=self.bear_runtime_skill,
+        )
+
+        agent.generate_multi_timeframe_argument(
+            technical_review=self.technical_review,
+            transcript_so_far=(),
+            round_number=1,
+        )
+
+        self.assertEqual(
+            gateway.calls[0]["system"],
+            self.bear_runtime_skill.system_instructions,
+        )
+        self.assertIn(
+            "# Jarvis Runtime Evidence Grounding",
+            gateway.calls[0]["system"],
+        )
+        self.assertIn(
+            "# Jarvis Bear Runtime Skill",
+            gateway.calls[0]["system"],
+        )
 
     def test_prompt_includes_all_evidence_ids(self):
         gateway = FakeGateway(

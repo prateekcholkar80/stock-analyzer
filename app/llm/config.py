@@ -20,6 +20,8 @@ class LLMRole(StrEnum):
     BULL = "bull"
     BEAR = "bear"
     JUDGE = "judge"
+    FUNDAMENTAL_ANALYST = "fundamental_analyst"
+    CORPORATE_FILINGS_ANALYST = "corporate_filings_analyst"
     JARVIS = "jarvis"
     TICKER_RESOLVER = "ticker_resolver"
 
@@ -85,6 +87,14 @@ class LLMSettings(BaseModel):
         default=None,
         alias="JARVIS_JUDGE_LLM_MODEL",
     )
+    fundamental_analyst_model: str | None = Field(
+        default=None,
+        alias="JARVIS_FUNDAMENTAL_ANALYST_LLM_MODEL",
+    )
+    corporate_filings_analyst_model: str | None = Field(
+        default=None,
+        alias="JARVIS_CORPORATE_FILINGS_ANALYST_LLM_MODEL",
+    )
     jarvis_model: str | None = Field(
         default=None,
         alias="JARVIS_PERSONA_LLM_MODEL",
@@ -111,6 +121,18 @@ class LLMSettings(BaseModel):
         ge=0,
         le=2,
         alias="JARVIS_JUDGE_LLM_TEMPERATURE",
+    )
+    fundamental_analyst_temperature: float = Field(
+        default=0.0,
+        ge=0,
+        le=2,
+        alias="JARVIS_FUNDAMENTAL_ANALYST_LLM_TEMPERATURE",
+    )
+    corporate_filings_analyst_temperature: float = Field(
+        default=0.0,
+        ge=0,
+        le=2,
+        alias="JARVIS_CORPORATE_FILINGS_ANALYST_LLM_TEMPERATURE",
     )
     jarvis_temperature: float = Field(
         default=0.2,
@@ -140,6 +162,16 @@ class LLMSettings(BaseModel):
         gt=0,
         alias="JARVIS_JUDGE_LLM_MAX_TOKENS",
     )
+    fundamental_analyst_max_tokens: int = Field(
+        default=2_500,
+        gt=0,
+        alias="JARVIS_FUNDAMENTAL_ANALYST_LLM_MAX_TOKENS",
+    )
+    corporate_filings_analyst_max_tokens: int = Field(
+        default=4_000,
+        gt=0,
+        alias="JARVIS_CORPORATE_FILINGS_ANALYST_LLM_MAX_TOKENS",
+    )
     jarvis_max_tokens: int = Field(
         default=5_000,
         gt=0,
@@ -156,6 +188,8 @@ class LLMSettings(BaseModel):
         "bull_model",
         "bear_model",
         "judge_model",
+        "fundamental_analyst_model",
+        "corporate_filings_analyst_model",
         "jarvis_model",
         "ticker_resolver_model",
         mode="before",
@@ -188,6 +222,10 @@ class LLMSettings(BaseModel):
             LLMRole.BULL: self.bull_model,
             LLMRole.BEAR: self.bear_model,
             LLMRole.JUDGE: self.judge_model,
+            LLMRole.FUNDAMENTAL_ANALYST: self.fundamental_analyst_model,
+            LLMRole.CORPORATE_FILINGS_ANALYST: (
+                self.corporate_filings_analyst_model
+            ),
             LLMRole.JARVIS: self.jarvis_model or self.judge_model,
             LLMRole.TICKER_RESOLVER: self.ticker_resolver_model,
         }[role]
@@ -205,6 +243,12 @@ class LLMSettings(BaseModel):
             LLMRole.BULL: self.bull_temperature,
             LLMRole.BEAR: self.bear_temperature,
             LLMRole.JUDGE: self.judge_temperature,
+            LLMRole.FUNDAMENTAL_ANALYST: (
+                self.fundamental_analyst_temperature
+            ),
+            LLMRole.CORPORATE_FILINGS_ANALYST: (
+                self.corporate_filings_analyst_temperature
+            ),
             LLMRole.JARVIS: self.jarvis_temperature,
             LLMRole.TICKER_RESOLVER: self.ticker_resolver_temperature,
         }[role]
@@ -212,6 +256,12 @@ class LLMSettings(BaseModel):
             LLMRole.BULL: self.bull_max_tokens,
             LLMRole.BEAR: self.bear_max_tokens,
             LLMRole.JUDGE: self.judge_max_tokens,
+            LLMRole.FUNDAMENTAL_ANALYST: (
+                self.fundamental_analyst_max_tokens
+            ),
+            LLMRole.CORPORATE_FILINGS_ANALYST: (
+                self.corporate_filings_analyst_max_tokens
+            ),
             LLMRole.JARVIS: self.jarvis_max_tokens,
             LLMRole.TICKER_RESOLVER: self.ticker_resolver_max_tokens,
         }[role]

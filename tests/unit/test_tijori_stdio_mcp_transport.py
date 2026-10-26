@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 from pydantic import ValidationError
 
@@ -58,6 +59,13 @@ class TijoriStdioMcpSettingsTests(unittest.TestCase):
             TijoriStdioMcpSettings(
                 **{**valid, "server_arguments": ("bad\nargument",)}
             )
+        with self.assertRaises(ValidationError):
+            TijoriStdioMcpSettings(
+                **{
+                    **valid,
+                    "filing_staging_directory": Path("relative-staging"),
+                }
+            )
 
     def test_settings_are_frozen_and_fingerprinted_without_session_content(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -106,6 +114,8 @@ class TijoriStdioMcpTransportTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.session_root = Path(self.temporary.name)
         self.session_root.chmod(0o700)
+        self.filing_staging_directory = self.session_root / "filing-staging"
+        self.filing_staging_directory.mkdir(mode=0o700)
         python = Path(sys.executable).resolve()
         self.runtime = self.session_root / "pinned-runtime-launcher"
         self.runtime.write_text(
@@ -120,6 +130,7 @@ class TijoriStdioMcpTransportTests(unittest.TestCase):
             server_entrypoint=FIXTURE,
             server_sha256=file_hash(FIXTURE),
             session_root=self.session_root,
+            filing_staging_directory=self.filing_staging_directory,
             timeout_seconds=1.5,
             terminate_grace_seconds=0.1,
         )
@@ -155,7 +166,7 @@ class TijoriStdioMcpTransportTests(unittest.TestCase):
         self.assertEqual(len(self.transport.configuration_fingerprint), 64)
         self.assertNotIn("tenant-1", self.transport.configuration_fingerprint)
 
-    def test_inspects_exact_five_tools_after_mcp_handshake(self):
+    def test_inspects_exact_seven_tools_after_mcp_handshake(self):
         inspection = self.transport.inspect(connection=self.connection)
         self.assertEqual(inspection.available_tools, TIJORI_APPROVED_TOOLS)
         self.assertTrue(inspection.authenticated)
@@ -341,6 +352,37 @@ class TijoriStdioMcpTransportTests(unittest.TestCase):
                 os.environ["TIJORI_PASSWORD"] = previous
         self.assertEqual(result.status, TijoriToolStatus.SUCCESS)
 
+    def test_passes_only_bounded_non_secret_environment_to_subprocess(self):
+        captured: dict[str, object] = {}
+
+        def capture_process(*args, **kwargs):
+            captured.update(kwargs)
+            raise OSError("synthetic launch stop")
+
+        with patch("subprocess.Popen", side_effect=capture_process):
+            self.assert_transport_failure(
+                TijoriTransportFailureKind.CONFIGURATION,
+                lambda: self.transport._start_process(
+                    self.transport.session_path_for(self.connection)
+                ),
+            )
+
+        environment = captured["env"]
+        self.assertEqual(
+            set(environment),
+            {
+                "LANG",
+                "LC_ALL",
+                "JARVIS_TIJORI_SESSION_FILE",
+                "JARVIS_TIJORI_PROVIDER_CONTRACT_VERSION",
+                "JARVIS_TIJORI_FILING_STAGING_DIRECTORY",
+            },
+        )
+        self.assertEqual(
+            environment["JARVIS_TIJORI_FILING_STAGING_DIRECTORY"],
+            str(self.filing_staging_directory),
+        )
+
     def test_rejects_non_json_tool_arguments(self):
         self.assert_transport_failure(
             TijoriTransportFailureKind.PROTOCOL,
@@ -357,7 +399,7 @@ class TijoriStdioMcpTransportTests(unittest.TestCase):
             clock=lambda: NOW,
         )
         manifest = adapter.inspect_capabilities(connection=self.connection)
-        self.assertEqual(len(manifest.capabilities), 5)
+        self.assertEqual(len(manifest.capabilities), 7)
         response = adapter.search_companies(
             request=FundamentalCompanySearchRequest(
                 request_id="synthetic-transport-search",

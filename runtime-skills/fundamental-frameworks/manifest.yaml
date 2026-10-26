@@ -1,0 +1,31 @@
+schema_version: jarvis.fundamental_framework_skill_manifest.v1
+registry_contract: jarvis.fundamental_framework_skill_registry.v1
+registry_content_sha256: d032f70a99fe54261bce3787bdda510e1b466c0c289ef883e92705d6cc3e3eee
+load_policy: fail_closed
+provider_neutral: true
+
+approval:
+  status: approved
+  scope: exact_sha256
+  approved_on: 2026-09-14
+
+shared_policy:
+  path: shared/evidence-grounding.md
+  content_sha256: 87325c64d9f7638682a001448d6011bcd0aa12937dbb2b0ec899f385f3feffbc
+
+skills:
+  - skill_id: jarvis.fundamental_framework.jhunjhunwala_style.v1
+    framework: jhunjhunwala_style
+    version: 1.0.0
+    path: fundamental-frameworks/jhunjhunwala-style/SKILL.md
+    content_sha256: d6a87d2a6f54311f76468f6ee377ab4b9fbf930872433fe0fa8093d91e0aca83
+    contract_schema: jarvis.fundamental_framework_skill.v1
+    output_schema_id: jarvis.fundamental_framework_explanation.v1
+    score_policy_id: jarvis.framework_score.jhunjhunwala_style
+    score_policy_version: 1.0.0
+    doctrine:
+      doctrine_id: jarvis.fundamental_framework_doctrine.jhunjhunwala_style.v1
+      version: 1.0.0
+      path: fundamental-frameworks/jhunjhunwala-style/references/framework-doctrine.md
+      content_sha256: b5f56a669f4334c98fcae3e540b66a547f5612cde5e38d06a387a4ee45b99aed
+    approval_status: approved

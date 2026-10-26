@@ -5,6 +5,7 @@ from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
+from app.models.evidence_hierarchy import HierarchicalEvidenceAssessment
 from app.models.multi_timeframe_evidence import (
     SwingAnalysisTimeframe,
     timeframe_interval,
@@ -311,7 +312,10 @@ class MultiTimeframeSwingInterpretation(TechnicalModel):
 
     model_config = ConfigDict(frozen=True, strict=True)
 
-    schema_version: Literal["jarvis.multi_timeframe_interpretation.v1"] = (
+    schema_version: Literal[
+        "jarvis.multi_timeframe_interpretation.v1",
+        "jarvis.multi_timeframe_interpretation.v2",
+    ] = (
         "jarvis.multi_timeframe_interpretation.v1"
     )
     daily: TimeframeMarketInterpretation
@@ -321,6 +325,7 @@ class MultiTimeframeSwingInterpretation(TechnicalModel):
     structural_risk: StructuralRisk
     risk_reward: SwingRiskRewardInterpretation
     trade_decision: TradeDecisionOutcome
+    hierarchy_assessment: HierarchicalEvidenceAssessment | None = None
     decisive_evidence_ids: tuple[str, ...] = ()
     decision_change_conditions: tuple[str, ...] = Field(min_length=1)
     rationale: str = Field(min_length=1)
@@ -369,6 +374,17 @@ class MultiTimeframeSwingInterpretation(TechnicalModel):
 
     @model_validator(mode="after")
     def validate_interpretation(self) -> Self:
+        legacy_schema = (
+            self.schema_version == "jarvis.multi_timeframe_interpretation.v1"
+        )
+        if legacy_schema and self.hierarchy_assessment is not None:
+            raise ValueError(
+                "legacy interpretation cannot contain a hierarchy assessment"
+            )
+        if not legacy_schema and self.hierarchy_assessment is None:
+            raise ValueError(
+                "version-2 interpretation requires a hierarchy assessment"
+            )
         if self.daily.timeframe is not SwingAnalysisTimeframe.DAILY:
             raise ValueError("daily interpretation must be assigned to daily")
         if self.weekly.timeframe is not SwingAnalysisTimeframe.WEEKLY:
@@ -389,13 +405,18 @@ class MultiTimeframeSwingInterpretation(TechnicalModel):
             raise ValueError(
                 "timeframe alignment does not match daily and weekly conditions"
             )
-        expected_condition = derive_combined_market_condition(
-            self.daily.market_condition,
-            self.weekly.market_condition,
+        expected_condition = (
+            derive_combined_market_condition(
+                self.daily.market_condition,
+                self.weekly.market_condition,
+            )
+            if legacy_schema
+            else self.hierarchy_assessment.primary_condition
         )
         if self.trade_decision.market_condition is not expected_condition:
             raise ValueError(
-                "trade decision condition does not match timeframe conditions"
+                "trade decision condition does not match its deterministic "
+                "condition source"
             )
 
         available_evidence = set(self.daily.decisive_evidence_ids) | set(
@@ -427,14 +448,17 @@ class MultiTimeframeSwingInterpretation(TechnicalModel):
                 )
 
         if self.trade_decision.decision is TradeDecision.BUY:
-            self._validate_buy_policy()
+            self._validate_buy_policy(legacy_schema=legacy_schema)
         else:
             self._validate_no_trade_policy(expected_condition)
         return self
 
-    def _validate_buy_policy(self) -> None:
+    def _validate_buy_policy(self, *, legacy_schema: bool) -> None:
         if (
-            self.alignment is not TimeframeAlignment.ALIGNED_BULLISH
+            (
+                legacy_schema
+                and self.alignment is not TimeframeAlignment.ALIGNED_BULLISH
+            )
             or self.tactical_readiness is not TacticalReadiness.READY
             or self.structural_risk
             not in {StructuralRisk.LOW, StructuralRisk.MODERATE}
@@ -444,6 +468,13 @@ class MultiTimeframeSwingInterpretation(TechnicalModel):
             raise ValueError(
                 "BUY requires aligned bullish timeframes, ready trigger, "
                 "acceptable structural risk and feasible 2R"
+            )
+        if (
+            not legacy_schema
+            and not self.hierarchy_assessment.release_eligible
+        ):
+            raise ValueError(
+                "BUY requires hierarchy release eligibility"
             )
 
     def _validate_no_trade_policy(

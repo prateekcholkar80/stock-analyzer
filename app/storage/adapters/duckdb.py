@@ -46,13 +46,59 @@ from app.models.benchmarking_financials_storage import (
     BenchmarkingFinancialsCacheKey,
     StoredBenchmarkingFinancialsDocument,
 )
+from app.models.fundamental_package import FundamentalEvidencePackage
+from app.models.fundamental_filings import (
+    FundamentalFilingArtifactManifest,
+    FundamentalFilingPackage,
+)
+from app.storage.fundamental_package_repositories import (
+    FundamentalPackageRepositoryScope,
+)
+from app.storage.fundamental_filing_repositories import (
+    FundamentalFilingDeleteAuthorization,
+    FundamentalFilingDeleteReceipt,
+    FundamentalFilingDeleteStatus,
+    FundamentalFilingDeleteTarget,
+    FundamentalFilingRepositoryScope,
+)
+from app.storage.fundamental_filing_evidence_repositories import (
+    FundamentalFilingEvidencePolicyKey,
+    StoredFundamentalFilingEvidence,
+)
+from app.storage.corporate_filings_analysis_repositories import (
+    CorporateFilingsAnalysisDeleteAuthorization,
+    CorporateFilingsAnalysisDeleteReceipt,
+    CorporateFilingsAnalysisDeleteStatus,
+    CorporateFilingsAnalysisPeriodKey,
+    CorporateFilingsAnalysisRepositoryScope,
+    StoredCorporateFilingsAnalysis,
+)
+from app.models.corporate_filings_analysis import (
+    CorporateFilingsAnalysisReuseKey,
+)
 
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 9
 _STRUCTURED_CACHE_ENTRY_ID_PATTERN = r"^financial_document:[a-f0-9]{64}$"
 _PEER_COMPARISON_CACHE_ENTRY_ID_PATTERN = r"^peer_comparison:[a-f0-9]{64}$"
 _BENCHMARKING_FINANCIALS_CACHE_ENTRY_ID_PATTERN = (
     r"^benchmarking_financials:[a-f0-9]{64}$"
+)
+_FILING_FINGERPRINT_PATTERN = r"^[a-f0-9]{64}$"
+_FILING_ARTIFACT_ID_PATTERN = r"^filing_artifact:[a-f0-9]{64}$"
+_FILING_PACKAGE_ID_PATTERN = r"^filing_package:[a-f0-9]{64}$"
+_FILING_EVIDENCE_RECORD_ID_PATTERN = (
+    r"^filing_evidence_record:[a-f0-9]{64}$"
+)
+_CORPORATE_FILINGS_ANALYSIS_RECORD_ID_PATTERN = (
+    r"^corporate_filings_analysis:[a-f0-9]{64}$"
+)
+_FILING_REFERENCE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,179}$"
+_FILING_ACTIVE_REFERENCE_DETAIL = (
+    "The filing artifact is referenced by a retained filing package."
+)
+_CORPORATE_FILINGS_ANALYSIS_ACTIVE_DETAIL = (
+    "The corporate-filings analysis is the active successful result."
 )
 FundamentalCacheClock = Callable[[], datetime]
 
@@ -84,6 +130,7 @@ class DuckDBJarvisStorage:
             )
             self.purge_expired_peer_comparisons(as_of=self._now())
             self.purge_expired_benchmarking_financials(as_of=self._now())
+            self.purge_expired_fundamental_packages(as_of=self._now())
         except StorageError:
             self._close_after_initialization_failure()
             raise
@@ -610,11 +657,8 @@ class DuckDBJarvisStorage:
                                 "fundamental replacement is not newer than "
                                 "cached data"
                             )
-                        self._delete_fundamental_entry_locked(
-                            value.cache_key.cache_entry_id
-                        )
                         persisted = value
-                        self._insert_fundamental_parent(persisted, summary)
+                        self._update_fundamental_parent(persisted, summary)
 
                 self._persist_fundamental_details(persisted)
                 self._connection.execute("COMMIT")
@@ -962,6 +1006,110 @@ class DuckDBJarvisStorage:
                     self._rollback_safely()
                 raise StorageError(
                     "Unable to replace DuckDB structured document"
+                ) from exc
+
+    def replace_structured_financial_document_package(
+        self,
+        stored: tuple[StoredStructuredFinancialDocument, ...],
+        *,
+        scope: StructuredDocumentRepositoryScope,
+    ) -> tuple[StoredStructuredFinancialDocument, ...]:
+        """Replace all eleven financial documents in one transaction."""
+
+        if not isinstance(stored, tuple) or len(stored) != 11:
+            raise StorageError(
+                "structured financial package must contain eleven documents"
+            )
+        values = tuple(
+            StoredStructuredFinancialDocument.model_validate(item)
+            for item in stored
+        )
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        now = self._now()
+        cache_entry_ids = tuple(
+            value.cache_key.cache_entry_id for value in values
+        )
+        if len(cache_entry_ids) != len(set(cache_entry_ids)):
+            raise StorageConflictError(
+                "structured financial package contains duplicate cache keys"
+            )
+        package_identities = {
+            (
+                value.cache_key.issuer.model_dump_json(),
+                value.cache_key.as_of_date,
+                value.retrieved_at,
+                value.stored_at,
+            )
+            for value in values
+        }
+        if len(package_identities) != 1:
+            raise StorageError(
+                "structured financial package is not one immutable snapshot"
+            )
+
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_structured_documents_locked(as_of=now)
+                actions = []
+                for value in values:
+                    if value.cache_key.repository_scope != caller_scope:
+                        raise StorageError(
+                            "structured financial package scope does not match key"
+                        )
+                    self._validate_structured_document_writable(value, as_of=now)
+                    existing = self._connection.execute(
+                        "SELECT storage_fingerprint, payload_json "
+                        "FROM jarvis_structured_financial_documents "
+                        "WHERE cache_entry_id = ?",
+                        [value.cache_key.cache_entry_id],
+                    ).fetchone()
+                    if existing is None:
+                        actions.append(("insert", value, value))
+                        continue
+                    current = (
+                        StoredStructuredFinancialDocument.model_validate_json(
+                            existing[1]
+                        )
+                    )
+                    if current.storage_fingerprint != existing[0]:
+                        raise StorageError(
+                            "DuckDB structured document fingerprint is inconsistent"
+                        )
+                    if existing[0] == value.storage_fingerprint:
+                        actions.append(("retain", value, current))
+                        continue
+                    if value.retrieved_at <= current.retrieved_at:
+                        raise StorageConflictError(
+                            "structured financial package is not newer than cache"
+                        )
+                    actions.append(("replace", value, value))
+
+                for action, value, _persisted in actions:
+                    if action == "retain":
+                        continue
+                    if action == "replace":
+                        self._delete_structured_document_locked(
+                            value.cache_key.cache_entry_id
+                        )
+                    self._insert_structured_document(value)
+                self._connection.execute("COMMIT")
+                return tuple(
+                    self._copy_structured_document(persisted)
+                    for _action, _value, persisted in actions
+                )
+            except StorageError:
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to replace DuckDB structured financial package"
                 ) from exc
 
     def get_structured_financial_document(
@@ -1787,6 +1935,1272 @@ class DuckDBJarvisStorage:
                     "Unable to purge DuckDB Benchmarking Financials"
                 ) from exc
 
+    def commit_fundamental_package(
+        self,
+        package: FundamentalEvidencePackage,
+        *,
+        expected_active_package_id: str | None,
+    ) -> FundamentalEvidencePackage:
+        value = FundamentalEvidencePackage.model_validate(package)
+        now = self._now()
+        scope = FundamentalPackageRepositoryScope.from_package(value)
+        scope_fingerprint = self._fundamental_package_scope_fingerprint(scope)
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_fundamental_packages_locked(as_of=now)
+                self._validate_fundamental_package_writable(value, as_of=now)
+                row = self._connection.execute(
+                    "SELECT package_id FROM jarvis_active_fundamental_packages "
+                    "WHERE scope_fingerprint = ?",
+                    [scope_fingerprint],
+                ).fetchone()
+                active_package_id = row[0] if row is not None else None
+                if active_package_id != expected_active_package_id:
+                    raise StorageConflictError(
+                        "active fundamental package changed before commit"
+                    )
+
+                existing = self._connection.execute(
+                    "SELECT aggregate_fingerprint "
+                    "FROM jarvis_fundamental_packages WHERE package_id = ?",
+                    [value.package_id],
+                ).fetchone()
+                if (
+                    existing is not None
+                    and existing[0] != value.aggregate_fingerprint
+                ):
+                    raise StorageConflictError(
+                        "fundamental package ID contains different data"
+                    )
+                if existing is None:
+                    self._insert_fundamental_package(value, scope_fingerprint)
+
+                self._connection.execute(
+                    "DELETE FROM jarvis_active_fundamental_packages "
+                    "WHERE scope_fingerprint = ?",
+                    [scope_fingerprint],
+                )
+                self._connection.execute(
+                    "INSERT INTO jarvis_active_fundamental_packages "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        scope_fingerprint,
+                        value.package_id,
+                        scope.connection.tenant_id,
+                        scope.connection.provider_connection_id,
+                        scope.connection.provider,
+                        scope.issuer.exchange,
+                        scope.issuer.symbol,
+                        now,
+                    ],
+                )
+                self._connection.execute("COMMIT")
+                return self._copy_fundamental_package(value)
+            except (StorageConflictError, StorageError):
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to commit DuckDB fundamental package"
+                ) from exc
+
+    def get_active_fundamental_package(
+        self,
+        *,
+        scope: FundamentalPackageRepositoryScope,
+        as_of: datetime,
+    ) -> FundamentalEvidencePackage | None:
+        caller_scope = FundamentalPackageRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(
+            as_of,
+            "fundamental package read time",
+        )
+        scope_fingerprint = self._fundamental_package_scope_fingerprint(
+            caller_scope
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_fundamental_packages_locked(as_of=read_at)
+                row = self._connection.execute(
+                    "SELECT p.payload_json "
+                    "FROM jarvis_active_fundamental_packages AS a "
+                    "JOIN jarvis_fundamental_packages AS p "
+                    "ON p.package_id = a.package_id "
+                    "WHERE a.scope_fingerprint = ? AND p.committed_at <= ?",
+                    [scope_fingerprint, read_at],
+                ).fetchone()
+                self._connection.execute("COMMIT")
+                if row is None:
+                    return None
+                package = FundamentalEvidencePackage.model_validate_json(row[0])
+                if FundamentalPackageRepositoryScope.from_package(
+                    package
+                ) != caller_scope:
+                    return None
+                return self._copy_fundamental_package(package)
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to read active DuckDB fundamental package"
+                ) from exc
+
+    def get_fundamental_package(
+        self,
+        package_id: str,
+        *,
+        scope: FundamentalPackageRepositoryScope,
+        as_of: datetime,
+    ) -> FundamentalEvidencePackage | None:
+        if not isinstance(package_id, str) or fullmatch(
+            r"fundamental_package:[a-f0-9]{64}", package_id
+        ) is None:
+            raise ValueError("fundamental package ID is invalid")
+        caller_scope = FundamentalPackageRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(
+            as_of,
+            "fundamental package read time",
+        )
+        scope_fingerprint = self._fundamental_package_scope_fingerprint(
+            caller_scope
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._purge_expired_fundamental_packages_locked(as_of=read_at)
+                row = self._connection.execute(
+                    "SELECT payload_json FROM jarvis_fundamental_packages "
+                    "WHERE package_id = ? AND scope_fingerprint = ? "
+                    "AND committed_at <= ?",
+                    [package_id, scope_fingerprint, read_at],
+                ).fetchone()
+                self._connection.execute("COMMIT")
+                if row is None:
+                    return None
+                return self._copy_fundamental_package(
+                    FundamentalEvidencePackage.model_validate_json(row[0])
+                )
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to read DuckDB fundamental package"
+                ) from exc
+
+    def purge_expired_fundamental_packages(
+        self,
+        *,
+        as_of: datetime,
+    ) -> int:
+        purge_at = _require_aware_datetime(
+            as_of,
+            "fundamental package purge time",
+        )
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                removed = self._purge_expired_fundamental_packages_locked(
+                    as_of=purge_at
+                )
+                self._connection.execute("COMMIT")
+                return removed
+            except duckdb.Error as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to purge DuckDB fundamental packages"
+                ) from exc
+
+    def save_filing_artifact(
+        self,
+        artifact: FundamentalFilingArtifactManifest,
+    ) -> FundamentalFilingArtifactManifest:
+        value = FundamentalFilingArtifactManifest.model_validate(artifact)
+        now = self._now()
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._validate_filing_artifact_writable(value, as_of=now)
+                self._validate_filing_artifact_links_locked(value, pending={})
+                persisted = self._save_filing_artifact_locked(value)
+                self._connection.execute("COMMIT")
+                return persisted
+            except (StorageConflictError, StorageError):
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to persist DuckDB filing artifact metadata"
+                ) from exc
+
+    def save_filing_evidence(
+        self,
+        record: StoredFundamentalFilingEvidence,
+    ) -> StoredFundamentalFilingEvidence:
+        value = StoredFundamentalFilingEvidence.model_validate(record)
+        now = self._now()
+        if value.stored_at > now:
+            raise StorageError(
+                "fundamental filing evidence storage time is in the future"
+            )
+        scope = value.scope
+        scope_fingerprint = self._filing_scope_fingerprint(scope)
+        reference = value.evidence.artifact.reference
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                row = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_fundamental_filing_evidence "
+                    "WHERE record_id = ?",
+                    [value.record_id],
+                ).fetchone()
+                if row is not None:
+                    existing = self._decode_scoped_filing_evidence(
+                        row[0],
+                        scope=scope,
+                    )
+                    if existing != value:
+                        raise StorageConflictError(
+                            "filing evidence record ID contains different data"
+                        )
+                    self._connection.execute("COMMIT")
+                    return self._copy_filing_evidence(existing)
+
+                self._connection.execute(
+                    "INSERT INTO jarvis_fundamental_filing_evidence VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        value.record_id,
+                        value.record_fingerprint,
+                        scope_fingerprint,
+                        reference.connection.tenant_id,
+                        reference.connection.provider_connection_id,
+                        reference.connection.provider,
+                        reference.issuer.exchange,
+                        reference.issuer.symbol,
+                        reference.issuer.isin,
+                        value.artifact_id,
+                        value.artifact_fingerprint,
+                        value.extraction_policy_fingerprint,
+                        value.validation_policy_fingerprint,
+                        value.extraction_fingerprint,
+                        value.validation_fingerprint,
+                        value.releaseable,
+                        value.evidence.extracted_at,
+                        value.stored_at,
+                        value.to_storage_json(),
+                    ],
+                )
+                self._connection.execute("COMMIT")
+                return self._copy_filing_evidence(value)
+            except (StorageConflictError, StorageError):
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to persist DuckDB filing evidence"
+                ) from exc
+
+    def get_filing_evidence(
+        self,
+        record_id: str,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+        as_of: datetime,
+    ) -> StoredFundamentalFilingEvidence | None:
+        self._validate_filing_identifier(
+            record_id,
+            pattern=_FILING_EVIDENCE_RECORD_ID_PATTERN,
+            label="filing evidence record ID",
+        )
+        caller_scope = FundamentalFilingRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(as_of, "filing evidence read time")
+        scope_fingerprint = self._filing_scope_fingerprint(caller_scope)
+        with self._lock:
+            self._ensure_open()
+            try:
+                row = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_fundamental_filing_evidence "
+                    "WHERE record_id = ? AND scope_fingerprint = ? "
+                    "AND stored_at <= ?",
+                    [record_id, scope_fingerprint, read_at],
+                ).fetchone()
+                if row is None:
+                    return None
+                value = self._decode_scoped_filing_evidence(
+                    row[0],
+                    scope=caller_scope,
+                )
+                if value.record_id != record_id:
+                    raise StorageError(
+                        "DuckDB filing evidence record identity is inconsistent"
+                    )
+                return self._copy_filing_evidence(value)
+            except StorageError:
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to read DuckDB filing evidence"
+                ) from exc
+
+    def list_filing_evidence_for_artifact(
+        self,
+        artifact_id: str,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+        as_of: datetime,
+    ) -> tuple[StoredFundamentalFilingEvidence, ...]:
+        self._validate_filing_identifier(
+            artifact_id,
+            pattern=_FILING_ARTIFACT_ID_PATTERN,
+            label="filing artifact ID",
+        )
+        caller_scope = FundamentalFilingRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(as_of, "filing evidence read time")
+        scope_fingerprint = self._filing_scope_fingerprint(caller_scope)
+        with self._lock:
+            self._ensure_open()
+            try:
+                rows = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_fundamental_filing_evidence "
+                    "WHERE scope_fingerprint = ? AND artifact_id = ? "
+                    "AND stored_at <= ? "
+                    "ORDER BY extracted_at, stored_at, record_id",
+                    [scope_fingerprint, artifact_id, read_at],
+                ).fetchall()
+                values = tuple(
+                    self._decode_scoped_filing_evidence(
+                        row[0],
+                        scope=caller_scope,
+                    )
+                    for row in rows
+                )
+                if any(value.artifact_id != artifact_id for value in values):
+                    raise StorageError(
+                        "DuckDB filing evidence artifact identity is inconsistent"
+                    )
+                return tuple(
+                    self._copy_filing_evidence(value) for value in values
+                )
+            except StorageError:
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to list DuckDB filing evidence"
+                ) from exc
+
+    def find_filing_evidence_by_policy(
+        self,
+        key: FundamentalFilingEvidencePolicyKey,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+        as_of: datetime,
+    ) -> tuple[StoredFundamentalFilingEvidence, ...]:
+        policy_key = FundamentalFilingEvidencePolicyKey.model_validate(key)
+        caller_scope = FundamentalFilingRepositoryScope.model_validate(scope)
+        read_at = _require_aware_datetime(as_of, "filing evidence read time")
+        scope_fingerprint = self._filing_scope_fingerprint(caller_scope)
+        with self._lock:
+            self._ensure_open()
+            try:
+                rows = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_fundamental_filing_evidence "
+                    "WHERE scope_fingerprint = ? AND artifact_id = ? "
+                    "AND artifact_fingerprint = ? "
+                    "AND extraction_policy_fingerprint = ? "
+                    "AND validation_policy_fingerprint = ? "
+                    "AND stored_at <= ? "
+                    "ORDER BY extracted_at, stored_at, record_id",
+                    [
+                        scope_fingerprint,
+                        policy_key.artifact_id,
+                        policy_key.artifact_fingerprint,
+                        policy_key.extraction_policy_fingerprint,
+                        policy_key.validation_policy_fingerprint,
+                        read_at,
+                    ],
+                ).fetchall()
+                values = tuple(
+                    self._decode_scoped_filing_evidence(
+                        row[0],
+                        scope=caller_scope,
+                    )
+                    for row in rows
+                )
+                if any(
+                    FundamentalFilingEvidencePolicyKey.from_record(value)
+                    != policy_key
+                    for value in values
+                ):
+                    raise StorageError(
+                        "DuckDB filing evidence policy identity is inconsistent"
+                    )
+                return tuple(
+                    self._copy_filing_evidence(value) for value in values
+                )
+            except StorageError:
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to query DuckDB filing evidence by policy"
+                ) from exc
+
+    def save_corporate_filings_analysis(
+        self,
+        record: StoredCorporateFilingsAnalysis,
+    ) -> StoredCorporateFilingsAnalysis:
+        value = self._copy_corporate_filings_analysis(
+            StoredCorporateFilingsAnalysis.model_validate(record)
+        )
+        now = self._now()
+        self._validate_corporate_filings_analysis_writable(value, as_of=now)
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                existing = self._validate_corporate_analysis_conflicts_locked(
+                    value
+                )
+                if existing is None:
+                    self._insert_corporate_filings_analysis_locked(value)
+                    existing = value
+                self._connection.execute("COMMIT")
+                return self._copy_corporate_filings_analysis(existing)
+            except (StorageConflictError, StorageError):
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to persist DuckDB corporate-filings analysis"
+                ) from exc
+
+    def find_corporate_filings_analysis_by_reuse_key(
+        self,
+        reuse_key: CorporateFilingsAnalysisReuseKey,
+        *,
+        scope: CorporateFilingsAnalysisRepositoryScope,
+        as_of: datetime,
+    ) -> StoredCorporateFilingsAnalysis | None:
+        key = CorporateFilingsAnalysisReuseKey.model_validate(reuse_key)
+        caller_scope = CorporateFilingsAnalysisRepositoryScope.model_validate(
+            scope
+        )
+        read_at = _require_aware_datetime(
+            as_of,
+            "corporate analysis reuse read time",
+        )
+        with self._lock:
+            self._ensure_open()
+            try:
+                rows = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_corporate_filings_analysis "
+                    "WHERE scope_fingerprint = ? "
+                    "AND reuse_key_fingerprint = ? AND stored_at <= ?",
+                    [
+                        caller_scope.scope_fingerprint,
+                        key.reuse_key_fingerprint,
+                        read_at,
+                    ],
+                ).fetchall()
+                if not rows:
+                    return None
+                if len(rows) != 1:
+                    raise StorageError(
+                        "DuckDB corporate analysis reuse index is ambiguous"
+                    )
+                value = self._decode_scoped_corporate_filings_analysis(
+                    rows[0][0],
+                    scope=caller_scope,
+                )
+                if value.reuse_key != key:
+                    raise StorageError(
+                        "DuckDB corporate analysis reuse metadata is inconsistent"
+                    )
+                return self._copy_corporate_filings_analysis(value)
+            except StorageError:
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to query DuckDB corporate analysis by reuse key"
+                ) from exc
+
+    def list_corporate_filings_analysis_history(
+        self,
+        period_key: CorporateFilingsAnalysisPeriodKey,
+        *,
+        scope: CorporateFilingsAnalysisRepositoryScope,
+        as_of: datetime,
+    ) -> tuple[StoredCorporateFilingsAnalysis, ...]:
+        key = CorporateFilingsAnalysisPeriodKey.model_validate(period_key)
+        caller_scope = CorporateFilingsAnalysisRepositoryScope.model_validate(
+            scope
+        )
+        read_at = _require_aware_datetime(
+            as_of,
+            "corporate analysis history read time",
+        )
+        with self._lock:
+            self._ensure_open()
+            try:
+                rows = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_corporate_filings_analysis "
+                    "WHERE scope_fingerprint = ? "
+                    "AND period_key_fingerprint = ? AND stored_at <= ? "
+                    "ORDER BY stored_at, analysis_completed_at, record_id",
+                    [
+                        caller_scope.scope_fingerprint,
+                        key.period_key_fingerprint,
+                        read_at,
+                    ],
+                ).fetchall()
+                values = tuple(
+                    self._decode_scoped_corporate_filings_analysis(
+                        row[0],
+                        scope=caller_scope,
+                    )
+                    for row in rows
+                )
+                if any(value.period_key != key for value in values):
+                    raise StorageError(
+                        "DuckDB corporate analysis period metadata is inconsistent"
+                    )
+                return tuple(
+                    self._copy_corporate_filings_analysis(value)
+                    for value in values
+                )
+            except StorageError:
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to list DuckDB corporate analysis history"
+                ) from exc
+
+    def get_active_corporate_filings_analysis(
+        self,
+        period_key: CorporateFilingsAnalysisPeriodKey,
+        *,
+        scope: CorporateFilingsAnalysisRepositoryScope,
+        as_of: datetime,
+    ) -> StoredCorporateFilingsAnalysis | None:
+        key = CorporateFilingsAnalysisPeriodKey.model_validate(period_key)
+        caller_scope = CorporateFilingsAnalysisRepositoryScope.model_validate(
+            scope
+        )
+        read_at = _require_aware_datetime(
+            as_of,
+            "active corporate analysis read time",
+        )
+        with self._lock:
+            self._ensure_open()
+            try:
+                row = self._connection.execute(
+                    "SELECT r.payload_json "
+                    "FROM jarvis_corporate_filings_analysis_active_history AS h "
+                    "JOIN jarvis_corporate_filings_analysis AS r "
+                    "ON r.record_id = h.record_id "
+                    "WHERE h.scope_fingerprint = ? "
+                    "AND h.period_key_fingerprint = ? "
+                    "AND h.activated_at <= ? AND r.stored_at <= ? "
+                    "ORDER BY h.activated_at DESC, "
+                    "h.activation_sequence DESC LIMIT 1",
+                    [
+                        caller_scope.scope_fingerprint,
+                        key.period_key_fingerprint,
+                        read_at,
+                        read_at,
+                    ],
+                ).fetchone()
+                if row is None:
+                    return None
+                value = self._decode_scoped_corporate_filings_analysis(
+                    row[0],
+                    scope=caller_scope,
+                )
+                if value.period_key != key:
+                    raise StorageError(
+                        "DuckDB active corporate analysis is inconsistent"
+                    )
+                return self._copy_corporate_filings_analysis(value)
+            except StorageError:
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to read active DuckDB corporate analysis"
+                ) from exc
+
+    def commit_corporate_filings_analysis(
+        self,
+        record: StoredCorporateFilingsAnalysis,
+        *,
+        expected_active_record_id: str | None,
+    ) -> StoredCorporateFilingsAnalysis:
+        value = self._copy_corporate_filings_analysis(
+            StoredCorporateFilingsAnalysis.model_validate(record)
+        )
+        self._validate_optional_corporate_analysis_record_id(
+            expected_active_record_id
+        )
+        now = self._now()
+        self._validate_corporate_filings_analysis_writable(value, as_of=now)
+        scope_fingerprint = value.scope.scope_fingerprint
+        period_key_fingerprint = value.period_key.period_key_fingerprint
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                row = self._connection.execute(
+                    "SELECT record_id "
+                    "FROM jarvis_active_corporate_filings_analysis "
+                    "WHERE scope_fingerprint = ? "
+                    "AND period_key_fingerprint = ?",
+                    [scope_fingerprint, period_key_fingerprint],
+                ).fetchone()
+                active_record_id = row[0] if row is not None else None
+                if active_record_id != expected_active_record_id:
+                    raise StorageConflictError(
+                        "active corporate filings analysis changed before commit"
+                    )
+
+                existing = self._validate_corporate_analysis_conflicts_locked(
+                    value
+                )
+                if active_record_id == value.record_id:
+                    if existing is None:
+                        raise StorageError(
+                            "active corporate analysis record is unavailable"
+                        )
+                    self._connection.execute("COMMIT")
+                    return self._copy_corporate_filings_analysis(existing)
+
+                if existing is None:
+                    self._insert_corporate_filings_analysis_locked(value)
+                    existing = value
+                sequence_row = self._connection.execute(
+                    "SELECT COALESCE(MAX(activation_sequence), 0) + 1 "
+                    "FROM jarvis_corporate_filings_analysis_active_history "
+                    "WHERE scope_fingerprint = ? "
+                    "AND period_key_fingerprint = ?",
+                    [scope_fingerprint, period_key_fingerprint],
+                ).fetchone()
+                activation_sequence = int(sequence_row[0])
+                self._connection.execute(
+                    "DELETE FROM jarvis_active_corporate_filings_analysis "
+                    "WHERE scope_fingerprint = ? "
+                    "AND period_key_fingerprint = ?",
+                    [scope_fingerprint, period_key_fingerprint],
+                )
+                self._connection.execute(
+                    "INSERT INTO jarvis_active_corporate_filings_analysis "
+                    "VALUES (?, ?, ?, ?)",
+                    [
+                        scope_fingerprint,
+                        period_key_fingerprint,
+                        value.record_id,
+                        now,
+                    ],
+                )
+                self._connection.execute(
+                    "INSERT INTO "
+                    "jarvis_corporate_filings_analysis_active_history "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [
+                        scope_fingerprint,
+                        period_key_fingerprint,
+                        activation_sequence,
+                        value.record_id,
+                        now,
+                    ],
+                )
+                self._connection.execute("COMMIT")
+                return self._copy_corporate_filings_analysis(existing)
+            except (StorageConflictError, StorageError):
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to commit DuckDB corporate-filings analysis"
+                ) from exc
+
+    def delete_corporate_filings_analysis(
+        self,
+        record_id: str,
+        *,
+        scope: CorporateFilingsAnalysisRepositoryScope,
+        authorization: CorporateFilingsAnalysisDeleteAuthorization,
+    ) -> CorporateFilingsAnalysisDeleteReceipt:
+        self._validate_corporate_analysis_record_id(record_id)
+        caller_scope = CorporateFilingsAnalysisRepositoryScope.model_validate(
+            scope
+        )
+        approved = CorporateFilingsAnalysisDeleteAuthorization.model_validate(
+            authorization
+        )
+        if approved.record_id != record_id:
+            raise StorageError(
+                "corporate analysis deletion authorization mismatches target"
+            )
+        completed_at = self._now()
+        if approved.authorized_at > completed_at:
+            raise StorageError(
+                "corporate analysis deletion authorization is in the future"
+            )
+        scope_fingerprint = caller_scope.scope_fingerprint
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                prior = self._read_corporate_analysis_delete_receipt_locked(
+                    approved
+                )
+                if prior is not None:
+                    self._connection.execute("COMMIT")
+                    return prior
+
+                row = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_corporate_filings_analysis "
+                    "WHERE record_id = ? AND scope_fingerprint = ?",
+                    [record_id, scope_fingerprint],
+                ).fetchone()
+                detail = None
+                if row is None:
+                    status = CorporateFilingsAnalysisDeleteStatus.NOT_FOUND
+                else:
+                    stored = self._decode_scoped_corporate_filings_analysis(
+                        row[0],
+                        scope=caller_scope,
+                    )
+                    if approved.record_fingerprint != stored.record_fingerprint:
+                        raise StorageError(
+                            "corporate analysis deletion fingerprint "
+                            "mismatches target"
+                        )
+                    active = self._connection.execute(
+                        "SELECT 1 "
+                        "FROM jarvis_active_corporate_filings_analysis "
+                        "WHERE scope_fingerprint = ? AND record_id = ? "
+                        "LIMIT 1",
+                        [scope_fingerprint, record_id],
+                    ).fetchone()
+                    if active is not None:
+                        status = (
+                            CorporateFilingsAnalysisDeleteStatus
+                            .REJECTED_ACTIVE_RESULT
+                        )
+                        detail = _CORPORATE_FILINGS_ANALYSIS_ACTIVE_DETAIL
+                    else:
+                        self._connection.execute(
+                            "DELETE FROM "
+                            "jarvis_corporate_filings_analysis_active_history "
+                            "WHERE scope_fingerprint = ? AND record_id = ?",
+                            [scope_fingerprint, record_id],
+                        )
+                        self._connection.execute(
+                            "DELETE FROM jarvis_corporate_filings_analysis "
+                            "WHERE record_id = ? AND scope_fingerprint = ?",
+                            [record_id, scope_fingerprint],
+                        )
+                        status = CorporateFilingsAnalysisDeleteStatus.DELETED
+                receipt = CorporateFilingsAnalysisDeleteReceipt(
+                    authorization=approved,
+                    status=status,
+                    completed_at=completed_at,
+                    sanitized_detail=detail,
+                )
+                self._insert_corporate_analysis_delete_receipt_locked(receipt)
+                self._connection.execute("COMMIT")
+                return self._copy_corporate_analysis_delete_receipt(receipt)
+            except (StorageConflictError, StorageError):
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to delete DuckDB corporate-filings analysis"
+                ) from exc
+
+    def find_filing_artifacts_by_content_hash(
+        self,
+        content_sha256: str,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+    ) -> tuple[FundamentalFilingArtifactManifest, ...]:
+        self._validate_filing_identifier(
+            content_sha256,
+            pattern=_FILING_FINGERPRINT_PATTERN,
+            label="filing content SHA-256",
+        )
+        caller_scope = FundamentalFilingRepositoryScope.model_validate(scope)
+        scope_fingerprint = self._filing_scope_fingerprint(caller_scope)
+        with self._lock:
+            self._ensure_open()
+            try:
+                rows = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_fundamental_filing_artifacts "
+                    "WHERE scope_fingerprint = ? AND content_sha256 = ? "
+                    "ORDER BY downloaded_at, last_checked_at, artifact_id",
+                    [scope_fingerprint, content_sha256],
+                ).fetchall()
+                return tuple(
+                    self._copy_filing_artifact(
+                        FundamentalFilingArtifactManifest.model_validate_json(
+                            row[0]
+                        )
+                    )
+                    for row in rows
+                )
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to query DuckDB filing artifacts by hash"
+                ) from exc
+
+    def get_filing_artifact(
+        self,
+        artifact_id: str,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+    ) -> FundamentalFilingArtifactManifest | None:
+        self._validate_filing_identifier(
+            artifact_id,
+            pattern=_FILING_ARTIFACT_ID_PATTERN,
+            label="filing artifact ID",
+        )
+        caller_scope = FundamentalFilingRepositoryScope.model_validate(scope)
+        scope_fingerprint = self._filing_scope_fingerprint(caller_scope)
+        with self._lock:
+            self._ensure_open()
+            try:
+                row = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_fundamental_filing_artifacts "
+                    "WHERE artifact_id = ? AND scope_fingerprint = ?",
+                    [artifact_id, scope_fingerprint],
+                ).fetchone()
+                if row is None:
+                    return None
+                return self._copy_filing_artifact(
+                    FundamentalFilingArtifactManifest.model_validate_json(
+                        row[0]
+                    )
+                )
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to read DuckDB filing artifact metadata"
+                ) from exc
+
+    def list_filing_artifact_versions(
+        self,
+        filing_reference_id: str,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+    ) -> tuple[FundamentalFilingArtifactManifest, ...]:
+        self._validate_filing_identifier(
+            filing_reference_id,
+            pattern=_FILING_REFERENCE_ID_PATTERN,
+            label="filing reference ID",
+        )
+        caller_scope = FundamentalFilingRepositoryScope.model_validate(scope)
+        scope_fingerprint = self._filing_scope_fingerprint(caller_scope)
+        with self._lock:
+            self._ensure_open()
+            try:
+                rows = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_fundamental_filing_artifacts "
+                    "WHERE scope_fingerprint = ? AND filing_reference_id = ? "
+                    "ORDER BY downloaded_at, last_checked_at, artifact_id",
+                    [scope_fingerprint, filing_reference_id],
+                ).fetchall()
+                return tuple(
+                    self._copy_filing_artifact(
+                        FundamentalFilingArtifactManifest.model_validate_json(
+                            row[0]
+                        )
+                    )
+                    for row in rows
+                )
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to list DuckDB filing artifact versions"
+                ) from exc
+
+    def commit_filing_package(
+        self,
+        package: FundamentalFilingPackage,
+        *,
+        expected_active_package_id: str | None,
+    ) -> FundamentalFilingPackage:
+        value = FundamentalFilingPackage.model_validate(package)
+        self._validate_optional_filing_package_id(expected_active_package_id)
+        now = self._now()
+        scope = FundamentalFilingRepositoryScope.from_package(value)
+        scope_fingerprint = self._filing_scope_fingerprint(scope)
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                self._validate_filing_package_writable(value, as_of=now)
+                active_row = self._connection.execute(
+                    "SELECT package_id "
+                    "FROM jarvis_active_fundamental_filing_packages "
+                    "WHERE scope_fingerprint = ?",
+                    [scope_fingerprint],
+                ).fetchone()
+                active_package_id = (
+                    active_row[0] if active_row is not None else None
+                )
+                if active_package_id != expected_active_package_id:
+                    raise StorageConflictError(
+                        "active filing package changed before commit"
+                    )
+
+                existing_row = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_fundamental_filing_packages "
+                    "WHERE package_id = ?",
+                    [value.package_id],
+                ).fetchone()
+                if existing_row is not None:
+                    existing = FundamentalFilingPackage.model_validate_json(
+                        existing_row[0]
+                    )
+                    if existing != value:
+                        raise StorageConflictError(
+                            "filing package ID contains different data"
+                        )
+
+                pending = {
+                    artifact.artifact_id: artifact
+                    for artifact in value.artifacts
+                }
+                for artifact in value.artifacts:
+                    self._validate_filing_artifact_writable(
+                        artifact,
+                        as_of=now,
+                    )
+                    self._validate_filing_artifact_links_locked(
+                        artifact,
+                        pending=pending,
+                    )
+                    self._validate_filing_artifact_conflict_locked(artifact)
+
+                for artifact in value.artifacts:
+                    self._save_filing_artifact_locked(artifact)
+                if existing_row is None:
+                    self._insert_filing_package_locked(
+                        value,
+                        scope_fingerprint=scope_fingerprint,
+                    )
+
+                manifest = value.manifest
+                self._connection.execute(
+                    "INSERT INTO jarvis_active_fundamental_filing_packages "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (scope_fingerprint) DO UPDATE SET "
+                    "package_id = excluded.package_id, "
+                    "tenant_id = excluded.tenant_id, "
+                    "provider_connection_id = excluded.provider_connection_id, "
+                    "provider = excluded.provider, "
+                    "exchange = excluded.exchange, "
+                    "symbol = excluded.symbol, "
+                    "updated_at = excluded.updated_at",
+                    [
+                        scope_fingerprint,
+                        value.package_id,
+                        manifest.connection.tenant_id,
+                        manifest.connection.provider_connection_id,
+                        manifest.connection.provider,
+                        manifest.issuer.exchange,
+                        manifest.issuer.symbol,
+                        now,
+                    ],
+                )
+                self._connection.execute("COMMIT")
+                return self._copy_filing_package(value)
+            except (StorageConflictError, StorageError):
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to commit DuckDB filing package"
+                ) from exc
+
+    def get_active_filing_package(
+        self,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+    ) -> FundamentalFilingPackage | None:
+        caller_scope = FundamentalFilingRepositoryScope.model_validate(scope)
+        scope_fingerprint = self._filing_scope_fingerprint(caller_scope)
+        with self._lock:
+            self._ensure_open()
+            try:
+                row = self._connection.execute(
+                    "SELECT p.payload_json "
+                    "FROM jarvis_active_fundamental_filing_packages AS a "
+                    "JOIN jarvis_fundamental_filing_packages AS p "
+                    "ON p.package_id = a.package_id "
+                    "WHERE a.scope_fingerprint = ?",
+                    [scope_fingerprint],
+                ).fetchone()
+                if row is None:
+                    return None
+                return self._copy_filing_package(
+                    FundamentalFilingPackage.model_validate_json(row[0])
+                )
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to read active DuckDB filing package"
+                ) from exc
+
+    def get_filing_package(
+        self,
+        package_id: str,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+    ) -> FundamentalFilingPackage | None:
+        self._validate_filing_identifier(
+            package_id,
+            pattern=_FILING_PACKAGE_ID_PATTERN,
+            label="filing package ID",
+        )
+        caller_scope = FundamentalFilingRepositoryScope.model_validate(scope)
+        scope_fingerprint = self._filing_scope_fingerprint(caller_scope)
+        with self._lock:
+            self._ensure_open()
+            try:
+                row = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_fundamental_filing_packages "
+                    "WHERE package_id = ? AND scope_fingerprint = ?",
+                    [package_id, scope_fingerprint],
+                ).fetchone()
+                if row is None:
+                    return None
+                return self._copy_filing_package(
+                    FundamentalFilingPackage.model_validate_json(row[0])
+                )
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                raise StorageError(
+                    "Unable to read DuckDB filing package"
+                ) from exc
+
+    def delete_filing_artifact(
+        self,
+        artifact_id: str,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+        authorization: FundamentalFilingDeleteAuthorization,
+    ) -> FundamentalFilingDeleteReceipt:
+        self._validate_filing_identifier(
+            artifact_id,
+            pattern=_FILING_ARTIFACT_ID_PATTERN,
+            label="filing artifact ID",
+        )
+        caller_scope = FundamentalFilingRepositoryScope.model_validate(scope)
+        approved = self._validate_filing_delete_authorization(
+            authorization,
+            target_kind=FundamentalFilingDeleteTarget.ARTIFACT,
+            target_id=artifact_id,
+        )
+        completed_at = self._now()
+        self._require_filing_authorization_not_future(
+            approved,
+            as_of=completed_at,
+        )
+        scope_fingerprint = self._filing_scope_fingerprint(caller_scope)
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                prior = self._read_filing_delete_receipt_locked(approved)
+                if prior is not None:
+                    self._connection.execute("COMMIT")
+                    return prior
+                exists = self._connection.execute(
+                    "SELECT 1 FROM jarvis_fundamental_filing_artifacts "
+                    "WHERE artifact_id = ? AND scope_fingerprint = ?",
+                    [artifact_id, scope_fingerprint],
+                ).fetchone()
+                if exists is None:
+                    status = FundamentalFilingDeleteStatus.NOT_FOUND
+                    detail = None
+                else:
+                    referenced = self._connection.execute(
+                        "SELECT 1 FROM "
+                        "jarvis_fundamental_filing_package_artifacts "
+                        "WHERE artifact_id = ? LIMIT 1",
+                        [artifact_id],
+                    ).fetchone()
+                    if referenced is not None:
+                        status = (
+                            FundamentalFilingDeleteStatus
+                            .REJECTED_ACTIVE_REFERENCE
+                        )
+                        detail = _FILING_ACTIVE_REFERENCE_DETAIL
+                    else:
+                        self._connection.execute(
+                            "DELETE FROM jarvis_fundamental_filing_artifacts "
+                            "WHERE artifact_id = ? AND scope_fingerprint = ?",
+                            [artifact_id, scope_fingerprint],
+                        )
+                        status = FundamentalFilingDeleteStatus.DELETED
+                        detail = None
+                receipt = FundamentalFilingDeleteReceipt(
+                    authorization=approved,
+                    status=status,
+                    completed_at=completed_at,
+                    sanitized_detail=detail,
+                )
+                self._insert_filing_delete_receipt_locked(receipt)
+                self._connection.execute("COMMIT")
+                return self._copy_filing_delete_receipt(receipt)
+            except (StorageConflictError, StorageError):
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to delete DuckDB filing artifact metadata"
+                ) from exc
+
+    def delete_filing_package(
+        self,
+        package_id: str,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+        authorization: FundamentalFilingDeleteAuthorization,
+    ) -> FundamentalFilingDeleteReceipt:
+        self._validate_filing_identifier(
+            package_id,
+            pattern=_FILING_PACKAGE_ID_PATTERN,
+            label="filing package ID",
+        )
+        caller_scope = FundamentalFilingRepositoryScope.model_validate(scope)
+        approved = self._validate_filing_delete_authorization(
+            authorization,
+            target_kind=FundamentalFilingDeleteTarget.PACKAGE,
+            target_id=package_id,
+        )
+        completed_at = self._now()
+        self._require_filing_authorization_not_future(
+            approved,
+            as_of=completed_at,
+        )
+        scope_fingerprint = self._filing_scope_fingerprint(caller_scope)
+        with self._lock:
+            self._ensure_open()
+            transaction_started = False
+            try:
+                self._connection.execute("BEGIN TRANSACTION")
+                transaction_started = True
+                prior = self._read_filing_delete_receipt_locked(approved)
+                if prior is not None:
+                    self._connection.execute("COMMIT")
+                    return prior
+                exists = self._connection.execute(
+                    "SELECT 1 FROM jarvis_fundamental_filing_packages "
+                    "WHERE package_id = ? AND scope_fingerprint = ?",
+                    [package_id, scope_fingerprint],
+                ).fetchone()
+                status = FundamentalFilingDeleteStatus.NOT_FOUND
+                if exists is not None:
+                    self._connection.execute(
+                        "DELETE FROM "
+                        "jarvis_active_fundamental_filing_packages "
+                        "WHERE scope_fingerprint = ? AND package_id = ?",
+                        [scope_fingerprint, package_id],
+                    )
+                    self._connection.execute(
+                        "DELETE FROM "
+                        "jarvis_fundamental_filing_package_artifacts "
+                        "WHERE package_id = ?",
+                        [package_id],
+                    )
+                    self._connection.execute(
+                        "DELETE FROM jarvis_fundamental_filing_packages "
+                        "WHERE package_id = ? AND scope_fingerprint = ?",
+                        [package_id, scope_fingerprint],
+                    )
+                    status = FundamentalFilingDeleteStatus.DELETED
+                receipt = FundamentalFilingDeleteReceipt(
+                    authorization=approved,
+                    status=status,
+                    completed_at=completed_at,
+                )
+                self._insert_filing_delete_receipt_locked(receipt)
+                self._connection.execute("COMMIT")
+                return self._copy_filing_delete_receipt(receipt)
+            except (StorageConflictError, StorageError):
+                if transaction_started:
+                    self._rollback_safely()
+                raise
+            except (duckdb.Error, ValidationError, ValueError) as exc:
+                if transaction_started:
+                    self._rollback_safely()
+                raise StorageError(
+                    "Unable to delete DuckDB filing package metadata"
+                ) from exc
+
     def find_similar_debate_runs(
         self,
         signature: tuple[str, ...],
@@ -1852,7 +3266,18 @@ class DuckDBJarvisStorage:
                     raise StorageError(
                         "Invalid DuckDB storage schema version"
                     ) from exc
-                if current_version not in (None, 1, 2, 3, 4, _SCHEMA_VERSION):
+                if current_version not in (
+                    None,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    _SCHEMA_VERSION,
+                ):
                     raise StorageError(
                         "Unsupported DuckDB storage schema version: "
                         f"{row[0]}"
@@ -1863,6 +3288,8 @@ class DuckDBJarvisStorage:
                 self._create_fundamental_tables()
                 self._create_fundamental_detail_tables()
                 self._create_structured_document_tables()
+                self._create_fundamental_package_tables()
+                self._create_fundamental_filing_tables()
                 if current_version == 1:
                     self._backfill_normalized_schema()
                 if row is None:
@@ -2092,15 +3519,13 @@ class DuckDBJarvisStorage:
             )
             """
         )
+        # DuckDB can leave this nullable, multi-column ART index unable to
+        # delete normalized source rows after a database reopen. Refresh then
+        # fails before the replacement transaction can insert newer evidence.
+        # Source scans are bounded by each snapshot's small source inventory,
+        # so retain the integrity indexes and remove this optional lookup.
         self._connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS jarvis_fundamental_source_lookup
-            ON jarvis_fundamental_sources (
-                source_type,
-                source_rank,
-                as_of_date
-            )
-            """
+            "DROP INDEX IF EXISTS jarvis_fundamental_source_lookup"
         )
         self._connection.execute(
             """
@@ -2322,6 +3747,420 @@ class DuckDBJarvisStorage:
             """
             CREATE INDEX IF NOT EXISTS jarvis_benchmarking_financials_expiry_lookup
             ON jarvis_benchmarking_financials (expires_at)
+            """
+        )
+
+    def _create_fundamental_package_tables(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_fundamental_packages (
+                package_id VARCHAR PRIMARY KEY,
+                aggregate_fingerprint VARCHAR NOT NULL,
+                manifest_fingerprint VARCHAR NOT NULL,
+                scope_fingerprint VARCHAR NOT NULL,
+                tenant_id VARCHAR NOT NULL,
+                provider_connection_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                operation_id VARCHAR NOT NULL,
+                committed_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                payload_json VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_fundamental_package_scope_lookup
+            ON jarvis_fundamental_packages (
+                tenant_id,
+                provider_connection_id,
+                provider,
+                exchange,
+                symbol,
+                committed_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_fundamental_package_expiry_lookup
+            ON jarvis_fundamental_packages (expires_at)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_active_fundamental_packages (
+                scope_fingerprint VARCHAR PRIMARY KEY,
+                package_id VARCHAR NOT NULL UNIQUE,
+                tenant_id VARCHAR NOT NULL,
+                provider_connection_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+
+    def _create_fundamental_filing_tables(self) -> None:
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_fundamental_filing_artifacts (
+                artifact_id VARCHAR PRIMARY KEY,
+                artifact_fingerprint VARCHAR NOT NULL,
+                content_sha256 VARCHAR NOT NULL,
+                scope_fingerprint VARCHAR NOT NULL,
+                tenant_id VARCHAR NOT NULL,
+                provider_connection_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                isin VARCHAR,
+                filing_reference_id VARCHAR NOT NULL,
+                category VARCHAR NOT NULL,
+                safe_relative_path VARCHAR NOT NULL,
+                downloaded_at TIMESTAMPTZ NOT NULL,
+                last_checked_at TIMESTAMPTZ NOT NULL,
+                recheck_after TIMESTAMPTZ NOT NULL,
+                payload_json VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_artifact_scope_lookup
+            ON jarvis_fundamental_filing_artifacts (
+                tenant_id,
+                provider_connection_id,
+                provider,
+                exchange,
+                symbol,
+                filing_reference_id,
+                downloaded_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_artifact_hash_lookup
+            ON jarvis_fundamental_filing_artifacts (
+                scope_fingerprint,
+                content_sha256
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_artifact_recheck_lookup
+            ON jarvis_fundamental_filing_artifacts (recheck_after)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_fundamental_filing_packages (
+                package_id VARCHAR PRIMARY KEY,
+                manifest_fingerprint VARCHAR NOT NULL,
+                discovery_fingerprint VARCHAR NOT NULL,
+                scope_fingerprint VARCHAR NOT NULL,
+                tenant_id VARCHAR NOT NULL,
+                provider_connection_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                isin VARCHAR,
+                operation_id VARCHAR NOT NULL,
+                committed_at TIMESTAMPTZ NOT NULL,
+                recheck_after TIMESTAMPTZ NOT NULL,
+                payload_json VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_package_scope_lookup
+            ON jarvis_fundamental_filing_packages (
+                tenant_id,
+                provider_connection_id,
+                provider,
+                exchange,
+                symbol,
+                committed_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_package_recheck_lookup
+            ON jarvis_fundamental_filing_packages (recheck_after)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+                jarvis_fundamental_filing_package_artifacts (
+                    package_id VARCHAR NOT NULL,
+                    artifact_id VARCHAR NOT NULL
+                )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_package_artifact_lookup
+            ON jarvis_fundamental_filing_package_artifacts (artifact_id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_package_relation_lookup
+            ON jarvis_fundamental_filing_package_artifacts (package_id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+                jarvis_active_fundamental_filing_packages (
+                    scope_fingerprint VARCHAR PRIMARY KEY,
+                    package_id VARCHAR NOT NULL UNIQUE,
+                    tenant_id VARCHAR NOT NULL,
+                    provider_connection_id VARCHAR NOT NULL,
+                    provider VARCHAR NOT NULL,
+                    exchange VARCHAR NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL
+                )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+                jarvis_fundamental_filing_delete_receipts (
+                    audit_id VARCHAR PRIMARY KEY,
+                    operation_id VARCHAR NOT NULL,
+                    authorized_by VARCHAR NOT NULL,
+                    target_kind VARCHAR NOT NULL,
+                    target_id VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    authorized_at TIMESTAMPTZ NOT NULL,
+                    completed_at TIMESTAMPTZ NOT NULL,
+                    payload_json VARCHAR NOT NULL
+                )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_delete_target_lookup
+            ON jarvis_fundamental_filing_delete_receipts (
+                target_kind,
+                target_id,
+                completed_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_fundamental_filing_evidence (
+                record_id VARCHAR PRIMARY KEY,
+                record_fingerprint VARCHAR NOT NULL,
+                scope_fingerprint VARCHAR NOT NULL,
+                tenant_id VARCHAR NOT NULL,
+                provider_connection_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                isin VARCHAR,
+                artifact_id VARCHAR NOT NULL,
+                artifact_fingerprint VARCHAR NOT NULL,
+                extraction_policy_fingerprint VARCHAR NOT NULL,
+                validation_policy_fingerprint VARCHAR NOT NULL,
+                extraction_fingerprint VARCHAR NOT NULL,
+                validation_fingerprint VARCHAR NOT NULL,
+                releaseable BOOLEAN NOT NULL,
+                extracted_at TIMESTAMPTZ NOT NULL,
+                stored_at TIMESTAMPTZ NOT NULL,
+                payload_json VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_evidence_scope_lookup
+            ON jarvis_fundamental_filing_evidence (
+                tenant_id,
+                provider_connection_id,
+                provider,
+                exchange,
+                symbol,
+                artifact_id,
+                stored_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_evidence_policy_lookup
+            ON jarvis_fundamental_filing_evidence (
+                scope_fingerprint,
+                artifact_id,
+                artifact_fingerprint,
+                extraction_policy_fingerprint,
+                validation_policy_fingerprint,
+                extracted_at,
+                stored_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS jarvis_filing_evidence_lineage_lookup
+            ON jarvis_fundamental_filing_evidence (
+                scope_fingerprint,
+                extraction_fingerprint,
+                validation_fingerprint
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_corporate_filings_analysis (
+                record_id VARCHAR PRIMARY KEY,
+                record_fingerprint VARCHAR NOT NULL,
+                scope_fingerprint VARCHAR NOT NULL,
+                tenant_id VARCHAR NOT NULL,
+                provider_connection_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                exchange VARCHAR NOT NULL,
+                symbol VARCHAR NOT NULL,
+                isin VARCHAR,
+                fiscal_year BIGINT NOT NULL,
+                fiscal_quarter BIGINT NOT NULL,
+                analysis_kind VARCHAR NOT NULL,
+                period_key_fingerprint VARCHAR NOT NULL,
+                reuse_key_fingerprint VARCHAR NOT NULL,
+                request_fingerprint VARCHAR NOT NULL,
+                filing_package_id VARCHAR NOT NULL,
+                filing_package_fingerprint VARCHAR NOT NULL,
+                bundle_fingerprint VARCHAR NOT NULL,
+                policy_fingerprint VARCHAR NOT NULL,
+                skill_id VARCHAR NOT NULL,
+                skill_version VARCHAR NOT NULL,
+                skill_sha256 VARCHAR NOT NULL,
+                model_configuration_fingerprint VARCHAR NOT NULL,
+                result_fingerprint VARCHAR NOT NULL,
+                analysis_completed_at TIMESTAMPTZ NOT NULL,
+                stored_at TIMESTAMPTZ NOT NULL,
+                payload_json VARCHAR NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                jarvis_corporate_analysis_reuse_lookup
+            ON jarvis_corporate_filings_analysis (
+                scope_fingerprint,
+                reuse_key_fingerprint,
+                stored_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                jarvis_corporate_analysis_period_history_lookup
+            ON jarvis_corporate_filings_analysis (
+                scope_fingerprint,
+                period_key_fingerprint,
+                stored_at,
+                analysis_completed_at
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                jarvis_corporate_analysis_lineage_lookup
+            ON jarvis_corporate_filings_analysis (
+                filing_package_fingerprint,
+                bundle_fingerprint,
+                policy_fingerprint,
+                model_configuration_fingerprint
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+                jarvis_active_corporate_filings_analysis (
+                    scope_fingerprint VARCHAR NOT NULL,
+                    period_key_fingerprint VARCHAR NOT NULL,
+                    record_id VARCHAR NOT NULL,
+                    activated_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (scope_fingerprint, period_key_fingerprint)
+                )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                jarvis_active_corporate_analysis_record_lookup
+            ON jarvis_active_corporate_filings_analysis (record_id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+                jarvis_corporate_filings_analysis_active_history (
+                    scope_fingerprint VARCHAR NOT NULL,
+                    period_key_fingerprint VARCHAR NOT NULL,
+                    activation_sequence BIGINT NOT NULL,
+                    record_id VARCHAR NOT NULL,
+                    activated_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (
+                        scope_fingerprint,
+                        period_key_fingerprint,
+                        activation_sequence
+                    )
+                )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                jarvis_corporate_analysis_activation_history_lookup
+            ON jarvis_corporate_filings_analysis_active_history (
+                scope_fingerprint,
+                period_key_fingerprint,
+                activated_at,
+                activation_sequence
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+                jarvis_corporate_filings_analysis_delete_receipts (
+                    audit_id VARCHAR PRIMARY KEY,
+                    operation_id VARCHAR NOT NULL,
+                    authorized_by VARCHAR NOT NULL,
+                    record_id VARCHAR NOT NULL,
+                    record_fingerprint VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    authorized_at TIMESTAMPTZ NOT NULL,
+                    completed_at TIMESTAMPTZ NOT NULL,
+                    payload_json VARCHAR NOT NULL
+                )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                jarvis_corporate_analysis_delete_target_lookup
+            ON jarvis_corporate_filings_analysis_delete_receipts (
+                record_id,
+                completed_at
+            )
             """
         )
 
@@ -3190,8 +5029,71 @@ class DuckDBJarvisStorage:
         stored: StoredFundamentalSnapshot,
         summary: FundamentalSnapshotSummary,
     ) -> None:
+        columns, values = self._fundamental_parent_row(stored, summary)
+        self._connection.execute(
+            "INSERT INTO jarvis_fundamental_snapshots ("
+            + ", ".join(columns)
+            + ") VALUES ("
+            + ", ".join("?" for _ in values)
+            + ")",
+            values,
+        )
+
+    def _update_fundamental_parent(
+        self,
+        stored: StoredFundamentalSnapshot,
+        summary: FundamentalSnapshotSummary,
+    ) -> None:
+        columns, values = self._fundamental_parent_row(stored, summary)
+        mutable_columns = columns[1:]
+        self._connection.execute(
+            "UPDATE jarvis_fundamental_snapshots SET "
+            + ", ".join(f"{column} = ?" for column in mutable_columns)
+            + " WHERE cache_entry_id = ?",
+            [*values[1:], values[0]],
+        )
+
+    @staticmethod
+    def _fundamental_parent_row(
+        stored: StoredFundamentalSnapshot,
+        summary: FundamentalSnapshotSummary,
+    ) -> tuple[tuple[str, ...], list[object]]:
         key = stored.cache_key
         issuer = key.issuer
+        columns = (
+            "cache_entry_id",
+            "cache_key_fingerprint",
+            "storage_fingerprint",
+            "tenant_id",
+            "provider_connection_id",
+            "provider",
+            "capability",
+            "exchange",
+            "symbol",
+            "isin",
+            "provider_company_id",
+            "provider_slug",
+            "as_of_date",
+            "request_max_periods",
+            "request_quarters",
+            "include_promoter_pledge",
+            "request_id",
+            "request_fingerprint",
+            "result_fingerprint",
+            "snapshot_id",
+            "snapshot_fingerprint",
+            "retrieval_status",
+            "evidence_posture",
+            "validation_status",
+            "retrieved_at",
+            "expires_at",
+            "stored_at",
+            "source_count",
+            "fact_count",
+            "conflict_count",
+            "summary_json",
+            "payload_json",
+        )
         values = [
             key.cache_entry_id,
             key.cache_key_fingerprint,
@@ -3226,49 +5128,26 @@ class DuckDBJarvisStorage:
             summary.model_dump_json(),
             stored.model_dump_json(exclude_computed_fields=True),
         ]
-        self._connection.execute(
-            "INSERT INTO jarvis_fundamental_snapshots ("
-            "cache_entry_id, cache_key_fingerprint, storage_fingerprint, "
-            "tenant_id, provider_connection_id, provider, capability, "
-            "exchange, symbol, isin, provider_company_id, provider_slug, "
-            "as_of_date, request_max_periods, request_quarters, "
-            "include_promoter_pledge, "
-            "request_id, request_fingerprint, result_fingerprint, "
-            "snapshot_id, snapshot_fingerprint, retrieval_status, "
-            "evidence_posture, validation_status, retrieved_at, expires_at, "
-            "stored_at, source_count, fact_count, conflict_count, "
-            "summary_json, payload_json"
-            ") VALUES (" + ", ".join("?" for _ in values) + ")",
-            values,
-        )
+        return columns, values
 
     def _persist_fundamental_details(
         self,
         stored: StoredFundamentalSnapshot,
     ) -> None:
         cache_entry_id = stored.cache_key.cache_entry_id
-        for table in (
-            "jarvis_fundamental_request_statements",
-            "jarvis_fundamental_request_period_types",
-            "jarvis_fundamental_sources",
-            "jarvis_fundamental_facts",
-            "jarvis_fundamental_conflicts",
-        ):
-            self._connection.execute(
-                f"DELETE FROM {table} WHERE cache_entry_id = ?",
-                [cache_entry_id],
-            )
-
         statements = [
             [cache_entry_id, index, _enum_value(statement)]
             for index, statement in enumerate(stored.cache_key.statements)
         ]
-        if statements:
-            self._connection.executemany(
-                "INSERT INTO jarvis_fundamental_request_statements "
-                "VALUES (?, ?, ?)",
-                statements,
-            )
+        self._sync_fundamental_detail_rows(
+            table="jarvis_fundamental_request_statements",
+            index_column="statement_index",
+            unique_column="statement",
+            mutable_columns=("statement",),
+            rows=statements,
+            cache_entry_id=cache_entry_id,
+            refresh_fingerprint=stored.storage_fingerprint,
+        )
 
         period_types = [
             [cache_entry_id, index, _enum_value(period_type)]
@@ -3276,12 +5155,15 @@ class DuckDBJarvisStorage:
                 stored.cache_key.period_types
             )
         ]
-        if period_types:
-            self._connection.executemany(
-                "INSERT INTO jarvis_fundamental_request_period_types "
-                "VALUES (?, ?, ?)",
-                period_types,
-            )
+        self._sync_fundamental_detail_rows(
+            table="jarvis_fundamental_request_period_types",
+            index_column="period_type_index",
+            unique_column="period_type",
+            mutable_columns=("period_type",),
+            rows=period_types,
+            cache_entry_id=cache_entry_id,
+            refresh_fingerprint=stored.storage_fingerprint,
+        )
 
         snapshot = stored.retrieval.snapshot
         if snapshot is None:
@@ -3305,10 +5187,25 @@ class DuckDBJarvisStorage:
             ]
             for index, source in enumerate(snapshot.sources)
         ]
-        self._connection.executemany(
-            "INSERT INTO jarvis_fundamental_sources VALUES "
-            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            sources,
+        self._sync_fundamental_detail_rows(
+            table="jarvis_fundamental_sources",
+            index_column="source_index",
+            unique_column="source_id",
+            mutable_columns=(
+                "source_id",
+                "source_type",
+                "source_rank",
+                "as_of_date",
+                "published_at",
+                "retrieved_at",
+                "freshness_status",
+                "validation_status",
+                "content_fingerprint",
+                "source_json",
+            ),
+            rows=sources,
+            cache_entry_id=cache_entry_id,
+            refresh_fingerprint=stored.storage_fingerprint,
         )
 
         facts = [
@@ -3341,11 +5238,34 @@ class DuckDBJarvisStorage:
             ]
             for index, fact in enumerate(snapshot.facts)
         ]
-        self._connection.executemany(
-            "INSERT INTO jarvis_fundamental_facts VALUES ("
-            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
-            ")",
-            facts,
+        self._sync_fundamental_detail_rows(
+            table="jarvis_fundamental_facts",
+            index_column="fact_index",
+            unique_column="evidence_id",
+            mutable_columns=(
+                "evidence_id",
+                "statement",
+                "line_item_id",
+                "line_item_standard",
+                "period_label",
+                "period_type",
+                "period_start",
+                "period_end",
+                "value_kind",
+                "normalized_value",
+                "currency",
+                "normalized_unit",
+                "availability_status",
+                "evidence_label",
+                "confidence",
+                "freshness_status",
+                "validation_status",
+                "conflict_status",
+                "fact_json",
+            ),
+            rows=facts,
+            cache_entry_id=cache_entry_id,
+            refresh_fingerprint=stored.storage_fingerprint,
         )
 
         conflicts = [
@@ -3361,11 +5281,79 @@ class DuckDBJarvisStorage:
             ]
             for index, conflict in enumerate(snapshot.conflicts)
         ]
-        if conflicts:
-            self._connection.executemany(
-                "INSERT INTO jarvis_fundamental_conflicts VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?)",
-                conflicts,
+        self._sync_fundamental_detail_rows(
+            table="jarvis_fundamental_conflicts",
+            index_column="conflict_index",
+            unique_column="conflict_id",
+            mutable_columns=(
+                "conflict_id",
+                "conflict_type",
+                "status",
+                "material",
+                "working_evidence_id",
+                "conflict_json",
+            ),
+            rows=conflicts,
+            cache_entry_id=cache_entry_id,
+            refresh_fingerprint=stored.storage_fingerprint,
+        )
+
+    def _sync_fundamental_detail_rows(
+        self,
+        *,
+        table: str,
+        index_column: str,
+        unique_column: str,
+        mutable_columns: tuple[str, ...],
+        rows: list[list[object]],
+        cache_entry_id: str,
+        refresh_fingerprint: str,
+    ) -> None:
+        """Replace indexed child rows without delete/reinsert index churn."""
+
+        existing_indices = {
+            row[0]
+            for row in self._connection.execute(
+                f"SELECT {index_column} FROM {table} "
+                "WHERE cache_entry_id = ?",
+                [cache_entry_id],
+            ).fetchall()
+        }
+        if existing_indices:
+            placeholder = f"__jarvis_refresh__{refresh_fingerprint}:"
+            self._connection.execute(
+                f"UPDATE {table} SET {unique_column} = ? || "
+                f"CAST({index_column} AS VARCHAR) "
+                "WHERE cache_entry_id = ?",
+                [placeholder, cache_entry_id],
+            )
+
+        assignments = ", ".join(
+            f"{column} = ?" for column in mutable_columns
+        )
+        for row in rows:
+            index = row[1]
+            if index in existing_indices:
+                self._connection.execute(
+                    f"UPDATE {table} SET {assignments} "
+                    f"WHERE cache_entry_id = ? AND {index_column} = ?",
+                    [*row[2:], cache_entry_id, index],
+                )
+            else:
+                self._connection.execute(
+                    f"INSERT INTO {table} VALUES ("
+                    + ", ".join("?" for _ in row)
+                    + ")",
+                    row,
+                )
+
+        retained_indices = {row[1] for row in rows}
+        surplus_indices = existing_indices - retained_indices
+        for index in surplus_indices:
+            self._connection.execute(
+                f"DELETE FROM {table} WHERE cache_entry_id = ? "
+                f"AND {index_column} = ?",
+                [cache_entry_id, index],
             )
 
     def _delete_fundamental_entry_locked(self, cache_entry_id: str) -> None:
@@ -3654,6 +5642,588 @@ class DuckDBJarvisStorage:
     ) -> StoredBenchmarkingFinancialsDocument:
         return StoredBenchmarkingFinancialsDocument.model_validate_json(
             stored.model_dump_json(exclude_computed_fields=True)
+        )
+
+    @staticmethod
+    def _fundamental_package_scope_fingerprint(
+        scope: FundamentalPackageRepositoryScope,
+    ) -> str:
+        return sha256(scope.model_dump_json().encode("utf-8")).hexdigest()
+
+    def _insert_fundamental_package(
+        self,
+        package: FundamentalEvidencePackage,
+        scope_fingerprint: str,
+    ) -> None:
+        manifest = package.manifest
+        self._connection.execute(
+            "INSERT INTO jarvis_fundamental_packages VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                package.package_id,
+                package.aggregate_fingerprint,
+                manifest.manifest_fingerprint,
+                scope_fingerprint,
+                manifest.connection.tenant_id,
+                manifest.connection.provider_connection_id,
+                manifest.connection.provider,
+                manifest.issuer.exchange,
+                manifest.issuer.symbol,
+                manifest.operation_id,
+                manifest.committed_at,
+                manifest.expires_at,
+                package.model_dump_json(exclude_computed_fields=True),
+            ],
+        )
+
+    def _purge_expired_fundamental_packages_locked(
+        self,
+        *,
+        as_of: datetime,
+    ) -> int:
+        rows = self._connection.execute(
+            "SELECT package_id FROM jarvis_fundamental_packages "
+            "WHERE expires_at <= ? ORDER BY package_id",
+            [as_of],
+        ).fetchall()
+        package_ids = tuple(row[0] for row in rows)
+        for package_id in package_ids:
+            self._connection.execute(
+                "DELETE FROM jarvis_active_fundamental_packages "
+                "WHERE package_id = ?",
+                [package_id],
+            )
+            self._connection.execute(
+                "DELETE FROM jarvis_fundamental_packages WHERE package_id = ?",
+                [package_id],
+            )
+        return len(package_ids)
+
+    @staticmethod
+    def _validate_fundamental_package_writable(
+        package: FundamentalEvidencePackage,
+        *,
+        as_of: datetime,
+    ) -> None:
+        if package.manifest.committed_at > as_of:
+            raise StorageError(
+                "fundamental package commit time is in the future"
+            )
+        if package.is_expired(as_of=as_of):
+            raise StorageError("expired fundamental package cannot be committed")
+
+    @staticmethod
+    def _copy_fundamental_package(
+        package: FundamentalEvidencePackage,
+    ) -> FundamentalEvidencePackage:
+        return FundamentalEvidencePackage.model_validate_json(
+            package.model_dump_json(exclude_computed_fields=True)
+        )
+
+    @staticmethod
+    def _copy_corporate_filings_analysis(
+        record: StoredCorporateFilingsAnalysis,
+    ) -> StoredCorporateFilingsAnalysis:
+        return StoredCorporateFilingsAnalysis.from_storage_json(
+            record.to_storage_json()
+        )
+
+    @staticmethod
+    def _copy_corporate_analysis_delete_receipt(
+        receipt: CorporateFilingsAnalysisDeleteReceipt,
+    ) -> CorporateFilingsAnalysisDeleteReceipt:
+        return CorporateFilingsAnalysisDeleteReceipt.model_validate_json(
+            receipt.model_dump_json(exclude_computed_fields=True)
+        )
+
+    @staticmethod
+    def _decode_scoped_corporate_filings_analysis(
+        payload_json: str,
+        *,
+        scope: CorporateFilingsAnalysisRepositoryScope,
+    ) -> StoredCorporateFilingsAnalysis:
+        value = StoredCorporateFilingsAnalysis.from_storage_json(payload_json)
+        if value.scope != scope:
+            raise StorageError(
+                "DuckDB corporate analysis scope metadata is inconsistent"
+            )
+        return value
+
+    @staticmethod
+    def _validate_corporate_filings_analysis_writable(
+        record: StoredCorporateFilingsAnalysis,
+        *,
+        as_of: datetime,
+    ) -> None:
+        if record.stored_at > as_of:
+            raise StorageError(
+                "corporate filings analysis storage time is in the future"
+            )
+
+    @staticmethod
+    def _validate_corporate_analysis_record_id(record_id: str) -> None:
+        if not isinstance(record_id, str) or fullmatch(
+            _CORPORATE_FILINGS_ANALYSIS_RECORD_ID_PATTERN,
+            record_id,
+        ) is None:
+            raise ValueError("corporate filings analysis record ID is invalid")
+
+    @classmethod
+    def _validate_optional_corporate_analysis_record_id(
+        cls,
+        record_id: str | None,
+    ) -> None:
+        if record_id is not None:
+            cls._validate_corporate_analysis_record_id(record_id)
+
+    def _validate_corporate_analysis_conflicts_locked(
+        self,
+        value: StoredCorporateFilingsAnalysis,
+    ) -> StoredCorporateFilingsAnalysis | None:
+        existing_row = self._connection.execute(
+            "SELECT payload_json FROM jarvis_corporate_filings_analysis "
+            "WHERE record_id = ?",
+            [value.record_id],
+        ).fetchone()
+        existing = None
+        if existing_row is not None:
+            existing = StoredCorporateFilingsAnalysis.from_storage_json(
+                existing_row[0]
+            )
+            if existing != value:
+                raise StorageConflictError(
+                    "corporate analysis record ID contains different data"
+                )
+
+        reuse_rows = self._connection.execute(
+            "SELECT record_id FROM jarvis_corporate_filings_analysis "
+            "WHERE scope_fingerprint = ? AND reuse_key_fingerprint = ?",
+            [
+                value.scope.scope_fingerprint,
+                value.reuse_key.reuse_key_fingerprint,
+            ],
+        ).fetchall()
+        if any(row[0] != value.record_id for row in reuse_rows):
+            raise StorageConflictError(
+                "corporate analysis reuse key contains different data"
+            )
+        return existing
+
+    def _insert_corporate_filings_analysis_locked(
+        self,
+        value: StoredCorporateFilingsAnalysis,
+    ) -> None:
+        execution = value.result.execution
+        if execution is None:
+            raise StorageError(
+                "corporate filings analysis execution metadata is missing"
+            )
+        columns = (
+            "record_id",
+            "record_fingerprint",
+            "scope_fingerprint",
+            "tenant_id",
+            "provider_connection_id",
+            "provider",
+            "exchange",
+            "symbol",
+            "isin",
+            "fiscal_year",
+            "fiscal_quarter",
+            "analysis_kind",
+            "period_key_fingerprint",
+            "reuse_key_fingerprint",
+            "request_fingerprint",
+            "filing_package_id",
+            "filing_package_fingerprint",
+            "bundle_fingerprint",
+            "policy_fingerprint",
+            "skill_id",
+            "skill_version",
+            "skill_sha256",
+            "model_configuration_fingerprint",
+            "result_fingerprint",
+            "analysis_completed_at",
+            "stored_at",
+            "payload_json",
+        )
+        period = value.period
+        values = [
+            value.record_id,
+            value.record_fingerprint,
+            value.scope.scope_fingerprint,
+            value.scope.connection.tenant_id,
+            value.scope.connection.provider_connection_id,
+            value.scope.connection.provider,
+            value.scope.issuer.exchange,
+            value.scope.issuer.symbol,
+            value.scope.issuer.isin,
+            period.fiscal_year,
+            period.fiscal_quarter,
+            value.analysis_kind.value,
+            value.period_key.period_key_fingerprint,
+            value.reuse_key.reuse_key_fingerprint,
+            value.request_fingerprint,
+            value.filing_package_id,
+            value.filing_package_fingerprint,
+            value.bundle_fingerprint,
+            value.policy_fingerprint,
+            value.skill_id,
+            value.skill_version,
+            value.skill_sha256,
+            value.model_configuration_fingerprint,
+            value.result.result_fingerprint,
+            execution.completed_at,
+            value.stored_at,
+            value.to_storage_json(),
+        ]
+        self._connection.execute(
+            "INSERT INTO jarvis_corporate_filings_analysis ("
+            + ", ".join(columns)
+            + ") VALUES ("
+            + ", ".join("?" for _ in values)
+            + ")",
+            values,
+        )
+
+    def _read_corporate_analysis_delete_receipt_locked(
+        self,
+        authorization: CorporateFilingsAnalysisDeleteAuthorization,
+    ) -> CorporateFilingsAnalysisDeleteReceipt | None:
+        row = self._connection.execute(
+            "SELECT payload_json "
+            "FROM jarvis_corporate_filings_analysis_delete_receipts "
+            "WHERE audit_id = ?",
+            [authorization.audit_id],
+        ).fetchone()
+        if row is None:
+            return None
+        receipt = CorporateFilingsAnalysisDeleteReceipt.model_validate_json(
+            row[0]
+        )
+        if receipt.authorization != authorization:
+            raise StorageConflictError(
+                "corporate analysis deletion audit ID was reused"
+            )
+        return self._copy_corporate_analysis_delete_receipt(receipt)
+
+    def _insert_corporate_analysis_delete_receipt_locked(
+        self,
+        receipt: CorporateFilingsAnalysisDeleteReceipt,
+    ) -> None:
+        authorization = receipt.authorization
+        self._connection.execute(
+            "INSERT INTO jarvis_corporate_filings_analysis_delete_receipts "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                authorization.audit_id,
+                authorization.operation_id,
+                authorization.authorized_by,
+                authorization.record_id,
+                authorization.record_fingerprint,
+                receipt.status.value,
+                authorization.authorized_at,
+                receipt.completed_at,
+                receipt.model_dump_json(exclude_computed_fields=True),
+            ],
+        )
+
+    @staticmethod
+    def _filing_scope_fingerprint(
+        scope: FundamentalFilingRepositoryScope,
+    ) -> str:
+        return sha256(scope.model_dump_json().encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _validate_filing_identifier(
+        value: str,
+        *,
+        pattern: str,
+        label: str,
+    ) -> None:
+        if not isinstance(value, str) or fullmatch(pattern, value) is None:
+            raise ValueError(f"{label} is invalid")
+
+    @classmethod
+    def _validate_optional_filing_package_id(cls, value: str | None) -> None:
+        if value is not None:
+            cls._validate_filing_identifier(
+                value,
+                pattern=_FILING_PACKAGE_ID_PATTERN,
+                label="expected active filing package ID",
+            )
+
+    @staticmethod
+    def _validate_filing_artifact_writable(
+        artifact: FundamentalFilingArtifactManifest,
+        *,
+        as_of: datetime,
+    ) -> None:
+        if artifact.last_checked_at > as_of:
+            raise StorageError("filing artifact check time is in the future")
+
+    @staticmethod
+    def _validate_filing_package_writable(
+        package: FundamentalFilingPackage,
+        *,
+        as_of: datetime,
+    ) -> None:
+        if package.manifest.committed_at > as_of:
+            raise StorageError("filing package commit time is in the future")
+
+    @staticmethod
+    def _copy_filing_artifact(
+        artifact: FundamentalFilingArtifactManifest,
+    ) -> FundamentalFilingArtifactManifest:
+        return FundamentalFilingArtifactManifest.model_validate_json(
+            artifact.model_dump_json(exclude_computed_fields=True)
+        )
+
+    @staticmethod
+    def _copy_filing_package(
+        package: FundamentalFilingPackage,
+    ) -> FundamentalFilingPackage:
+        return FundamentalFilingPackage.model_validate_json(
+            package.model_dump_json(exclude_computed_fields=True)
+        )
+
+    @staticmethod
+    def _copy_filing_delete_receipt(
+        receipt: FundamentalFilingDeleteReceipt,
+    ) -> FundamentalFilingDeleteReceipt:
+        return FundamentalFilingDeleteReceipt.model_validate_json(
+            receipt.model_dump_json(exclude_computed_fields=True)
+        )
+
+    @staticmethod
+    def _copy_filing_evidence(
+        record: StoredFundamentalFilingEvidence,
+    ) -> StoredFundamentalFilingEvidence:
+        return StoredFundamentalFilingEvidence.from_storage_json(
+            record.to_storage_json()
+        )
+
+    @staticmethod
+    def _decode_scoped_filing_evidence(
+        payload_json: str,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+    ) -> StoredFundamentalFilingEvidence:
+        value = StoredFundamentalFilingEvidence.from_storage_json(payload_json)
+        if value.scope != scope:
+            raise StorageError(
+                "DuckDB filing evidence scope metadata is inconsistent"
+            )
+        return value
+
+    def _validate_filing_artifact_conflict_locked(
+        self,
+        artifact: FundamentalFilingArtifactManifest,
+    ) -> FundamentalFilingArtifactManifest | None:
+        row = self._connection.execute(
+            "SELECT payload_json "
+            "FROM jarvis_fundamental_filing_artifacts "
+            "WHERE artifact_id = ?",
+            [artifact.artifact_id],
+        ).fetchone()
+        if row is None:
+            return None
+        existing = FundamentalFilingArtifactManifest.model_validate_json(
+            row[0]
+        )
+        if existing != artifact:
+            raise StorageConflictError(
+                "filing artifact ID contains different metadata"
+            )
+        return existing
+
+    def _save_filing_artifact_locked(
+        self,
+        artifact: FundamentalFilingArtifactManifest,
+    ) -> FundamentalFilingArtifactManifest:
+        existing = self._validate_filing_artifact_conflict_locked(artifact)
+        if existing is not None:
+            return self._copy_filing_artifact(existing)
+
+        scope = FundamentalFilingRepositoryScope.from_artifact(artifact)
+        reference = artifact.reference
+        self._connection.execute(
+            "INSERT INTO jarvis_fundamental_filing_artifacts VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                artifact.artifact_id,
+                artifact.artifact_fingerprint,
+                artifact.content_sha256,
+                self._filing_scope_fingerprint(scope),
+                reference.connection.tenant_id,
+                reference.connection.provider_connection_id,
+                reference.connection.provider,
+                reference.issuer.exchange,
+                reference.issuer.symbol,
+                reference.issuer.isin,
+                reference.filing_reference_id,
+                reference.category.value,
+                artifact.safe_relative_path,
+                artifact.downloaded_at,
+                artifact.last_checked_at,
+                artifact.recheck_after,
+                artifact.model_dump_json(exclude_computed_fields=True),
+            ],
+        )
+        return self._copy_filing_artifact(artifact)
+
+    def _validate_filing_artifact_links_locked(
+        self,
+        artifact: FundamentalFilingArtifactManifest,
+        *,
+        pending: dict[str, FundamentalFilingArtifactManifest],
+    ) -> None:
+        artifact_scope = FundamentalFilingRepositoryScope.from_artifact(
+            artifact
+        )
+        for relation, related_id in (
+            ("duplicate", artifact.duplicate_of_artifact_id),
+            ("supersedes", artifact.supersedes_artifact_id),
+        ):
+            if related_id is None:
+                continue
+            related = pending.get(related_id)
+            if related is None:
+                row = self._connection.execute(
+                    "SELECT payload_json "
+                    "FROM jarvis_fundamental_filing_artifacts "
+                    "WHERE artifact_id = ?",
+                    [related_id],
+                ).fetchone()
+                if row is not None:
+                    related = (
+                        FundamentalFilingArtifactManifest.model_validate_json(
+                            row[0]
+                        )
+                    )
+            if related is None or (
+                FundamentalFilingRepositoryScope.from_artifact(related)
+                != artifact_scope
+            ):
+                raise StorageConflictError(
+                    f"filing artifact {relation} link is unavailable in scope"
+                )
+            if relation == "duplicate":
+                if related.content_sha256 != artifact.content_sha256:
+                    raise StorageConflictError(
+                        "duplicate filing artifacts must share a content hash"
+                    )
+            elif (
+                related.reference.filing_reference_id
+                != artifact.reference.filing_reference_id
+                or related.content_sha256 == artifact.content_sha256
+            ):
+                raise StorageConflictError(
+                    "superseded filing artifact lineage is inconsistent"
+                )
+
+    def _insert_filing_package_locked(
+        self,
+        package: FundamentalFilingPackage,
+        *,
+        scope_fingerprint: str,
+    ) -> None:
+        manifest = package.manifest
+        self._connection.execute(
+            "INSERT INTO jarvis_fundamental_filing_packages VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                package.package_id,
+                manifest.manifest_fingerprint,
+                manifest.discovery_fingerprint,
+                scope_fingerprint,
+                manifest.connection.tenant_id,
+                manifest.connection.provider_connection_id,
+                manifest.connection.provider,
+                manifest.issuer.exchange,
+                manifest.issuer.symbol,
+                manifest.issuer.isin,
+                manifest.operation_id,
+                manifest.committed_at,
+                manifest.recheck_after,
+                package.model_dump_json(exclude_computed_fields=True),
+            ],
+        )
+        if package.artifacts:
+            self._connection.executemany(
+                "INSERT INTO jarvis_fundamental_filing_package_artifacts "
+                "VALUES (?, ?)",
+                [
+                    [package.package_id, artifact.artifact_id]
+                    for artifact in package.artifacts
+                ],
+            )
+
+    @staticmethod
+    def _validate_filing_delete_authorization(
+        authorization: FundamentalFilingDeleteAuthorization,
+        *,
+        target_kind: FundamentalFilingDeleteTarget,
+        target_id: str,
+    ) -> FundamentalFilingDeleteAuthorization:
+        value = FundamentalFilingDeleteAuthorization.model_validate(
+            authorization
+        )
+        if value.target_kind is not target_kind or value.target_id != target_id:
+            raise StorageError(
+                "filing deletion authorization does not match the target"
+            )
+        return value
+
+    @staticmethod
+    def _require_filing_authorization_not_future(
+        authorization: FundamentalFilingDeleteAuthorization,
+        *,
+        as_of: datetime,
+    ) -> None:
+        if authorization.authorized_at > as_of:
+            raise StorageError(
+                "filing deletion authorization is in the future"
+            )
+
+    def _read_filing_delete_receipt_locked(
+        self,
+        authorization: FundamentalFilingDeleteAuthorization,
+    ) -> FundamentalFilingDeleteReceipt | None:
+        row = self._connection.execute(
+            "SELECT payload_json "
+            "FROM jarvis_fundamental_filing_delete_receipts "
+            "WHERE audit_id = ?",
+            [authorization.audit_id],
+        ).fetchone()
+        if row is None:
+            return None
+        receipt = FundamentalFilingDeleteReceipt.model_validate_json(row[0])
+        if receipt.authorization != authorization:
+            raise StorageConflictError(
+                "filing deletion audit ID contains different authorization"
+            )
+        return self._copy_filing_delete_receipt(receipt)
+
+    def _insert_filing_delete_receipt_locked(
+        self,
+        receipt: FundamentalFilingDeleteReceipt,
+    ) -> None:
+        authorization = receipt.authorization
+        self._connection.execute(
+            "INSERT INTO jarvis_fundamental_filing_delete_receipts VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                authorization.audit_id,
+                authorization.operation_id,
+                authorization.authorized_by,
+                authorization.target_kind.value,
+                authorization.target_id,
+                receipt.status.value,
+                authorization.authorized_at,
+                receipt.completed_at,
+                receipt.model_dump_json(exclude_computed_fields=True),
+            ],
         )
 
     def _get_payload(

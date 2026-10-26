@@ -1,0 +1,59 @@
+schema_version: 1
+bundle: stock-analyzer-quant-architect
+version: 1.2.2
+master_skill: SKILL.md
+shared_context: PROJECT_CONTEXT.md
+routing: ROUTING.md
+skill_improvement:
+  lifecycle: references/skill-improvement-lifecycle.md
+  candidate_schema: references/skill-change-candidate.schema.json
+  candidate_schema_version: 1
+  validator: scripts/validate_skill_candidate.py
+  validator_mode: read-only
+scope:
+  product: jarvis-equity-research
+  market: indian-cash-equities
+  horizon: swing
+  source_timeframe: one-hour
+  decision_timeframes:
+    - daily
+    - weekly
+  decisions:
+    - buy
+    - no-trade
+governance:
+  active_skill_mutation: prohibited
+  candidate_promotion: human-approval-required
+  validation: deterministic-and-forward-safe
+  audit_fields:
+    - skill-version
+    - content-hash
+    - validation-evidence
+    - approved-by
+    - promoted-at
+  rollback_required: true
+subskills:
+  - name: python-platform-engineer
+    path: subskills/python-platform-engineer/SKILL.md
+  - name: quant-researcher
+    path: subskills/quant-researcher/SKILL.md
+  - name: fundamental-researcher
+    path: subskills/fundamental-researcher/SKILL.md
+  - name: technical-analysis-engineer
+    path: subskills/technical-analysis-engineer/SKILL.md
+  - name: price-action-researcher
+    path: subskills/price-action-researcher/SKILL.md
+  - name: strategy-researcher
+    path: subskills/strategy-researcher/SKILL.md
+  - name: backtesting-specialist
+    path: subskills/backtesting-specialist/SKILL.md
+  - name: market-data-engineer
+    path: subskills/market-data-engineer/SKILL.md
+  - name: quant-ml-researcher
+    path: subskills/quant-ml-researcher/SKILL.md
+  - name: local-mlops-engineer
+    path: subskills/local-mlops-engineer/SKILL.md
+  - name: enterprise-fintech-architect
+    path: subskills/enterprise-fintech-architect/SKILL.md
+  - name: risk-and-execution-researcher
+    path: subskills/risk-and-execution-researcher/SKILL.md

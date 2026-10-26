@@ -16,6 +16,7 @@ from app.storage.financial_document_repositories import (
 from tests.unit.test_financial_document_in_memory_repository import (
     MutableClock,
     build_entry,
+    build_package,
 )
 from tests.unit.test_financial_document_storage import COMPLETED_AT
 
@@ -37,13 +38,13 @@ class DuckDBStructuredFinancialDocumentRepositoryTests(unittest.TestCase):
     def storage(self):
         return DuckDBJarvisStorage(self.database, clock=self.clock)
 
-    def test_implements_port_and_creates_schema_version_five_table(self):
+    def test_implements_port_and_creates_current_schema_table(self):
         with self.storage() as storage:
             self.assertIsInstance(
                 storage,
                 StructuredFinancialDocumentRepository,
             )
-            self.assertEqual(storage.schema_version, 5)
+            self.assertEqual(storage.schema_version, 6)
         connection = duckdb.connect(str(self.database), read_only=True)
         try:
             tables = {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
@@ -53,7 +54,7 @@ class DuckDBStructuredFinancialDocumentRepositoryTests(unittest.TestCase):
             ).fetchone()[0]
         finally:
             connection.close()
-        self.assertEqual(version, "5")
+        self.assertEqual(version, "6")
         self.assertIn("jarvis_structured_financial_documents", tables)
 
     def test_migrates_version_four_database_without_provider_access(self):
@@ -81,7 +82,7 @@ class DuckDBStructuredFinancialDocumentRepositoryTests(unittest.TestCase):
                 for row in migrated._connection.execute("SHOW TABLES").fetchall()
             }
 
-        self.assertEqual(version, "5")
+        self.assertEqual(version, "6")
         self.assertIn("jarvis_structured_financial_documents", tables)
 
     def test_json_document_survives_close_and_reopen(self):
@@ -185,6 +186,40 @@ class DuckDBStructuredFinancialDocumentRepositoryTests(unittest.TestCase):
                 as_of=self.clock.now,
             )
         self.assertEqual(loaded, refreshed)
+
+    def test_atomic_package_replace_commits_all_or_rolls_back_all(self):
+        original = build_package()
+        refreshed = build_package(offset=timedelta(hours=2))
+        advanced = build_package(offset=timedelta(hours=3))
+        with self.storage() as storage:
+            self.clock.now = original[0].stored_at
+            persisted = storage.replace_structured_financial_document_package(
+                original,
+                scope=self.scope,
+            )
+            self.assertEqual(persisted, original)
+
+            self.clock.now = advanced[-1].stored_at
+            storage.replace_structured_financial_document(
+                advanced[-1],
+                scope=self.scope,
+            )
+            before_attempt = (*original[:-1], advanced[-1])
+            with self.assertRaises(StorageConflictError):
+                storage.replace_structured_financial_document_package(
+                    refreshed,
+                    scope=self.scope,
+                )
+
+            for item in before_attempt:
+                self.assertEqual(
+                    storage.get_structured_financial_document(
+                        item.cache_key,
+                        scope=self.scope,
+                        as_of=self.clock.now,
+                    ),
+                    item,
+                )
 
     def test_scoped_delete_and_automatic_expiry(self):
         stored = build_entry(retention=timedelta(hours=1))

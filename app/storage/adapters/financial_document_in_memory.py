@@ -131,6 +131,73 @@ class InMemoryStructuredFinancialDocumentRepository:
             self._entries[cache_entry_id] = _copy(value)
             return _copy(value)
 
+    def replace_structured_financial_document_package(
+        self,
+        stored: tuple[StoredStructuredFinancialDocument, ...],
+        *,
+        scope: StructuredDocumentRepositoryScope,
+    ) -> tuple[StoredStructuredFinancialDocument, ...]:
+        """Replace one complete package through a copy-on-write commit."""
+
+        if not isinstance(stored, tuple) or len(stored) != 11:
+            raise StorageError(
+                "structured financial package must contain eleven documents"
+            )
+        values = tuple(
+            StoredStructuredFinancialDocument.model_validate(item)
+            for item in stored
+        )
+        caller_scope = StructuredDocumentRepositoryScope.model_validate(scope)
+        now = self._now()
+        cache_entry_ids = tuple(
+            value.cache_key.cache_entry_id for value in values
+        )
+        if len(cache_entry_ids) != len(set(cache_entry_ids)):
+            raise StorageConflictError(
+                "structured financial package contains duplicate cache keys"
+            )
+        package_identities = {
+            (
+                value.cache_key.issuer.model_dump_json(),
+                value.cache_key.as_of_date,
+                value.retrieved_at,
+                value.stored_at,
+            )
+            for value in values
+        }
+        if len(package_identities) != 1:
+            raise StorageError(
+                "structured financial package is not one immutable snapshot"
+            )
+
+        with self._lock:
+            staged = {
+                cache_entry_id: _copy(value)
+                for cache_entry_id, value in self._entries.items()
+                if not value.is_expired(as_of=now)
+            }
+            persisted = []
+            for value in values:
+                if value.cache_key.repository_scope != caller_scope:
+                    raise StorageError(
+                        "structured financial package scope does not match key"
+                    )
+                self._validate_writable(value, as_of=now)
+                cache_entry_id = value.cache_key.cache_entry_id
+                existing = staged.get(cache_entry_id)
+                if existing is not None:
+                    if existing.storage_fingerprint == value.storage_fingerprint:
+                        persisted.append(_copy(existing))
+                        continue
+                    if value.retrieved_at <= existing.retrieved_at:
+                        raise StorageConflictError(
+                            "structured financial package is not newer than cache"
+                        )
+                staged[cache_entry_id] = _copy(value)
+                persisted.append(_copy(value))
+            self._entries = staged
+            return tuple(persisted)
+
     def get_structured_financial_document(
         self,
         key: StructuredDocumentCacheKey,

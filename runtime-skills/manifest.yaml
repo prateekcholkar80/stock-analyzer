@@ -1,0 +1,50 @@
+schema_version: jarvis.runtime_skill_manifest.v1
+registry_contract: jarvis.runtime_skill_registry.v1
+load_policy: fail_closed
+provider_neutral: true
+
+approval:
+  status: approved
+  scope: exact_sha256
+  approved_on: 2026-09-08
+
+shared_policy:
+  path: shared/evidence-grounding.md
+  content_sha256: 87325c64d9f7638682a001448d6011bcd0aa12937dbb2b0ec899f385f3feffbc
+
+skills:
+  - skill_id: jarvis.bull_runtime_skill.v1
+    agent_role: bull
+    version: 1.0.0
+    path: jarvis-bull-runtime/SKILL.md
+    content_sha256: d7b121c9dfd869c9ff7719cb25d265a45026111c63582a888f0a255b2620c641
+    contract_schema: jarvis.runtime_skill.v1
+    output_schema_id: jarvis.bull_bear_argument.v1
+    approval_status: approved
+
+  - skill_id: jarvis.bear_runtime_skill.v1
+    agent_role: bear
+    version: 1.0.0
+    path: jarvis-bear-runtime/SKILL.md
+    content_sha256: 85f0098d9551241dc23460ec5a2cf0db67d78c2f055c3da443ff179f7477a3e9
+    contract_schema: jarvis.runtime_skill.v1
+    output_schema_id: jarvis.bull_bear_argument.v1
+    approval_status: approved
+
+  - skill_id: jarvis.judge_runtime_skill.v1
+    agent_role: judge
+    version: 1.0.0
+    path: jarvis-judge-runtime/SKILL.md
+    content_sha256: 1d4b92009bba0e6732189af8b2560db335d71d1fba148bb0ea3d089621314896
+    contract_schema: jarvis.runtime_skill.v1
+    output_schema_id: jarvis.debate_verdict.v1
+    approval_status: approved
+
+  - skill_id: jarvis.fundamental_analyst_runtime_skill.v1
+    agent_role: fundamental_analyst
+    version: 1.0.0
+    path: jarvis-fundamental-analyst-runtime/SKILL.md
+    content_sha256: c2e4b0225ad9e0df393d9b06282d088888eb4ea6e33daae34027e778885a9698
+    contract_schema: jarvis.runtime_skill.v1
+    output_schema_id: jarvis.fundamental_analysis.v1
+    approval_status: approved

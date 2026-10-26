@@ -1,7 +1,12 @@
 import math
+import os
 import unittest
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock, patch
 
 from pydantic import ValidationError
 
@@ -12,7 +17,10 @@ from app.exceptions import (
     FundamentalProviderUnavailableError,
     FundamentalResponseValidationError,
 )
-from app.fundamentals.adapters.tijori_mcp import TijoriMcpAdapter
+from app.fundamentals.adapters.tijori_mcp import (
+    TijoriFilingArtifactImporter,
+    TijoriMcpAdapter,
+)
 from app.fundamentals.tijori_mcp_contracts import (
     TIJORI_APPROVED_TOOLS,
     TijoriMcpAdapterSettings,
@@ -24,10 +32,16 @@ from app.fundamentals.tijori_mcp_contracts import (
 )
 from app.gateways.fundamentals import (
     FundamentalBenchmarkingFinancialsGateway,
+    FundamentalCapability,
     FundamentalCapabilityStatus,
     FundamentalCompanyOverviewRequest,
     FundamentalCompanySearchRequest,
     FundamentalEvidenceGateway,
+    FundamentalFilingAcquisitionRequest,
+    FundamentalFilingDiscoveryRequest,
+    FundamentalFilingGateway,
+    FundamentalFinancialDocumentPackageGateway,
+    FundamentalFinancialDocumentPackageRequest,
     FundamentalFinancialsRequest,
     FundamentalIssuerLocator,
     FundamentalIssuerResolutionRequest,
@@ -55,12 +69,24 @@ from app.models.fundamentals import (
     ProviderEntitlementStatus,
     ProviderSubscriptionTier,
 )
+from tests.unit.test_tijori_company_filing_contract import (
+    DISCOVERED_AT as FILING_DISCOVERED_AT,
+    DISCOVERY_FINGERPRINT as FILING_SOURCE_FINGERPRINT,
+    discovery_payload as filing_discovery_payload,
+    download_payload as filing_download_payload,
+)
 from tests.unit.test_tijori_benchmarking_financials_contract import (
     benchmarking_payload,
 )
 
 
 NOW = datetime(2026, 8, 28, 10, 0, tzinfo=UTC)
+FILING_NOW = datetime.fromisoformat(FILING_DISCOVERED_AT)
+FILING_PDF = (
+    b"%PDF-1.7\n"
+    b"1 0 obj\n<< /Type /Page >>\nendobj\n"
+    b"%%EOF\n"
+)
 
 
 class FakeTijoriTransport:
@@ -559,6 +585,30 @@ def quarterly_results_payload(reporting_basis: str = "consolidated") -> dict:
     return payload
 
 
+def financial_document_package_payload() -> dict:
+    documents = [growth_table_payload()["document"]]
+    for reporting_basis in ("consolidated", "standalone"):
+        documents.extend(
+            payload_factory(reporting_basis)["document"]
+            for payload_factory in (
+                balance_sheet_payload,
+                profit_and_loss_payload,
+                cash_flow_payload,
+                ratios_payload,
+                quarterly_results_payload,
+            )
+        )
+    return {
+        "package": {
+            "schema_version": "tijori.financial_document_package.v1",
+            "issuer": growth_table_payload()["document"]["issuer"],
+            "source": growth_table_payload()["document"]["source"],
+            "documents": documents,
+            "extraction": {"document_count": 11, "status": "complete"},
+        }
+    }
+
+
 def peer_comparison_payload() -> dict:
     return {
         "document": {
@@ -719,6 +769,31 @@ class TijoriMcpAdapterTests(unittest.TestCase):
         values.update(changes)
         return FundamentalCompanyOverviewRequest(**values)
 
+    def filing_issuer(self):
+        return self.issuer.model_copy(
+            update={
+                "symbol": "COFORGE",
+                "legal_name": "Coforge Ltd.",
+                "isin": "INE591G01017",
+                "provider_company_id": "242",
+                "provider_slug": "niit-technologies-limited",
+            }
+        )
+
+    def filing_discovery_request(self, **changes):
+        values = {
+            "request_id": "request-filing-discovery-1",
+            "operation_id": "operation-filing-1",
+            "connection": self.connection,
+            "requested_at": FILING_NOW,
+            "issuer": self.filing_issuer(),
+            "from_fiscal_year": 2017,
+            "through_date": FILING_NOW.date(),
+            "max_documents": 100,
+        }
+        values.update(changes)
+        return FundamentalFilingDiscoveryRequest(**values)
+
     def test_implements_provider_neutral_gateway(self):
         self.assertIsInstance(self.adapter, FundamentalEvidenceGateway)
         self.assertIsInstance(
@@ -733,6 +808,65 @@ class TijoriMcpAdapterTests(unittest.TestCase):
             self.adapter,
             FundamentalBenchmarkingFinancialsGateway,
         )
+        self.assertIsInstance(
+            self.adapter,
+            FundamentalFinancialDocumentPackageGateway,
+        )
+        self.assertIsInstance(self.adapter, FundamentalFilingGateway)
+
+    def test_financial_package_returns_one_provider_neutral_snapshot(self):
+        self.transport.result = TijoriMcpToolResult(
+            tool_name="get_financials",
+            status=TijoriToolStatus.SUCCESS,
+            payload=financial_document_package_payload(),
+        )
+        request = FundamentalFinancialDocumentPackageRequest(
+            request_id="request-financial-package-1",
+            operation_id="operation-1",
+            connection=self.connection,
+            requested_at=NOW,
+            issuer=self.issuer,
+            as_of_date=date(2026, 8, 28),
+        )
+
+        result = self.adapter.retrieve_financial_document_package(
+            request=request
+        )
+
+        self.assertEqual(result.status, FundamentalRetrievalStatus.COMPLETED)
+        self.assertEqual(len(result.package.documents), 11)
+        self.assertEqual(
+            len({item.retrieved_at for item in result.package.documents}),
+            1,
+        )
+        self.assertEqual(
+            result.package.expires_at - result.package.retrieved_at,
+            timedelta(days=10),
+        )
+        _, tool_name, arguments = self.transport.calls[-1]
+        self.assertEqual(tool_name, "get_financials")
+        self.assertEqual(arguments["document_type"], "financial_package")
+        self.assertEqual(arguments["reporting_basis"], "not_applicable")
+
+    def test_financial_package_rejects_mixed_or_incomplete_payload(self):
+        request = FundamentalFinancialDocumentPackageRequest(
+            request_id="request-financial-package-invalid-1",
+            operation_id="operation-1",
+            connection=self.connection,
+            requested_at=NOW,
+            issuer=self.issuer,
+        )
+        malformed = financial_document_package_payload()
+        malformed["package"]["documents"].pop()
+        malformed["package"]["extraction"]["document_count"] = 10
+        self.transport.result = TijoriMcpToolResult(
+            tool_name="get_financials",
+            status=TijoriToolStatus.SUCCESS,
+            payload=malformed,
+        )
+
+        with self.assertRaises(FundamentalResponseValidationError):
+            self.adapter.retrieve_financial_document_package(request=request)
         self.assertEqual(len(self.adapter.configuration_fingerprint), 64)
         self.assertNotIn("tijori-user-1", self.adapter.configuration_fingerprint)
 
@@ -773,15 +907,328 @@ class TijoriMcpAdapterTests(unittest.TestCase):
                 payload=nested,
             )
 
-    def test_capability_inspection_maps_all_five_tools(self):
+    def test_capability_inspection_maps_all_seven_tools_fail_closed(self):
         manifest = self.adapter.inspect_capabilities(connection=self.connection)
-        self.assertEqual(len(manifest.capabilities), 5)
+        self.assertEqual(len(manifest.capabilities), 7)
+        statuses = {
+            item.capability: item.status for item in manifest.capabilities
+        }
+        self.assertEqual(
+            statuses[FundamentalCapability.FILING_ACQUISITION],
+            FundamentalCapabilityStatus.UNAVAILABLE,
+        )
         self.assertTrue(all(
             item.status is FundamentalCapabilityStatus.AVAILABLE
             for item in manifest.capabilities
+            if item.capability is not FundamentalCapability.FILING_ACQUISITION
         ))
         history = [item for item in manifest.capabilities if item.supports_history]
-        self.assertEqual([item.max_periods for item in history], [40, 40])
+        self.assertEqual([item.max_periods for item in history], [40, 40, None])
+
+    def test_filing_discovery_translates_complete_neutral_snapshot(self):
+        self.transport.result = TijoriMcpToolResult(
+            tool_name="list_company_filings",
+            status=TijoriToolStatus.SUCCESS,
+            payload=filing_discovery_payload(),
+        )
+        adapter = TijoriMcpAdapter(
+            transport=self.transport,
+            clock=lambda: FILING_NOW,
+        )
+        request = self.filing_discovery_request()
+
+        result = adapter.discover_filings(request=request)
+
+        self.assertEqual(result.status, FundamentalRetrievalStatus.COMPLETED)
+        self.assertEqual(len(result.discovery.references), 2)
+        self.assertEqual(
+            result.discovery.references[0].source_discovery_fingerprint,
+            FILING_SOURCE_FINGERPRINT,
+        )
+        self.assertNotEqual(
+            result.discovery.discovery_fingerprint,
+            FILING_SOURCE_FINGERPRINT,
+        )
+        _, tool_name, arguments = self.transport.calls[-1]
+        self.assertEqual(tool_name, "list_company_filings")
+        self.assertEqual(arguments["issuer"]["provider_company_id"], "242")
+        self.assertEqual(arguments["from_fiscal_year"], 2017)
+        self.assertEqual(arguments["through_date"], "2026-09-14")
+        self.assertNotIn("tenant_id", repr(arguments))
+
+    def test_filing_acquisition_imports_exact_content_addressed_pdf(self):
+        with TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            staging = root / "staging"
+            artifacts = root / "artifacts"
+            staging.mkdir(mode=0o700)
+            artifacts.mkdir(mode=0o700)
+            staging.chmod(0o700)
+            artifacts.chmod(0o700)
+            importer = TijoriFilingArtifactImporter(
+                staging_root=staging,
+                artifact_root=artifacts,
+            )
+            adapter = TijoriMcpAdapter(
+                transport=self.transport,
+                clock=lambda: FILING_NOW,
+                filing_artifact_importer=importer,
+            )
+            self.transport.result = TijoriMcpToolResult(
+                tool_name="list_company_filings",
+                status=TijoriToolStatus.SUCCESS,
+                payload=filing_discovery_payload(),
+            )
+            discovery_result = adapter.discover_filings(
+                request=self.filing_discovery_request()
+            )
+            filing_reference = discovery_result.discovery.references[0]
+            content_hash = sha256(FILING_PDF).hexdigest()
+            staged_key = f"{content_hash}.pdf"
+            staged_path = staging / staged_key
+            staged_path.write_bytes(FILING_PDF)
+            staged_path.chmod(0o600)
+            payload = filing_download_payload()
+            payload.update(
+                {
+                    "content_sha256": content_hash,
+                    "byte_length": len(FILING_PDF),
+                    "staged_artifact_key": staged_key,
+                    "downloaded_at": FILING_NOW.isoformat(),
+                }
+            )
+            self.transport.result = TijoriMcpToolResult(
+                tool_name="download_company_filing",
+                status=TijoriToolStatus.SUCCESS,
+                payload=payload,
+            )
+            request = FundamentalFilingAcquisitionRequest(
+                request_id="request-filing-acquisition-1",
+                operation_id="operation-filing-1",
+                connection=self.connection,
+                requested_at=FILING_NOW,
+                issuer=self.filing_issuer(),
+                reference=filing_reference,
+                discovery_fingerprint=(
+                    discovery_result.discovery.discovery_fingerprint
+                ),
+            )
+
+            result = adapter.acquire_filing(request=request)
+
+            self.assertEqual(
+                result.status,
+                FundamentalRetrievalStatus.COMPLETED,
+            )
+            self.assertEqual(result.artifact.content_sha256, content_hash)
+            self.assertEqual(result.artifact.page_count, 1)
+            self.assertEqual(result.artifact.pdf_version, "1.7")
+            self.assertFalse(staged_path.exists())
+            durable_path = artifacts / result.artifact.safe_relative_path
+            self.assertEqual(durable_path.read_bytes(), FILING_PDF)
+            self.assertEqual(durable_path.stat().st_mode & 0o077, 0)
+            serialized_path = result.artifact.safe_relative_path
+            self.assertNotIn("tenant-1", serialized_path)
+            self.assertNotIn("tijori-user-1", serialized_path)
+            _, tool_name, arguments = self.transport.calls[-1]
+            self.assertEqual(tool_name, "download_company_filing")
+            self.assertEqual(
+                arguments["filing_reference"]["discovery_fingerprint"],
+                FILING_SOURCE_FINGERPRINT,
+            )
+
+            staged_path.write_bytes(FILING_PDF)
+            staged_path.chmod(0o600)
+            repeated = adapter.acquire_filing(request=request)
+            self.assertEqual(
+                repeated.artifact.artifact_id,
+                result.artifact.artifact_id,
+            )
+            self.assertFalse(staged_path.exists())
+
+    def test_filing_importer_rejects_non_owner_only_root(self):
+        with TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            staging = root / "staging"
+            artifacts = root / "artifacts"
+            staging.mkdir(mode=0o700)
+            artifacts.mkdir(mode=0o700)
+            staging.chmod(0o755)
+            artifacts.chmod(0o700)
+
+            with self.assertRaisesRegex(ValueError, "must be owner-only"):
+                TijoriFilingArtifactImporter(
+                    staging_root=staging,
+                    artifact_root=artifacts,
+                )
+
+    def test_filing_importer_counts_compressed_page_objects_with_parser(self):
+        content = (
+            b"%PDF-1.7\n"
+            b"1 0 obj\n<< /Type /ObjStm >>\nendobj\n"
+            b"%%EOF\n"
+        )
+        with TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            source = root / "source.pdf"
+            destination = root / "destination.pdf"
+            source.write_bytes(content)
+            descriptor = os.open(source, os.O_RDONLY)
+            parsed = MagicMock()
+            parsed.pages = [object(), object(), object(), object()]
+            parsed.__enter__.return_value = parsed
+            parsed.__exit__.return_value = False
+            try:
+                with patch(
+                    "app.fundamentals.adapters.tijori_mcp.pdfplumber.open",
+                    return_value=parsed,
+                ):
+                    metadata = TijoriFilingArtifactImporter._copy_and_validate_pdf(
+                        source_descriptor=descriptor,
+                        temporary_path=destination,
+                        expected_hash=sha256(content).hexdigest(),
+                        expected_length=len(content),
+                    )
+            finally:
+                os.close(descriptor)
+
+            self.assertEqual(metadata["page_count"], 4)
+            self.assertEqual(metadata["pdf_version"], "1.7")
+            self.assertEqual(destination.read_bytes(), content)
+
+    def test_filing_discovery_rejects_cross_issuer_payload(self):
+        payload = filing_discovery_payload()
+        payload["issuer"]["provider_company_id"] = "999"
+        self.transport.result = TijoriMcpToolResult(
+            tool_name="list_company_filings",
+            status=TijoriToolStatus.SUCCESS,
+            payload=payload,
+        )
+        adapter = TijoriMcpAdapter(
+            transport=self.transport,
+            clock=lambda: FILING_NOW,
+        )
+
+        with self.assertRaises(FundamentalResponseValidationError):
+            adapter.discover_filings(request=self.filing_discovery_request())
+
+    def test_filing_discovery_returns_sanitized_provider_failure(self):
+        self.transport.result = TijoriMcpToolResult(
+            tool_name="list_company_filings",
+            status=TijoriToolStatus.UNAVAILABLE,
+        )
+        adapter = TijoriMcpAdapter(
+            transport=self.transport,
+            clock=lambda: FILING_NOW,
+        )
+
+        result = adapter.discover_filings(
+            request=self.filing_discovery_request()
+        )
+
+        self.assertEqual(
+            result.status,
+            FundamentalRetrievalStatus.PROVIDER_UNAVAILABLE,
+        )
+        self.assertIsNone(result.discovery)
+        self.assertEqual(len(result.limitations), 1)
+
+    def test_filing_acquisition_preserves_stage_on_content_mismatch(self):
+        with TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            staging = root / "staging"
+            artifacts = root / "artifacts"
+            staging.mkdir(mode=0o700)
+            artifacts.mkdir(mode=0o700)
+            staging.chmod(0o700)
+            artifacts.chmod(0o700)
+            importer = TijoriFilingArtifactImporter(
+                staging_root=staging,
+                artifact_root=artifacts,
+            )
+            adapter = TijoriMcpAdapter(
+                transport=self.transport,
+                clock=lambda: FILING_NOW,
+                filing_artifact_importer=importer,
+            )
+            self.transport.result = TijoriMcpToolResult(
+                tool_name="list_company_filings",
+                status=TijoriToolStatus.SUCCESS,
+                payload=filing_discovery_payload(),
+            )
+            discovery_result = adapter.discover_filings(
+                request=self.filing_discovery_request()
+            )
+            filing_reference = discovery_result.discovery.references[0]
+            expected_hash = sha256(FILING_PDF).hexdigest()
+            staged_path = staging / f"{expected_hash}.pdf"
+            staged_path.write_bytes(FILING_PDF.replace(b"Page", b"Fail"))
+            staged_path.chmod(0o600)
+            payload = filing_download_payload()
+            payload.update(
+                {
+                    "content_sha256": expected_hash,
+                    "byte_length": len(FILING_PDF),
+                    "staged_artifact_key": f"{expected_hash}.pdf",
+                    "downloaded_at": FILING_NOW.isoformat(),
+                }
+            )
+            self.transport.result = TijoriMcpToolResult(
+                tool_name="download_company_filing",
+                status=TijoriToolStatus.SUCCESS,
+                payload=payload,
+            )
+            request = FundamentalFilingAcquisitionRequest(
+                request_id="request-filing-acquisition-invalid-1",
+                operation_id="operation-filing-1",
+                connection=self.connection,
+                requested_at=FILING_NOW,
+                issuer=self.filing_issuer(),
+                reference=filing_reference,
+                discovery_fingerprint=(
+                    discovery_result.discovery.discovery_fingerprint
+                ),
+            )
+
+            with self.assertRaises(FundamentalResponseValidationError):
+                adapter.acquire_filing(request=request)
+
+            self.assertTrue(staged_path.exists())
+            self.assertEqual(
+                [path for path in artifacts.rglob("*") if path.is_file()],
+                [],
+            )
+
+    def test_filing_acquisition_requires_configured_secure_importer(self):
+        self.transport.result = TijoriMcpToolResult(
+            tool_name="list_company_filings",
+            status=TijoriToolStatus.SUCCESS,
+            payload=filing_discovery_payload(),
+        )
+        adapter = TijoriMcpAdapter(
+            transport=self.transport,
+            clock=lambda: FILING_NOW,
+        )
+        discovery_result = adapter.discover_filings(
+            request=self.filing_discovery_request()
+        )
+        calls_before = len(self.transport.calls)
+        request = FundamentalFilingAcquisitionRequest(
+            request_id="request-filing-acquisition-unconfigured-1",
+            operation_id="operation-filing-1",
+            connection=self.connection,
+            requested_at=FILING_NOW,
+            issuer=self.filing_issuer(),
+            reference=discovery_result.discovery.references[0],
+            discovery_fingerprint=(
+                discovery_result.discovery.discovery_fingerprint
+            ),
+        )
+
+        with self.assertRaises(FundamentalGatewayConfigurationError):
+            adapter.acquire_filing(request=request)
+
+        self.assertEqual(len(self.transport.calls), calls_before)
 
     def test_unauthenticated_inspection_marks_every_capability_unavailable(self):
         self.transport.inspection = TijoriMcpTransportInspection(
@@ -1090,6 +1537,52 @@ class TijoriMcpAdapterTests(unittest.TestCase):
         payload = benchmarking_payload()
         payload["document"]["source"]["retrieved_at"] = NOW.isoformat()
         payload["document"]["observation_date"] = "2026-08-28"
+        rows = payload["document"]["rows"]
+        row_template = rows[2]
+        rows.extend(
+            (
+                {
+                    **row_template,
+                    "row_key": "286",
+                    "original_label": "5yr Avg Cash Conversion Cycle",
+                    "display_order": 3,
+                    "provider_hidden": False,
+                    "values": [
+                        {
+                            **row_template["values"][0],
+                            "source_value": "30 days",
+                        },
+                        {
+                            **row_template["values"][1],
+                            "source_value": "-12 days",
+                            "availability_status": "available",
+                        },
+                    ],
+                },
+                {
+                    **row_template,
+                    "row_key": "172",
+                    "original_label": "Net Sales by Employee Cost",
+                    "display_order": 4,
+                    "provider_hidden": False,
+                    "values": [
+                        {
+                            **row_template["values"][0],
+                            "source_value": "(2.50)",
+                        },
+                        {
+                            **row_template["values"][1],
+                            "source_value": "1.25 .",
+                            "availability_status": "available",
+                        },
+                    ],
+                },
+            )
+        )
+        payload["document"]["extraction"].update(
+            row_count=5,
+            cell_count=10,
+        )
         self.transport.result = TijoriMcpToolResult(
             tool_name="get_company_overview",
             status=TijoriToolStatus.SUCCESS,
@@ -1124,6 +1617,19 @@ class TijoriMcpAdapterTests(unittest.TestCase):
         )
         self.assertTrue(document.rows[2].provider_hidden)
         self.assertIsNone(document.rows[2].cells[1].normalized_value)
+        self.assertEqual(document.rows[3].normalized_unit, "days")
+        self.assertEqual(
+            document.rows[3].cells[0].normalized_value,
+            Decimal("30"),
+        )
+        self.assertEqual(
+            document.rows[4].cells[0].normalized_value,
+            Decimal("-2.50"),
+        )
+        self.assertEqual(
+            document.rows[4].cells[1].normalized_value,
+            Decimal("1.25"),
+        )
         self.assertEqual(
             document.expires_at - document.retrieved_at,
             timedelta(days=10),

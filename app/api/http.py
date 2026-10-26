@@ -57,6 +57,8 @@ from app.exceptions import (
     StorageError,
 )
 from app.models.browser_operations import (
+    BrowserOperationAuditLog,
+    BrowserFundamentalPackagePublicationOutcome,
     BrowserOperationOutput,
     BrowserOperationRequest,
     BrowserOperationSnapshot,
@@ -72,7 +74,10 @@ from app.models.browser_conversation import (
     ConversationEventReplayCursor,
 )
 from app.models.conversation import JarvisUtterance
-from app.models.dashboard import JarvisDashboardView
+from app.models.dashboard import (
+    JarvisDashboardView,
+    JarvisTechnicalResearchDashboardView,
+)
 from app.models.fundamentals import ProviderConnectionScope
 from app.models.financial_document_storage import (
     StructuredDocumentRepositoryScope,
@@ -81,6 +86,7 @@ from app.presentation.dashboard import (
     DashboardProjectionError,
     JarvisDashboardProjector,
 )
+from app.workflow.agent_outcomes import build_agent_execution_outcomes
 from app.stt.gateway import Transcription
 from app.services.provider_sessions import ProviderSessionCommandError
 from app.storage.financial_document_repositories import (
@@ -1048,14 +1054,70 @@ def create_jarvis_http_app(
         )
 
     @app.get(
+        "/api/v1/sessions/{session_id}/operations/{operation_id}/audit",
+        response_model=BrowserOperationAuditLog,
+    )
+    def get_operation_audit(
+        session_id: str,
+        operation_id: str,
+        x_jarvis_session_token: str | None = Header(default=None),
+    ) -> BrowserOperationAuditLog:
+        authorize(session_id, x_jarvis_session_token)
+        snapshot = owned_operation(session_id, operation_id)
+        events = []
+        sequence = 0
+        while True:
+            batch = operations.replay(
+                WorkflowEventReplayCursor(
+                    operation_id=operation_id,
+                    after_sequence=sequence,
+                    limit=500,
+                )
+            )
+            events.extend(batch.events)
+            sequence = batch.next_sequence
+            if not batch.has_more:
+                break
+        result = (
+            operations.get_result(operation_id)
+            if snapshot.result_available
+            else None
+        )
+        if snapshot.result_available and result is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="retained browser operation result is unavailable",
+            )
+        return BrowserOperationAuditLog(
+            operation=snapshot,
+            events=tuple(events),
+            agent_outcomes=build_agent_execution_outcomes(
+                snapshot,
+                tuple(events),
+                result,
+            ),
+            fundamental_package_publication=(
+                BrowserFundamentalPackagePublicationOutcome(
+                    reference=result.fundamental_package_reference,
+                )
+                if result is not None
+                and result.fundamental_package_reference is not None
+                else None
+            ),
+            result=result,
+        )
+
+    @app.get(
         "/api/v1/sessions/{session_id}/operations/{operation_id}/dashboard",
-        response_model=JarvisDashboardView,
+        response_model=(
+            JarvisDashboardView | JarvisTechnicalResearchDashboardView
+        ),
     )
     def get_dashboard(
         session_id: str,
         operation_id: str,
         x_jarvis_session_token: str | None = Header(default=None),
-    ) -> JarvisDashboardView:
+    ) -> JarvisDashboardView | JarvisTechnicalResearchDashboardView:
         authorize(session_id, x_jarvis_session_token)
         snapshot = owned_operation(session_id, operation_id)
         if snapshot.status is not BrowserOperationStatus.COMPLETED:
@@ -1084,6 +1146,16 @@ def create_jarvis_http_app(
             if not batch.has_more:
                 break
         try:
+            response = output.research_response
+            if (
+                response is not None
+                and response.research_division_result is not None
+            ):
+                return resolved_dashboard_projector.project_technical_research(
+                    snapshot,
+                    output,
+                    events,
+                )
             return resolved_dashboard_projector.project(
                 snapshot,
                 output,

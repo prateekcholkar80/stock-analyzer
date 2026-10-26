@@ -13,6 +13,8 @@ TOOLS = (
     "get_company_overview",
     "get_financials",
     "get_shareholding",
+    "list_company_filings",
+    "download_company_filing",
 )
 
 

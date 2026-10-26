@@ -5,6 +5,7 @@ from typing import Literal, Self
 from pydantic import ConfigDict, Field, model_validator
 
 from app.models.agentic import AgenticTradePlanningResult
+from app.models.evidence_hierarchy import HierarchicalEvidenceAssessment
 from app.models.technical import TechnicalModel
 from app.models.trade_decision import (
     MarketCondition,
@@ -50,6 +51,7 @@ class MultiTimeframeLongTradePlanResult(TechnicalModel):
     disposition: MultiTimeframeTradeDisposition
     reason: MultiTimeframeTradeReason
     trade_decision: TradeDecisionOutcome | None = None
+    hierarchy_assessment: HierarchicalEvidenceAssessment | None = None
     minimum_reward_to_risk: Literal[2.0] = 2.0
     daily_planning_result: AgenticTradePlanningResult | None = None
     rationale: str = Field(min_length=1)
@@ -73,6 +75,31 @@ class MultiTimeframeLongTradePlanResult(TechnicalModel):
             raise ValueError(
                 "version-2 trade plan requires a trade-decision contract"
             )
+        if not legacy_schema and self.hierarchy_assessment is None:
+            raise ValueError(
+                "version-2 trade plan requires a hierarchy assessment"
+            )
+        if legacy_schema and self.hierarchy_assessment is not None:
+            raise ValueError(
+                "legacy trade plan cannot contain a hierarchy assessment"
+            )
+
+        assessment = self.hierarchy_assessment
+        if assessment is not None and self.trade_decision is not None:
+            if (
+                assessment.primary_condition
+                is not self.trade_decision.market_condition
+            ):
+                raise ValueError(
+                    "hierarchy primary condition must match the trade decision"
+                )
+            if (
+                self.trade_decision.decision is TradeDecision.BUY
+                and not assessment.release_eligible
+            ):
+                raise ValueError(
+                    "BUY decision requires hierarchy release eligibility"
+                )
 
         planning = self.daily_planning_result
         if self.disposition is MultiTimeframeTradeDisposition.ACTIONABLE:
@@ -96,6 +123,10 @@ class MultiTimeframeLongTradePlanResult(TechnicalModel):
             ):
                 raise ValueError(
                     "actionable plan requires a bullish BUY decision"
+                )
+            if assessment is None or not assessment.release_eligible:
+                raise ValueError(
+                    "actionable plan requires hierarchy release eligibility"
                 )
             return self
 

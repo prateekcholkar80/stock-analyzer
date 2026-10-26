@@ -68,6 +68,7 @@ def peer_comparison_payload() -> dict:
                 "exchange": "nse",
                 "symbol": "coforge",
                 "legal_name": "Coforge Ltd.",
+                "isin": None,
                 "provider_company_id": "123",
                 "provider_slug": "niit-technologies-limited",
             },
@@ -115,6 +116,7 @@ class TijoriPeerComparisonPayloadTests(unittest.TestCase):
 
         self.assertEqual(payload.document.issuer.exchange, "NSE")
         self.assertEqual(payload.document.issuer.symbol, "COFORGE")
+        self.assertIsNone(payload.document.issuer.isin)
         self.assertEqual(payload.document.observation_date.isoformat(), "2026-09-01")
         self.assertTrue(payload.document.peers[0].is_subject)
         self.assertEqual(

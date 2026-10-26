@@ -1,6 +1,9 @@
 from math import isclose
 
-from app.analytics.cpr_policy import evaluate_cpr_trade_policy
+from app.analytics.evidence_hierarchy import (
+    assess_evidence_hierarchy,
+    build_multi_timeframe_technical_findings,
+)
 from app.exceptions import AgentSubmissionRejectedError
 from app.models.agentic import (
     AgenticSwingAnalysisResult,
@@ -9,6 +12,12 @@ from app.models.agentic import (
     TradePlanningReason,
 )
 from app.models.debate import AgenticDebateResult
+from app.models.evidence_hierarchy import (
+    EvidenceFamily,
+    EvidenceFamilyFinding,
+    EvidenceFamilyState,
+    HierarchicalEvidenceAssessment,
+)
 from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
 from app.models.multi_timeframe_trade import (
     MultiTimeframeLongTradePlanResult,
@@ -21,7 +30,6 @@ from app.models.trade_decision import (
     NoTradeReason,
     TradeDecision,
     TradeDecisionOutcome,
-    combined_profile_market_condition,
 )
 from app.orchestration.agent_orchestrator import AgentOrchestrator
 
@@ -47,10 +55,19 @@ class BuildMultiTimeframeLongTradePlan:
         package = _validated_chain(technical_review, debate_result)
         verdict = debate_result.submission.verdict
         analysis = package.technical_analysis
-        market_condition = combined_profile_market_condition(
-            analysis.daily_submission.profile,
-            analysis.weekly_submission.profile,
+        technical_findings = build_multi_timeframe_technical_findings(package)
+        hierarchy = _hierarchy_assessment(
+            technical_findings,
+            entry_state=EvidenceFamilyState.INSUFFICIENT,
+            entry_rationale=(
+                "The deterministic entry stage has not been reached."
+            ),
+            risk_state=EvidenceFamilyState.INSUFFICIENT,
+            risk_rationale=(
+                "The deterministic stop and target stage has not been reached."
+            ),
         )
+        market_condition = hierarchy.primary_condition
         common = {
             "schema_version": "jarvis.multi_timeframe_trade_plan.v2",
             "policy_id": "jarvis.buy_eligibility_2r_swing_policy.v2",
@@ -72,6 +89,7 @@ class BuildMultiTimeframeLongTradePlan:
             )
             return MultiTimeframeLongTradePlanResult(
                 **common,
+                hierarchy_assessment=hierarchy,
                 disposition=MultiTimeframeTradeDisposition.NO_TRADE,
                 reason=MultiTimeframeTradeReason.JUDGE_NOT_BULLISH,
                 trade_decision=TradeDecisionOutcome(
@@ -92,35 +110,13 @@ class BuildMultiTimeframeLongTradePlan:
             )
             return MultiTimeframeLongTradePlanResult(
                 **common,
+                hierarchy_assessment=hierarchy,
                 disposition=MultiTimeframeTradeDisposition.NO_TRADE,
                 reason=MultiTimeframeTradeReason.TIMEFRAME_SETUP_NOT_ALIGNED,
                 trade_decision=TradeDecisionOutcome(
                     market_condition=market_condition,
                     decision=TradeDecision.NO_TRADE,
                     no_trade_reasons=(no_trade_reason,),
-                    rationale=rationale,
-                ),
-                rationale=rationale,
-            )
-
-        cpr_policy = evaluate_cpr_trade_policy(
-            package.daily.cpr,
-            package.weekly.cpr,
-        )
-        if not cpr_policy.buy_eligible:
-            rationale = (
-                "No BUY decision was issued because the deterministic CPR "
-                "confirmation policy found unresolved timing or structural "
-                f"risk. {cpr_policy.rationale}"
-            )
-            return MultiTimeframeLongTradePlanResult(
-                **common,
-                disposition=MultiTimeframeTradeDisposition.NO_TRADE,
-                reason=MultiTimeframeTradeReason.TIMEFRAME_SETUP_NOT_ALIGNED,
-                trade_decision=TradeDecisionOutcome(
-                    market_condition=MarketCondition.BULLISH,
-                    decision=TradeDecision.NO_TRADE,
-                    no_trade_reasons=cpr_policy.blocking_reasons,
                     rationale=rationale,
                 ),
                 rationale=rationale,
@@ -154,11 +150,22 @@ class BuildMultiTimeframeLongTradePlan:
             )
         plan = planning.approved_trade_intent
         if plan is None:
+            entry_state, risk_state = _planner_gate_states(
+                planning.submission.reason
+            )
+            hierarchy = _hierarchy_assessment(
+                technical_findings,
+                entry_state=entry_state,
+                entry_rationale=planning.submission.rationale,
+                risk_state=risk_state,
+                risk_rationale=planning.submission.rationale,
+            )
             no_trade_reason = _planner_no_trade_reason(
                 planning.submission.reason
             )
             return MultiTimeframeLongTradePlanResult(
                 **common,
+                hierarchy_assessment=hierarchy,
                 disposition=MultiTimeframeTradeDisposition.NO_TRADE,
                 reason=(
                     MultiTimeframeTradeReason.DETERMINISTIC_PLANNER_NO_TRADE
@@ -172,14 +179,26 @@ class BuildMultiTimeframeLongTradePlan:
                 ),
                 rationale=planning.submission.rationale,
             )
+        hierarchy = _hierarchy_assessment(
+            technical_findings,
+            entry_state=EvidenceFamilyState.PASS,
+            entry_rationale=planning.submission.rationale,
+            risk_state=EvidenceFamilyState.PASS,
+            risk_rationale=plan.evaluation.rationale,
+        )
+        if not hierarchy.release_eligible:
+            raise AgentSubmissionRejectedError(
+                "deterministic trade planning cannot bypass hierarchy gates"
+            )
         rationale = (
-            "The final Judge and daily profile are bullish, and the "
-            "deterministic planner found a structure-aware buy setup "
-            "with a feasible 1:2 minimum target. "
-            f"{cpr_policy.rationale}"
+            "The final Judge is bullish, the hierarchical primary context "
+            "is bullish, and the deterministic planner found a "
+            "structure-aware entry with a feasible 1:2 minimum target. "
+            f"{hierarchy.rationale}"
         )
         return MultiTimeframeLongTradePlanResult(
             **common,
+            hierarchy_assessment=hierarchy,
             disposition=MultiTimeframeTradeDisposition.ACTIONABLE,
             reason=(
                 MultiTimeframeTradeReason.BULLISH_VERDICT_AND_DAILY_SETUP
@@ -192,6 +211,87 @@ class BuildMultiTimeframeLongTradePlan:
             ),
             rationale=rationale,
         )
+
+
+def _hierarchy_assessment(
+    technical_findings: tuple[EvidenceFamilyFinding, ...],
+    *,
+    entry_state: EvidenceFamilyState,
+    entry_rationale: str,
+    risk_state: EvidenceFamilyState,
+    risk_rationale: str,
+) -> HierarchicalEvidenceAssessment:
+    entry_evidence_ids = _family_evidence_ids(
+        technical_findings,
+        {
+            EvidenceFamily.MARKET_STRUCTURE,
+            EvidenceFamily.PRICE_LOCATION,
+            EvidenceFamily.CPR_CONTEXT,
+            EvidenceFamily.CANDLESTICK_CONTEXT,
+        },
+    )
+    risk_evidence_ids = _family_evidence_ids(
+        technical_findings,
+        {
+            EvidenceFamily.PRICE_LOCATION,
+            EvidenceFamily.VOLATILITY_CONTEXT,
+        },
+    )
+    gate_findings = (
+        EvidenceFamilyFinding(
+            family=EvidenceFamily.FUNDAMENTAL_HEALTH,
+            state=EvidenceFamilyState.NOT_APPLICABLE,
+            rationale=(
+                "Fundamental health is a separate conclusion and is not "
+                "evaluated by the technical trade-planning workflow."
+            ),
+        ),
+        EvidenceFamilyFinding(
+            family=EvidenceFamily.ENTRY_TRIGGER,
+            state=entry_state,
+            evidence_ids=entry_evidence_ids,
+            rationale=entry_rationale,
+        ),
+        EvidenceFamilyFinding(
+            family=EvidenceFamily.RISK_TARGET_FEASIBILITY,
+            state=risk_state,
+            evidence_ids=risk_evidence_ids,
+            rationale=risk_rationale,
+        ),
+    )
+    return assess_evidence_hierarchy(
+        (*technical_findings, *gate_findings),
+        not_applicable_families=frozenset(
+            {EvidenceFamily.FUNDAMENTAL_HEALTH}
+        ),
+    )
+
+
+def _family_evidence_ids(
+    findings: tuple[EvidenceFamilyFinding, ...],
+    families: set[EvidenceFamily],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            evidence_id
+            for finding in findings
+            if finding.family in families
+            for evidence_id in finding.evidence_ids
+        )
+    )
+
+
+def _planner_gate_states(
+    reason: TradePlanningReason,
+) -> tuple[EvidenceFamilyState, EvidenceFamilyState]:
+    if reason is TradePlanningReason.NON_DIRECTIONAL_PROFILE:
+        return EvidenceFamilyState.FAIL, EvidenceFamilyState.INSUFFICIENT
+    if reason in {
+        TradePlanningReason.MINIMUM_TARGET_BLOCKED,
+        TradePlanningReason.INSUFFICIENT_STOP_EVIDENCE,
+    }:
+        return EvidenceFamilyState.PASS, EvidenceFamilyState.FAIL
+    raise ValueError("unsupported planner reason for hierarchy gates")
 
 
 def _validated_chain(technical_review, debate_result):

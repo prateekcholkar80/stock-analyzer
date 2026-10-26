@@ -2,6 +2,8 @@ import csv
 import io
 import os
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import RLock
@@ -31,6 +33,18 @@ logger = get_logger(__name__)
 class SectorIndustry(NamedTuple):
     sector: str
     industry: str
+
+
+class SectorIndustryObservation(NamedTuple):
+    """One exact sector-master record with reproducible provenance."""
+
+    symbol: str
+    sector: str
+    industry: str
+    source_location: str
+    source_payload_fingerprint: str
+    source_record_fingerprint: str
+    retrieved_at: datetime
 
 
 class NseSectorMasterConfig(BaseModel):
@@ -135,6 +149,8 @@ class NseSectorMasterCatalog:
         self.config = resolved_config
         self._downloader = downloader or _download_sector_master
         self._mapping: dict[str, SectorIndustry] | None = None
+        self._source_payload_fingerprint: str | None = None
+        self._source_retrieved_at: datetime | None = None
         self._lock = RLock()
 
     def sector_industry_by_symbol(self) -> Mapping[str, SectorIndustry]:
@@ -159,6 +175,10 @@ class NseSectorMasterCatalog:
                     )
                 else:
                     self._mapping = dict(mapping)
+                    self._record_source_provenance(
+                        cached_payload,
+                        retrieved_at=_cache_modified_at(self.config.cache_path),
+                    )
                     return self._mapping
 
             try:
@@ -171,6 +191,10 @@ class NseSectorMasterCatalog:
                 if stale_payload is None:
                     raise
                 mapping = _parse_sector_master_payload(stale_payload)
+                self._record_source_provenance(
+                    stale_payload,
+                    retrieved_at=_cache_modified_at(self.config.cache_path),
+                )
                 logger.warning(
                     "Using stale NSE sector-master cache after download "
                     "failure",
@@ -183,6 +207,10 @@ class NseSectorMasterCatalog:
             else:
                 mapping = _parse_sector_master_payload(payload)
                 _write_cache_atomically(self.config.cache_path, payload)
+                self._record_source_provenance(
+                    payload,
+                    retrieved_at=datetime.now(timezone.utc),
+                )
 
             self._mapping = dict(mapping)
             return self._mapping
@@ -198,6 +226,10 @@ class NseSectorMasterCatalog:
             mapping = _parse_sector_master_payload(payload)
             _write_cache_atomically(self.config.cache_path, payload)
             self._mapping = dict(mapping)
+            self._record_source_provenance(
+                payload,
+                retrieved_at=datetime.now(timezone.utc),
+            )
             logger.info(
                 "NSE sector master refreshed",
                 extra={
@@ -207,6 +239,52 @@ class NseSectorMasterCatalog:
                 },
             )
             return len(mapping)
+
+    def observation_for_symbol(
+        self,
+        symbol: str,
+    ) -> SectorIndustryObservation | None:
+        """Return an exact symbol match and its source provenance.
+
+        No company-name or substring matching is performed. A catalog with
+        injected rows but no recorded source payload returns ``None`` because
+        those rows cannot support an evidence-cited classification.
+        """
+
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("sector observation symbol must be non-blank")
+        normalized = symbol.strip().upper()
+        for suffix in ("-EQ", "-BE", "-BZ"):
+            if normalized.endswith(suffix):
+                normalized = normalized[: -len(suffix)]
+                break
+        mapping = self.sector_industry_by_symbol()
+        record = mapping.get(normalized)
+        payload_fingerprint = self._source_payload_fingerprint
+        retrieved_at = self._source_retrieved_at
+        if record is None or payload_fingerprint is None or retrieved_at is None:
+            return None
+        canonical_record = "\0".join(
+            (payload_fingerprint, normalized, record.sector, record.industry)
+        ).encode("utf-8")
+        return SectorIndustryObservation(
+            symbol=normalized,
+            sector=record.sector,
+            industry=record.industry,
+            source_location=self.config.endpoint_url,
+            source_payload_fingerprint=payload_fingerprint,
+            source_record_fingerprint=sha256(canonical_record).hexdigest(),
+            retrieved_at=retrieved_at,
+        )
+
+    def _record_source_provenance(
+        self,
+        payload: bytes,
+        *,
+        retrieved_at: datetime,
+    ) -> None:
+        self._source_payload_fingerprint = sha256(payload).hexdigest()
+        self._source_retrieved_at = retrieved_at
 
     def _download(self) -> bytes:
         try:
@@ -349,6 +427,15 @@ def _read_cache(path: Path, max_payload_bytes: int) -> bytes | None:
             "Unable to read the NSE sector-master cache"
         ) from exc
     return payload or None
+
+
+def _cache_modified_at(path: Path) -> datetime:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError as exc:
+        raise InstrumentMasterDataError(
+            "Unable to read NSE sector-master cache provenance"
+        ) from exc
 
 
 def _write_cache_atomically(path: Path, payload: bytes) -> None:

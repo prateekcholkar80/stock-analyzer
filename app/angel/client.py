@@ -1,6 +1,8 @@
+from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from threading import RLock
-from time import perf_counter
+from time import monotonic, perf_counter, sleep
 from typing import Any
 
 import pyotp
@@ -18,6 +20,87 @@ from app.logging_config import get_logger
 ClientFactory = Callable[..., Any]
 logger = get_logger(__name__)
 _EXPIRED_SESSION_ERROR_CODES = frozenset({"AG8001"})
+_RATE_LIMIT_MARKERS = (
+    "exceeding access rate",
+    "exceeding rate limit",
+    "rate limit exceeded",
+    "too many requests",
+)
+
+
+@dataclass(frozen=True)
+class AngelHistoricalRequestPolicy:
+    """Published broker limits plus conservative bounded retry delays."""
+
+    requests_per_second: int = 3
+    requests_per_minute: int = 180
+    requests_per_hour: int = 5_000
+    retry_delays_seconds: tuple[float, ...] = (2.0, 5.0, 10.0)
+
+    def __post_init__(self) -> None:
+        limits = (
+            self.requests_per_second,
+            self.requests_per_minute,
+            self.requests_per_hour,
+        )
+        if any(isinstance(value, bool) or value < 1 for value in limits):
+            raise ValueError("historical request limits must be positive integers")
+        if any(
+            isinstance(delay, bool) or delay < 0
+            for delay in self.retry_delays_seconds
+        ):
+            raise ValueError("historical retry delays must be non-negative")
+
+
+class _HistoricalRequestLimiter:
+    """Thread-safe sliding-window limiter for one broker client code."""
+
+    def __init__(
+        self,
+        policy: AngelHistoricalRequestPolicy,
+        *,
+        clock: Callable[[], float],
+        sleep_fn: Callable[[float], None],
+    ) -> None:
+        self._windows = (
+            (1.0, policy.requests_per_second),
+            (60.0, policy.requests_per_minute),
+            (3_600.0, policy.requests_per_hour),
+        )
+        self._clock = clock
+        self._sleep = sleep_fn
+        self._request_times: deque[float] = deque()
+        self._lock = RLock()
+
+    def acquire(self) -> None:
+        with self._lock:
+            while True:
+                now = self._clock()
+                longest_window = self._windows[-1][0]
+                while (
+                    self._request_times
+                    and self._request_times[0] <= now - longest_window
+                ):
+                    self._request_times.popleft()
+
+                required_wait = 0.0
+                request_times = tuple(self._request_times)
+                for window_seconds, request_limit in self._windows:
+                    in_window = tuple(
+                        timestamp
+                        for timestamp in request_times
+                        if timestamp > now - window_seconds
+                    )
+                    if len(in_window) >= request_limit:
+                        required_wait = max(
+                            required_wait,
+                            in_window[-request_limit] + window_seconds - now,
+                        )
+
+                if required_wait <= 0:
+                    self._request_times.append(now)
+                    return
+                self._sleep(required_wait)
 
 
 def _duration_ms(started_at: float) -> float:
@@ -37,6 +120,18 @@ def _is_expired_session_response(response: object) -> bool:
     )
 
 
+def _is_rate_limit_failure(value: object) -> bool:
+    if isinstance(value, dict):
+        message = " ".join(
+            str(value.get(field, ""))
+            for field in ("message", "errorCode", "errorcode")
+        )
+    else:
+        message = str(value)
+    normalized = message.casefold()
+    return any(marker in normalized for marker in _RATE_LIMIT_MARKERS)
+
+
 def _disable_unsafe_sdk_request_logging(sdk_module: object) -> None:
     """Stop SmartAPI from logging raw headers and authentication fields."""
     sdk_logger = getattr(sdk_module, "logger", None)
@@ -49,6 +144,10 @@ class AngelOneClient:
         self,
         settings: Settings | None = None,
         client_factory: ClientFactory | None = None,
+        historical_request_policy: AngelHistoricalRequestPolicy | None = None,
+        *,
+        clock: Callable[[], float] = monotonic,
+        sleep_fn: Callable[[float], None] = sleep,
     ):
         self.settings = settings or get_settings()
 
@@ -65,6 +164,15 @@ class AngelOneClient:
         self.session: MarketResponse | None = None
         self._authentication_lock = RLock()
         self._session_generation = 0
+        self._historical_request_policy = (
+            historical_request_policy or AngelHistoricalRequestPolicy()
+        )
+        self._history_limiter = _HistoricalRequestLimiter(
+            self._historical_request_policy,
+            clock=clock,
+            sleep_fn=sleep_fn,
+        )
+        self._sleep = sleep_fn
 
     def initialize(self) -> None:
         self.login()
@@ -185,6 +293,41 @@ class AngelOneClient:
                 "Angel One client is not authenticated"
             )
 
+    def _request_historical_with_rate_policy(
+        self,
+        request: Callable[[], MarketResponse],
+    ) -> MarketResponse:
+        delays = self._historical_request_policy.retry_delays_seconds
+        for attempt in range(len(delays) + 1):
+            self._history_limiter.acquire()
+            try:
+                response = request()
+            except Exception as exc:
+                if not _is_rate_limit_failure(exc) or attempt >= len(delays):
+                    raise
+            else:
+                if not _is_rate_limit_failure(response):
+                    return response
+                if attempt >= len(delays):
+                    raise MarketDataError(
+                        "Angel One historical rate-limit retry budget exhausted"
+                    )
+
+            delay = delays[attempt]
+            logger.warning(
+                "Angel One historical request rate limited; retrying",
+                extra={
+                    "event": "angel.history.rate_limited",
+                    "retry_attempt": attempt + 1,
+                    "retry_delay_seconds": delay,
+                },
+            )
+            self._sleep(delay)
+
+        raise MarketDataError(
+            "Angel One historical rate-limit retry budget exhausted"
+        )
+
     def get_ltp(
         self,
         exchange: str,
@@ -276,7 +419,9 @@ class AngelOneClient:
 
         try:
             response = self._request_with_session_refresh(
-                lambda: self.client.getCandleData(params),
+                lambda: self._request_historical_with_rate_policy(
+                    lambda: self.client.getCandleData(params)
+                ),
                 operation="historical_candles",
             )
         except Exception as exc:

@@ -3,7 +3,9 @@ duckdb
 pandas
 pandas-ta-classic
 openpyxl
+pdfplumber
 pydantic
+pytz
 smartapi-python
 pyotp
 requests

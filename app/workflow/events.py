@@ -230,6 +230,23 @@ _DEFAULT_ACTIVITIES = {
 }
 
 
+_ATOMIC_ACTIVITY_STAGES = frozenset(
+    {
+        WorkflowStage.MARKET_DATA_LOADING,
+        WorkflowStage.TECHNICAL_ANALYSIS,
+        WorkflowStage.DATA_PREPARATION,
+        WorkflowStage.ANALYSIS,
+        WorkflowStage.EVIDENCE_REVIEW,
+        WorkflowStage.BULL_DEBATING,
+        WorkflowStage.BEAR_DEBATING,
+        WorkflowStage.JUDGE_REVIEWING,
+        WorkflowStage.TRADE_PLANNING,
+        WorkflowStage.PRESENTATION,
+        WorkflowStage.FOLLOW_UP,
+    }
+)
+
+
 @runtime_checkable
 class WorkflowEventSink(Protocol):
     def publish(self, event: JarvisWorkflowEvent) -> None:
@@ -291,6 +308,10 @@ class WorkflowEventEmitter:
         self._sink = resolved_sink
         self._clock = resolved_clock
         self._sequence = initial_sequence
+        self._activity_states: dict[
+            tuple[WorkflowStage, str, int | None],
+            WorkflowEventState,
+        ] = {}
         self._lock = RLock()
 
     def emit(
@@ -321,6 +342,23 @@ class WorkflowEventEmitter:
         if not resolved_message:
             raise ValueError("workflow event message must not be blank")
         with self._lock:
+            activity_key = (
+                stage,
+                resolved_activity.activity_id,
+                round_number,
+            )
+            if stage in _ATOMIC_ACTIVITY_STAGES:
+                previous_state = self._activity_states.get(activity_key)
+                if state is WorkflowEventState.STARTED:
+                    if previous_state is not None:
+                        raise ValueError(
+                            "workflow activity invocation was already started"
+                        )
+                elif previous_state is not WorkflowEventState.STARTED:
+                    raise ValueError(
+                        "workflow activity terminal state requires exactly "
+                        "one started state"
+                    )
             self._sequence += 1
             event = JarvisWorkflowEvent(
                 event_id=f"{self.operation_id}:{self._sequence}",
@@ -347,6 +385,8 @@ class WorkflowEventEmitter:
                         "error_type": type(exc).__name__,
                     },
                 )
+            if stage in _ATOMIC_ACTIVITY_STAGES:
+                self._activity_states[activity_key] = state
             return event
 
 

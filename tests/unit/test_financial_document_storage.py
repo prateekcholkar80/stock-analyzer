@@ -240,6 +240,9 @@ class CompleteStructuredDocumentRepository:
     def replace_structured_financial_document(self, stored, *, scope):
         return stored
 
+    def replace_structured_financial_document_package(self, stored, *, scope):
+        return stored
+
     def get_structured_financial_document(self, key, *, scope, as_of):
         return None
 
@@ -286,6 +289,7 @@ class StructuredFinancialDocumentRepositoryTests(unittest.TestCase):
         expected = {
             "save_structured_financial_document",
             "replace_structured_financial_document",
+            "replace_structured_financial_document_package",
             "get_structured_financial_document",
             "get_structured_financial_document_by_cache_entry_id",
             "delete_structured_financial_document",

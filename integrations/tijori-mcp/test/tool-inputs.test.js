@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { validateToolArguments } from '../src/tool-inputs.js';
+import {
+  validateDownloadCompanyFilingArguments,
+  validateListCompanyFilingsArguments,
+  validateToolArguments,
+} from '../src/tool-inputs.js';
 
 
 const issuer = {
@@ -11,6 +15,19 @@ const issuer = {
   isin: 'ine467b01029',
   provider_company_id: '123',
   provider_slug: 'tata-consultancy-services',
+};
+const filingReference = {
+  filing_reference_id: 'filing.tcs.fy2026.q4.earnings-release',
+  category: 'earnings_release',
+  provider_company_id: '123',
+  provider_slug: 'tata-consultancy-services',
+  source_page_url: (
+    'https://www.tijorifinance.com/company/tata-consultancy-services/'
+  ),
+  artifact_url: (
+    'https://files.tijorifinance.com/insight/india/123/ER-Mar26.pdf'
+  ),
+  discovery_fingerprint: 'a'.repeat(64),
 };
 
 test('normalizes and defaults company-search arguments', () => {
@@ -132,6 +149,20 @@ test('accepts explicit Growth Table document scenarios independently', () => {
   });
 });
 
+test('accepts the complete Financial Package as a basis-independent document', () => {
+  assert.deepEqual(validateToolArguments('get_financials', {
+    issuer,
+    as_of_date: '2026-08-30',
+    document_type: 'financial_package',
+    reporting_basis: 'not_applicable',
+  }), {
+    issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+    as_of_date: '2026-08-30',
+    document_type: 'financial_package',
+    reporting_basis: 'not_applicable',
+  });
+});
+
 test('accepts explicit Balance Sheet scenarios for both reporting bases', () => {
   for (const reportingBasis of ['consolidated', 'standalone']) {
     assert.deepEqual(validateToolArguments('get_financials', {
@@ -239,6 +270,14 @@ test('rejects incomplete, unsupported, or mixed financial document dimensions', 
   );
   assert.throws(
     () => validateToolArguments('get_financials', {
+      issuer,
+      document_type: 'financial_package',
+      reporting_basis: 'standalone',
+    }),
+    /requires the not_applicable reporting basis exclusively/,
+  );
+  assert.throws(
+    () => validateToolArguments('get_financials', {
       issuer, document_type: 'balance_sheet', reporting_basis: 'not_applicable',
     }),
     /requires the not_applicable reporting basis exclusively/,
@@ -266,6 +305,174 @@ test('applies shareholding defaults and validates explicit bounds', () => {
   });
   assert.equal(explicit.quarters, 40);
   assert.equal(explicit.include_promoter_pledge, false);
+});
+
+test('validates bounded filing discovery inputs and safe defaults', () => {
+  const defaults = validateListCompanyFilingsArguments({ issuer });
+
+  assert.deepEqual(defaults, {
+    issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+    categories: ['earnings_release', 'conference_call'],
+    from_fiscal_year: null,
+    through_date: null,
+    max_documents: 100,
+  });
+  assert.equal(Object.isFrozen(defaults), true);
+  assert.equal(Object.isFrozen(defaults.issuer), true);
+  assert.equal(Object.isFrozen(defaults.categories), true);
+
+  assert.deepEqual(validateListCompanyFilingsArguments({
+    issuer,
+    categories: ['conference_call'],
+    from_fiscal_year: 2017,
+    through_date: '2026-09-14',
+    max_documents: 200,
+  }), {
+    issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+    categories: ['conference_call'],
+    from_fiscal_year: 2017,
+    through_date: '2026-09-14',
+    max_documents: 200,
+  });
+});
+
+test('rejects unsafe or unbounded filing discovery inputs', () => {
+  assert.throws(
+    () => validateListCompanyFilingsArguments({
+      issuer: { ...issuer, provider_company_id: null },
+    }),
+    /resolved provider company identity/,
+  );
+  assert.throws(
+    () => validateListCompanyFilingsArguments({
+      issuer,
+      categories: ['annual_report'],
+    }),
+    /unsupported value/,
+  );
+  assert.throws(
+    () => validateListCompanyFilingsArguments({
+      issuer,
+      categories: ['earnings_release', 'earnings_release'],
+    }),
+    /unique/,
+  );
+  assert.throws(
+    () => validateListCompanyFilingsArguments({
+      issuer,
+      from_fiscal_year: 1899,
+    }),
+    /integer from 1900 to 2200/,
+  );
+  assert.throws(
+    () => validateListCompanyFilingsArguments({
+      issuer,
+      max_documents: 201,
+    }),
+    /integer from 1 to 200/,
+  );
+  assert.throws(
+    () => validateListCompanyFilingsArguments({
+      issuer,
+      download_directory: '/tmp/provider-files',
+    }),
+    /unsupported field/,
+  );
+});
+
+test('validates exact issuer-bound filing download inputs', () => {
+  const result = validateDownloadCompanyFilingArguments({
+    issuer,
+    filing_reference: filingReference,
+    expected_source_url: filingReference.artifact_url,
+    expected_provider_company_id: '123',
+  });
+
+  assert.deepEqual(result, {
+    issuer: { ...issuer, exchange: 'NSE', symbol: 'TCS', isin: 'INE467B01029' },
+    filing_reference: filingReference,
+    expected_source_url: filingReference.artifact_url,
+    expected_provider_company_id: '123',
+  });
+  assert.equal(Object.isFrozen(result), true);
+  assert.equal(Object.isFrozen(result.filing_reference), true);
+});
+
+test('rejects mismatched or unsafe filing download inputs', () => {
+  assert.throws(
+    () => validateDownloadCompanyFilingArguments({
+      issuer,
+      filing_reference: filingReference,
+      expected_source_url: filingReference.artifact_url,
+      expected_provider_company_id: '999',
+    }),
+    /company identity must match/,
+  );
+  assert.throws(
+    () => validateDownloadCompanyFilingArguments({
+      issuer,
+      filing_reference: filingReference,
+      expected_source_url: 'https://files.tijorifinance.com/another.pdf',
+      expected_provider_company_id: '123',
+    }),
+    /must exactly match/,
+  );
+  assert.throws(
+    () => validateDownloadCompanyFilingArguments({
+      issuer,
+      filing_reference: {
+        ...filingReference,
+        artifact_url: 'http://files.tijorifinance.com/ER-Mar26.pdf',
+      },
+      expected_source_url: 'http://files.tijorifinance.com/ER-Mar26.pdf',
+      expected_provider_company_id: '123',
+    }),
+    /credential-free HTTPS URL/,
+  );
+  assert.throws(
+    () => validateDownloadCompanyFilingArguments({
+      issuer,
+      filing_reference: {
+        ...filingReference,
+        artifact_url: (
+          'https://files.tijorifinance.com/ER.pdf?session_token=secret'
+        ),
+      },
+      expected_source_url: (
+        'https://files.tijorifinance.com/ER.pdf?session_token=secret'
+      ),
+      expected_provider_company_id: '123',
+    }),
+    /sensitive URL parameters/,
+  );
+  assert.throws(
+    () => validateDownloadCompanyFilingArguments({
+      issuer,
+      filing_reference: { ...filingReference, local_path: '/tmp/ER.pdf' },
+      expected_source_url: filingReference.artifact_url,
+      expected_provider_company_id: '123',
+    }),
+    /unsupported field/,
+  );
+});
+
+test('activates filing discovery and strict issuer-bound filing download', () => {
+  const discovery = validateToolArguments('list_company_filings', { issuer });
+  assert.deepEqual(discovery.categories, [
+    'earnings_release',
+    'conference_call',
+  ]);
+  assert.equal(Object.isFrozen(discovery), true);
+  const download = validateToolArguments('download_company_filing', {
+    issuer,
+    filing_reference: filingReference,
+    expected_source_url: filingReference.artifact_url,
+    expected_provider_company_id: '123',
+  });
+  assert.equal(download.expected_provider_company_id, '123');
+  assert.equal(download.expected_source_url, filingReference.artifact_url);
+  assert.equal(Object.isFrozen(download), true);
+  assert.equal(Object.isFrozen(download.filing_reference), true);
 });
 
 test('rejects unknown tools, fields, and missing required fields', () => {

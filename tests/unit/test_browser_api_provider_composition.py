@@ -1,7 +1,10 @@
 import hashlib
+from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from app.api.models import ProviderSessionTargetRequest
 from app.exceptions import ConfigurationError
@@ -13,6 +16,9 @@ from app.services.provider_sessions import ProviderSessionService
 from app.services.fundamental_evidence import (
     FundamentalEvidenceCoordinator,
     FundamentalEvidenceSource,
+)
+from app.services.fundamental_filing_evidence import (
+    FundamentalFilingEvidenceCoordinator,
 )
 from app.storage.adapters.duckdb import DuckDBJarvisStorage
 from app.storage.financial_document_repositories import (
@@ -27,6 +33,13 @@ from examples.browser_api import _provider_session_http_dependencies
 
 class BrowserApiProviderCompositionTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.fundamental_analyst = object()
+        self.analyst_composition = patch(
+            "examples.browser_api.compose_fundamental_analyst",
+            return_value=self.fundamental_analyst,
+        )
+        self.compose_analyst = self.analyst_composition.start()
+        self.addCleanup(self.analyst_composition.stop)
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name).resolve()
         root.chmod(0o700)
@@ -36,6 +49,10 @@ class BrowserApiProviderCompositionTests(unittest.TestCase):
         server = root / "index.js"
         server.write_text("// synthetic MCP server", encoding="utf-8")
         server.chmod(0o600)
+        filing_staging = root / "filing-staging"
+        filing_staging.mkdir(mode=0o700)
+        filing_artifacts = root / "filing-artifacts"
+        filing_artifacts.mkdir(mode=0o700)
         self.environment = {
             "JARVIS_TIJORI_ENABLED": "true",
             "JARVIS_LOCAL_TENANT_ID": "tenant.prateek",
@@ -50,6 +67,10 @@ class BrowserApiProviderCompositionTests(unittest.TestCase):
                 server.read_bytes()
             ).hexdigest(),
             "JARVIS_TIJORI_SESSION_ROOT": str(root),
+            "JARVIS_TIJORI_FILING_STAGING_DIRECTORY": str(filing_staging),
+            "JARVIS_FUNDAMENTAL_FILING_ARTIFACT_DIRECTORY": str(
+                filing_artifacts
+            ),
             "JARVIS_TIJORI_PROVIDER_CONTRACT_VERSION": (
                 "tijori.local_contract.v1"
             ),
@@ -69,9 +90,16 @@ class BrowserApiProviderCompositionTests(unittest.TestCase):
         )
 
         self.assertEqual(dependencies, {})
+        self.compose_analyst.assert_not_called()
 
     def test_composes_service_registry_and_fixed_local_tenant_identity(self):
-        stored = build_entry()
+        completed_at = datetime.now(ZoneInfo("Asia/Kolkata")) - timedelta(
+            seconds=2
+        )
+        stored = build_entry(
+            requested_at=completed_at - timedelta(seconds=1),
+            completed_at=completed_at,
+        )
         self.storage.save_fundamental_snapshot(stored)
         dependencies = _provider_session_http_dependencies(
             self.environment,
@@ -84,6 +112,31 @@ class BrowserApiProviderCompositionTests(unittest.TestCase):
         )
         coordinator = dependencies["fundamental_evidence_coordinator"]
         self.assertIsInstance(coordinator, FundamentalEvidenceCoordinator)
+        self.assertIsNotNone(
+            coordinator._gateway._filing_artifact_importer
+        )
+        filing_coordinator = dependencies[
+            "fundamental_filing_evidence_coordinator"
+        ]
+        self.assertIsInstance(
+            filing_coordinator,
+            FundamentalFilingEvidenceCoordinator,
+        )
+        self.assertIs(filing_coordinator._filing_repository, self.storage)
+        self.assertIs(filing_coordinator._evidence_repository, self.storage)
+        self.assertEqual(
+            filing_coordinator._extractor._artifact_root,
+            Path(
+                self.environment[
+                    "JARVIS_FUNDAMENTAL_FILING_ARTIFACT_DIRECTORY"
+                ]
+            ).resolve(),
+        )
+        self.assertIs(
+            dependencies["fundamental_analyst"],
+            self.fundamental_analyst,
+        )
+        self.compose_analyst.assert_called_once_with()
         self.assertEqual(
             coordinator.load(stored.request).source,
             FundamentalEvidenceSource.CACHE,

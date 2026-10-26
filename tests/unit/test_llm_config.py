@@ -11,6 +11,19 @@ from app.llm.config import (
     LLMSettings,
     get_llm_settings,
 )
+from app.llm.factory import LLMGatewayFactory
+
+
+class _ConfiguredGateway:
+    def __init__(self, settings):
+        self.settings = settings
+
+    @property
+    def configuration_fingerprint(self):
+        return "f" * 64
+
+    def generate(self, *, system, messages, response_model):
+        raise AssertionError("configuration test must not generate output")
 
 
 class LLMSettingsTests(unittest.TestCase):
@@ -32,6 +45,14 @@ class LLMSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             settings.for_role(LLMRole.JUDGE).model,
+            "openai/test-model",
+        )
+        self.assertEqual(
+            settings.for_role(LLMRole.FUNDAMENTAL_ANALYST).model,
+            "openai/test-model",
+        )
+        self.assertEqual(
+            settings.for_role(LLMRole.CORPORATE_FILINGS_ANALYST).model,
             "openai/test-model",
         )
         self.assertEqual(
@@ -75,6 +96,56 @@ class LLMSettingsTests(unittest.TestCase):
         self.assertEqual(persona.temperature, 0.1)
         self.assertEqual(persona.max_tokens, 3000)
 
+    def test_fundamental_analyst_has_dedicated_generation_settings(self):
+        settings = LLMSettings.from_environment(
+            {
+                "JARVIS_LLM_MODEL": "provider/shared",
+                "JARVIS_FUNDAMENTAL_ANALYST_LLM_MODEL": (
+                    "provider/fundamental"
+                ),
+                "JARVIS_FUNDAMENTAL_ANALYST_LLM_TEMPERATURE": "0.1",
+                "JARVIS_FUNDAMENTAL_ANALYST_LLM_MAX_TOKENS": "3200",
+            }
+        )
+
+        analyst = settings.for_role(LLMRole.FUNDAMENTAL_ANALYST)
+        self.assertEqual(analyst.model, "provider/fundamental")
+        self.assertEqual(analyst.temperature, 0.1)
+        self.assertEqual(analyst.max_tokens, 3200)
+
+        factory = LLMGatewayFactory(settings, _ConfiguredGateway)
+        gateway = factory.for_role(LLMRole.FUNDAMENTAL_ANALYST)
+        self.assertEqual(gateway.settings, analyst)
+        self.assertIs(
+            gateway,
+            factory.for_role(LLMRole.FUNDAMENTAL_ANALYST),
+        )
+
+    def test_corporate_filings_analyst_has_dedicated_generation_settings(self):
+        settings = LLMSettings.from_environment(
+            {
+                "JARVIS_LLM_MODEL": "provider/shared",
+                "JARVIS_CORPORATE_FILINGS_ANALYST_LLM_MODEL": (
+                    "provider/filings"
+                ),
+                "JARVIS_CORPORATE_FILINGS_ANALYST_LLM_TEMPERATURE": "0.1",
+                "JARVIS_CORPORATE_FILINGS_ANALYST_LLM_MAX_TOKENS": "3600",
+            }
+        )
+
+        analyst = settings.for_role(LLMRole.CORPORATE_FILINGS_ANALYST)
+        self.assertEqual(analyst.model, "provider/filings")
+        self.assertEqual(analyst.temperature, 0.1)
+        self.assertEqual(analyst.max_tokens, 3600)
+
+        factory = LLMGatewayFactory(settings, _ConfiguredGateway)
+        gateway = factory.for_role(LLMRole.CORPORATE_FILINGS_ANALYST)
+        self.assertEqual(gateway.settings, analyst)
+        self.assertIs(
+            gateway,
+            factory.for_role(LLMRole.CORPORATE_FILINGS_ANALYST),
+        )
+
     def test_role_specific_model_overrides_shared_model(self):
         settings = LLMSettings.from_environment(
             {
@@ -113,6 +184,8 @@ class LLMSettingsTests(unittest.TestCase):
             settings.for_role(LLMRole.JUDGE).model,
             "provider/judge-model",
         )
+        with self.assertRaisesRegex(ValueError, "fundamental_analyst"):
+            settings.for_role(LLMRole.FUNDAMENTAL_ANALYST)
 
     def test_blank_override_falls_back_to_shared_model(self):
         settings = LLMSettings.from_environment(
@@ -193,6 +266,24 @@ class LLMSettingsTests(unittest.TestCase):
             5000,
         )
         self.assertEqual(
+            settings.for_role(LLMRole.FUNDAMENTAL_ANALYST),
+            LLMRoleSettings(
+                role=LLMRole.FUNDAMENTAL_ANALYST,
+                model="provider/model",
+                temperature=0.0,
+                max_tokens=2500,
+            ),
+        )
+        self.assertEqual(
+            settings.for_role(LLMRole.CORPORATE_FILINGS_ANALYST),
+            LLMRoleSettings(
+                role=LLMRole.CORPORATE_FILINGS_ANALYST,
+                model="provider/model",
+                temperature=0.0,
+                max_tokens=4000,
+            ),
+        )
+        self.assertEqual(
             settings.for_role(LLMRole.TICKER_RESOLVER),
             LLMRoleSettings(
                 role=LLMRole.TICKER_RESOLVER,
@@ -207,6 +298,11 @@ class LLMSettingsTests(unittest.TestCase):
             ("JARVIS_BULL_LLM_TEMPERATURE", "-0.1"),
             ("JARVIS_BEAR_LLM_TEMPERATURE", "2.1"),
             ("JARVIS_JUDGE_LLM_TEMPERATURE", "nan"),
+            ("JARVIS_FUNDAMENTAL_ANALYST_LLM_TEMPERATURE", "-0.1"),
+            (
+                "JARVIS_CORPORATE_FILINGS_ANALYST_LLM_TEMPERATURE",
+                "2.1",
+            ),
         ):
             with self.subTest(variable=variable, value=value):
                 with self.assertRaises(ValidationError):
@@ -222,6 +318,8 @@ class LLMSettingsTests(unittest.TestCase):
             "JARVIS_BULL_LLM_MAX_TOKENS",
             "JARVIS_BEAR_LLM_MAX_TOKENS",
             "JARVIS_JUDGE_LLM_MAX_TOKENS",
+            "JARVIS_FUNDAMENTAL_ANALYST_LLM_MAX_TOKENS",
+            "JARVIS_CORPORATE_FILINGS_ANALYST_LLM_MAX_TOKENS",
         ):
             with self.subTest(variable=variable):
                 with self.assertRaises(ValidationError):

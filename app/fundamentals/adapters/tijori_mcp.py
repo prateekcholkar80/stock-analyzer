@@ -1,8 +1,8 @@
 """Fail-closed adapter from a scoped Tijori MCP transport to Jarvis evidence.
 
-This module intentionally contains no subprocess, browser, network, login, or
-credential code.  Those concerns belong behind ``TijoriMcpTransport`` and are
-not part of the offline vertical slice.
+This module contains no subprocess, browser, network, login, or credential
+code. Those concerns belong behind ``TijoriMcpTransport``. The optional filing
+importer handles only validated files inside explicitly configured local roots.
 """
 
 from collections.abc import Callable
@@ -10,8 +10,16 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat as stat_module
 from typing import Literal, TypeVar
+from uuid import uuid4
 
+import pdfplumber
+from pdfminer.pdfdocument import PDFPasswordIncorrect
+from pdfminer.pdfparser import PDFSyntaxError
 from pydantic import ValidationError
 
 from app.exceptions import (
@@ -33,12 +41,16 @@ from app.fundamentals.tijori_mcp_contracts import (
     TijoriBenchmarkingCell,
     TijoriCashFlowDocument,
     TijoriCashFlowPayload,
+    TijoriCompanyFilingDownloadPayload,
+    TijoriCompanyFilingsPayload,
+    TijoriCompanyFilingReference,
     TijoriCompanyRecord,
     TijoriCompanySearchPayload,
     TijoriEvidenceFactRecord,
     TijoriEvidencePayload,
     TijoriEvidenceSourceRecord,
     TijoriFinancialDocumentCell,
+    TijoriFinancialDocumentPackagePayload,
     TijoriFinancialStatementCell,
     TijoriGrowthTableDocument,
     TijoriGrowthTablePayload,
@@ -72,7 +84,16 @@ from app.gateways.fundamentals import (
     FundamentalCompanySearchResult,
     FundamentalEvidenceGateway,
     FundamentalEvidenceRetrieval,
+    FundamentalFinancialDocumentPackage,
+    FundamentalFinancialDocumentPackageGateway,
+    FundamentalFinancialDocumentPackageRequest,
+    FundamentalFinancialDocumentPackageResult,
     FundamentalFinancialsRequest,
+    FundamentalFilingAcquisitionRequest,
+    FundamentalFilingAcquisitionResult,
+    FundamentalFilingDiscoveryRequest,
+    FundamentalFilingDiscoveryResult,
+    FundamentalFilingGateway,
     FundamentalGatewayRequest,
     FundamentalGatewayResponse,
     FundamentalIssuerCandidate,
@@ -127,6 +148,16 @@ from app.models.fundamentals import (
     NormalizedFundamentalFact,
     ProviderConnectionScope,
 )
+from app.models.fundamental_filings import (
+    FundamentalFilingArtifactManifest,
+    FundamentalFilingCategory,
+    FundamentalFilingDiscoverySnapshot,
+    FundamentalFilingPeriod,
+    FundamentalFilingPeriodState,
+    FundamentalFilingPeriodType,
+    FundamentalFilingReference,
+    FundamentalFilingSourceClass,
+)
 
 
 _PayloadT = TypeVar(
@@ -134,6 +165,7 @@ _PayloadT = TypeVar(
     TijoriCompanySearchPayload,
     TijoriIssuerResolutionPayload,
     TijoriEvidencePayload,
+    TijoriFinancialDocumentPackagePayload,
     TijoriGrowthTablePayload,
     TijoriBalanceSheetPayload,
     TijoriCashFlowPayload,
@@ -142,6 +174,8 @@ _PayloadT = TypeVar(
     TijoriQuarterlyResultsPayload,
     TijoriPeerComparisonPayload,
     TijoriBenchmarkingFinancialsPayload,
+    TijoriCompanyFilingsPayload,
+    TijoriCompanyFilingDownloadPayload,
 )
 _ResponseT = TypeVar("_ResponseT", bound=FundamentalGatewayResponse)
 _FINGERPRINT_CHARS = frozenset("0123456789abcdef")
@@ -161,15 +195,336 @@ _STATUS_LIMITATIONS = {
         "Tijori could not provide this evidence at the time of the request."
     ),
 }
+_PDF_HEADER_PATTERN = re.compile(rb"^%PDF-([0-9]+(?:\.[0-9]+)?)")
+_PDF_PAGE_PATTERN = re.compile(rb"/Type\s*/Page(?!s)\b")
+_PDF_SCAN_OVERLAP = 64
+_PDF_EOF_TAIL_BYTES = 1_024
+_MAXIMUM_FILING_BYTES = 100_000_000
+_MAXIMUM_FILING_PAGES = 5_000
+_FILING_RECHECK_INTERVAL = timedelta(days=10)
+
+
+class TijoriFilingArtifactImporter:
+    """Import validated staged PDFs into an owner-only artifact boundary."""
+
+    def __init__(
+        self,
+        *,
+        staging_root: Path,
+        artifact_root: Path,
+    ) -> None:
+        self._staging_root = self._validate_root(
+            staging_root,
+            "filing staging",
+        )
+        self._artifact_root = self._validate_root(
+            artifact_root,
+            "filing artifact",
+        )
+        if self._staging_root == self._artifact_root:
+            raise ValueError("filing staging and artifact roots must differ")
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        material = f"{self._staging_root}\n{self._artifact_root}"
+        return sha256(material.encode("utf-8")).hexdigest()
+
+    def import_staged_artifact(
+        self,
+        *,
+        payload: TijoriCompanyFilingDownloadPayload,
+        reference: FundamentalFilingReference,
+        checked_at: datetime,
+    ) -> FundamentalFilingArtifactManifest:
+        if checked_at.tzinfo is None or checked_at.utcoffset() is None:
+            raise ValueError("filing artifact check time requires timezone")
+        if payload.downloaded_at > checked_at:
+            raise ValueError("filing download cannot follow its validation")
+        self._validate_payload_reference(payload, reference)
+
+        relative_path = self._relative_artifact_path(reference, payload)
+        destination = self._artifact_root.joinpath(*relative_path.parts)
+        self._require_inside_root(destination, self._artifact_root)
+        self._create_owner_only_parents(destination.parent)
+        staged_path = self._staging_root / payload.staged_artifact_key
+        self._require_inside_root(staged_path, self._staging_root)
+        temporary_path = destination.parent / f".part-{uuid4().hex}"
+
+        source_descriptor = self._open_regular_owner_file(staged_path)
+        try:
+            metadata = self._copy_and_validate_pdf(
+                source_descriptor=source_descriptor,
+                temporary_path=temporary_path,
+                expected_hash=payload.content_sha256,
+                expected_length=payload.byte_length,
+            )
+            manifest = FundamentalFilingArtifactManifest(
+                reference=reference,
+                content_sha256=payload.content_sha256,
+                safe_relative_path=relative_path.as_posix(),
+                byte_length=payload.byte_length,
+                page_count=metadata["page_count"],
+                pdf_version=metadata["pdf_version"],
+                downloaded_at=payload.downloaded_at,
+                last_checked_at=checked_at,
+                recheck_after=checked_at + _FILING_RECHECK_INTERVAL,
+            )
+            self._publish_without_overwrite(
+                temporary_path=temporary_path,
+                destination=destination,
+                expected_hash=payload.content_sha256,
+                expected_length=payload.byte_length,
+            )
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
+        finally:
+            os.close(source_descriptor)
+
+        staged_path.unlink()
+        return manifest
+
+    @staticmethod
+    def _validate_root(value: Path, label: str) -> Path:
+        if not isinstance(value, Path) or not value.is_absolute():
+            raise ValueError(f"{label} root must be an absolute path")
+        metadata = value.lstat()
+        if not stat_module.S_ISDIR(metadata.st_mode) or value.is_symlink():
+            raise ValueError(f"{label} root must be a real directory")
+        if metadata.st_mode & 0o077:
+            raise ValueError(f"{label} root must be owner-only")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise ValueError(f"{label} root owner is invalid")
+        return value.resolve(strict=True)
+
+    @staticmethod
+    def _validate_payload_reference(
+        payload: TijoriCompanyFilingDownloadPayload,
+        reference: FundamentalFilingReference,
+    ) -> None:
+        if (
+            payload.filing_reference_id != reference.filing_reference_id
+            or payload.category != reference.category.value
+            or payload.provider_company_id
+            != reference.issuer.provider_company_id
+            or payload.provider_slug != reference.issuer.provider_slug
+            or payload.source_page_url != reference.source_page_url
+            or payload.artifact_url != reference.artifact_url
+            or payload.discovery_fingerprint
+            != reference.source_discovery_fingerprint
+        ):
+            raise ValueError("staged filing does not match its exact reference")
+
+    @staticmethod
+    def _relative_artifact_path(
+        reference: FundamentalFilingReference,
+        payload: TijoriCompanyFilingDownloadPayload,
+    ) -> PurePosixPath:
+        tenant_key = sha256(
+            reference.connection.tenant_id.encode("utf-8")
+        ).hexdigest()
+        connection_key = sha256(
+            reference.connection.provider_connection_id.encode("utf-8")
+        ).hexdigest()
+        issuer_key = reference.issuer.isin
+        if issuer_key is None:
+            identity_hash = sha256(
+                (
+                    f"{reference.issuer.exchange}:"
+                    f"{reference.issuer.symbol}"
+                ).encode("utf-8")
+            ).hexdigest()
+            issuer_key = f"instrument-{identity_hash}"
+        if reference.period.fiscal_year is None:
+            fiscal_year = "unclassified"
+        else:
+            fiscal_year = f"FY{reference.period.fiscal_year}"
+        if reference.period.fiscal_quarter is not None:
+            period = f"Q{reference.period.fiscal_quarter}"
+        elif (
+            reference.period.period_type
+            is FundamentalFilingPeriodType.ANNUAL
+        ):
+            period = "annual"
+        else:
+            period = "unclassified"
+        return PurePosixPath(
+            f"tenant-{tenant_key}",
+            f"connection-{connection_key}",
+            issuer_key,
+            fiscal_year,
+            period,
+            reference.category.value.replace("_", "-"),
+            payload.staged_artifact_key,
+        )
+
+    @staticmethod
+    def _require_inside_root(path: Path, root: Path) -> None:
+        if not path.is_relative_to(root):
+            raise ValueError("filing artifact escaped its configured boundary")
+
+    def _create_owner_only_parents(self, directory: Path) -> None:
+        relative = directory.relative_to(self._artifact_root)
+        cursor = self._artifact_root
+        for part in relative.parts:
+            cursor /= part
+            cursor.mkdir(mode=0o700, exist_ok=True)
+            metadata = cursor.lstat()
+            if (
+                not stat_module.S_ISDIR(metadata.st_mode)
+                or cursor.is_symlink()
+                or metadata.st_mode & 0o077
+                or (
+                    hasattr(os, "getuid")
+                    and metadata.st_uid != os.getuid()
+                )
+            ):
+                raise ValueError("filing artifact directory is not owner-only")
+
+    @staticmethod
+    def _open_regular_owner_file(path: Path) -> int:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat_module.S_ISREG(metadata.st_mode)
+                or metadata.st_mode & 0o077
+                or (
+                    hasattr(os, "getuid")
+                    and metadata.st_uid != os.getuid()
+                )
+            ):
+                raise ValueError("staged filing must be an owner-only file")
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _copy_and_validate_pdf(
+        *,
+        source_descriptor: int,
+        temporary_path: Path,
+        expected_hash: str,
+        expected_length: int,
+    ) -> dict[str, object]:
+        digest = sha256()
+        byte_length = 0
+        header = b""
+        overlap = b""
+        eof_tail = b""
+        page_count = 0
+        destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        destination_descriptor = os.open(
+            temporary_path,
+            destination_flags,
+            0o600,
+        )
+        try:
+            with os.fdopen(destination_descriptor, "wb", closefd=False) as target:
+                while True:
+                    chunk = os.read(source_descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    byte_length += len(chunk)
+                    if byte_length > _MAXIMUM_FILING_BYTES:
+                        raise ValueError("staged filing exceeds the byte limit")
+                    digest.update(chunk)
+                    target.write(chunk)
+                    if len(header) < 32:
+                        header = (header + chunk)[:32]
+                    scanned = overlap + chunk
+                    overlap_length = len(overlap)
+                    page_count += sum(
+                        1
+                        for match in _PDF_PAGE_PATTERN.finditer(scanned)
+                        if match.end() > overlap_length
+                    )
+                    if page_count > _MAXIMUM_FILING_PAGES:
+                        raise ValueError("staged filing exceeds the page limit")
+                    overlap = scanned[-_PDF_SCAN_OVERLAP:]
+                    eof_tail = (eof_tail + chunk)[-_PDF_EOF_TAIL_BYTES:]
+                target.flush()
+                os.fsync(destination_descriptor)
+        finally:
+            os.close(destination_descriptor)
+
+        header_match = _PDF_HEADER_PATTERN.match(header)
+        if header_match is None or b"%%EOF" not in eof_tail:
+            raise ValueError("staged filing failed PDF structure validation")
+        if byte_length != expected_length or digest.hexdigest() != expected_hash:
+            raise ValueError("staged filing content metadata does not match")
+        if page_count < 1:
+            page_count = TijoriFilingArtifactImporter._parsed_pdf_page_count(
+                temporary_path
+            )
+        return {
+            "page_count": page_count,
+            "pdf_version": header_match.group(1).decode("ascii"),
+        }
+
+    @staticmethod
+    def _parsed_pdf_page_count(path: Path) -> int:
+        """Count pages when compressed object streams hide raw page markers."""
+
+        try:
+            with pdfplumber.open(path) as document:
+                page_count = len(document.pages)
+        except (OSError, PDFPasswordIncorrect, PDFSyntaxError, ValueError) as exc:
+            raise ValueError(
+                "staged filing failed PDF structure validation"
+            ) from exc
+        if page_count < 1 or page_count > _MAXIMUM_FILING_PAGES:
+            raise ValueError("staged filing failed PDF structure validation")
+        return page_count
+
+    @classmethod
+    def _publish_without_overwrite(
+        cls,
+        *,
+        temporary_path: Path,
+        destination: Path,
+        expected_hash: str,
+        expected_length: int,
+    ) -> None:
+        try:
+            os.link(temporary_path, destination)
+        except FileExistsError:
+            descriptor = cls._open_regular_owner_file(destination)
+            try:
+                digest = sha256()
+                byte_length = 0
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    byte_length += len(chunk)
+                    digest.update(chunk)
+                if (
+                    byte_length != expected_length
+                    or digest.hexdigest() != expected_hash
+                ):
+                    raise ValueError(
+                        "existing filing artifact conflicts with its hash"
+                    )
+            finally:
+                os.close(descriptor)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
 
 class TijoriMcpAdapter(
     FundamentalBenchmarkingFinancialsGateway,
     FundamentalEvidenceGateway,
+    FundamentalFilingGateway,
+    FundamentalFinancialDocumentPackageGateway,
     FundamentalPeerComparisonGateway,
     FundamentalStructuredDocumentGateway,
 ):
-    """Normalize only five audited, read-only Tijori tools."""
+    """Normalize the audited Tijori tools behind provider-neutral contracts."""
 
     def __init__(
         self,
@@ -177,12 +532,14 @@ class TijoriMcpAdapter(
         transport: TijoriMcpTransport,
         settings: TijoriMcpAdapterSettings | None = None,
         clock: Callable[[], datetime] | None = None,
+        filing_artifact_importer: TijoriFilingArtifactImporter | None = None,
     ) -> None:
         if not isinstance(transport, TijoriMcpTransport):
             raise TypeError("Tijori adapter requires a compatible transport")
         self._transport = transport
         self._settings = settings or TijoriMcpAdapterSettings()
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._filing_artifact_importer = filing_artifact_importer
         self._transport_fingerprint = self._validate_fingerprint(
             transport.configuration_fingerprint
         )
@@ -191,9 +548,16 @@ class TijoriMcpAdapter(
     def configuration_fingerprint(self) -> str:
         material = (
             f"{self._settings.configuration_fingerprint}:"
-            f"{self._transport_fingerprint}"
+            f"{self._transport_fingerprint}:"
+            f"{self._filing_importer_fingerprint}"
         )
         return sha256(material.encode("utf-8")).hexdigest()
+
+    @property
+    def _filing_importer_fingerprint(self) -> str:
+        if self._filing_artifact_importer is None:
+            return "filing-import-disabled"
+        return self._filing_artifact_importer.configuration_fingerprint
 
     def inspect_capabilities(
         self,
@@ -238,42 +602,90 @@ class TijoriMcpAdapter(
             )
 
         tool_by_capability: tuple[
-            tuple[FundamentalCapability, TijoriToolName, bool, int | None], ...
+            tuple[
+                FundamentalCapability,
+                TijoriToolName,
+                bool,
+                int | None,
+                bool,
+            ], ...
         ] = (
-            (FundamentalCapability.COMPANY_SEARCH, "search_company", False, None),
+            (
+                FundamentalCapability.COMPANY_SEARCH,
+                "search_company",
+                False,
+                None,
+                True,
+            ),
             (
                 FundamentalCapability.ISSUER_RESOLUTION,
                 "resolve_company_ids",
                 False,
                 None,
+                True,
             ),
             (
                 FundamentalCapability.COMPANY_OVERVIEW,
                 "get_company_overview",
                 False,
                 None,
+                True,
             ),
             (
                 FundamentalCapability.FINANCIAL_STATEMENTS,
                 "get_financials",
                 True,
                 40,
+                True,
             ),
             (
                 FundamentalCapability.SHAREHOLDING_HISTORY,
                 "get_shareholding",
                 True,
                 40,
+                True,
+            ),
+            (
+                FundamentalCapability.FILING_DISCOVERY,
+                "list_company_filings",
+                True,
+                None,
+                True,
+            ),
+            (
+                FundamentalCapability.FILING_ACQUISITION,
+                "download_company_filing",
+                False,
+                None,
+                False,
             ),
         )
         available = set(inspection.available_tools)
         descriptors = []
-        for capability, tool_name, supports_history, max_periods in tool_by_capability:
-            is_available = inspection.authenticated and tool_name in available
+        for (
+            capability,
+            tool_name,
+            supports_history,
+            max_periods,
+            read_only,
+        ) in tool_by_capability:
+            importer_ready = (
+                capability is not FundamentalCapability.FILING_ACQUISITION
+                or self._filing_artifact_importer is not None
+            )
+            is_available = (
+                inspection.authenticated
+                and tool_name in available
+                and importer_ready
+            )
             if not inspection.authenticated:
                 notes = ("The scoped Tijori session is not authenticated.",)
             elif tool_name not in available:
-                notes = ("The audited read-only provider tool is unavailable.",)
+                notes = ("The audited provider tool is unavailable.",)
+            elif not importer_ready:
+                notes = (
+                    "The secure filing artifact importer is not configured.",
+                )
             else:
                 notes = ()
             descriptors.append(
@@ -284,6 +696,7 @@ class TijoriMcpAdapter(
                         if is_available
                         else FundamentalCapabilityStatus.UNAVAILABLE
                     ),
+                    read_only=read_only,
                     supports_history=supports_history,
                     max_periods=max_periods,
                     notes=notes,
@@ -413,6 +826,196 @@ class TijoriMcpAdapter(
             tool_name="get_company_overview",
             arguments=self._evidence_arguments(request),
         )
+
+    def discover_filings(
+        self,
+        *,
+        request: FundamentalFilingDiscoveryRequest,
+    ) -> FundamentalFilingDiscoveryResult:
+        """Return a validated, provider-neutral filing discovery snapshot."""
+
+        if request.max_documents > 200:
+            raise FundamentalGatewayConfigurationError(
+                "Tijori filing discovery supports at most 200 documents",
+                **self._error_context(request),
+            )
+        started_at, result, completed_at = self._call(
+            request=request,
+            tool_name="list_company_filings",
+            arguments={
+                "issuer": self._filing_issuer_arguments(request.issuer),
+                "categories": [
+                    category.value for category in request.categories
+                ],
+                "from_fiscal_year": request.from_fiscal_year,
+                "through_date": request.through_date.isoformat(),
+                "max_documents": request.max_documents,
+            },
+        )
+        failed_status = self._filing_failure_status(result.status)
+        if failed_status is not None:
+            response = FundamentalFilingDiscoveryResult(
+                **self._response_metadata(
+                    request,
+                    started_at,
+                    completed_at,
+                ),
+                issuer=request.issuer,
+                status=failed_status,
+                limitations=(_STATUS_LIMITATIONS[result.status],),
+            )
+            return self._bind(request, response)
+        self._raise_terminal_tool_status(result.status, request=request)
+        payload = self._parse_payload(
+            TijoriCompanyFilingsPayload,
+            result,
+            request=request,
+        )
+        self._validate_filing_discovery_identity(request, payload)
+        if payload.requested_filters.categories != tuple(
+            category.value for category in request.categories
+        ) or (
+            payload.requested_filters.from_fiscal_year
+            != request.from_fiscal_year
+            or payload.requested_filters.through_date != request.through_date
+            or payload.requested_filters.max_documents
+            != request.max_documents
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori filing discovery scope does not match the request",
+            )
+        if not (
+            started_at <= payload.source.discovered_at <= completed_at
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori filing discovery time is outside the request",
+            )
+        try:
+            references = tuple(
+                self._normalize_filing_reference(request, item)
+                for item in payload.filings
+            )
+            snapshot = FundamentalFilingDiscoverySnapshot(
+                discovery_id=(
+                    f"filing.discovery.{request.issuer.exchange}."
+                    f"{request.issuer.symbol}."
+                    f"{payload.discovery_fingerprint[:24]}"
+                ),
+                connection=request.connection,
+                issuer=request.issuer,
+                categories=request.categories,
+                from_fiscal_year=request.from_fiscal_year,
+                through_date=request.through_date,
+                max_documents=request.max_documents,
+                discovered_at=payload.source.discovered_at,
+                references=references,
+                unavailable_period_labels=payload.unavailable_period_labels,
+                validation_status=FundamentalValidationStatus.VALIDATED,
+                limitations=payload.limitations,
+            )
+            response = FundamentalFilingDiscoveryResult(
+                **self._response_metadata(
+                    request,
+                    started_at,
+                    completed_at,
+                ),
+                issuer=request.issuer,
+                status=FundamentalRetrievalStatus.COMPLETED,
+                discovery=snapshot,
+            )
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise FundamentalResponseValidationError(
+                "Tijori filing discovery could not be normalized safely",
+                **self._error_context(request),
+            ) from exc
+        return self._bind(request, response)
+
+    def acquire_filing(
+        self,
+        *,
+        request: FundamentalFilingAcquisitionRequest,
+    ) -> FundamentalFilingAcquisitionResult:
+        """Acquire and securely import one exact discovered filing PDF."""
+
+        importer = self._filing_artifact_importer
+        if importer is None:
+            raise FundamentalGatewayConfigurationError(
+                "The secure filing artifact importer is not configured",
+                **self._error_context(request),
+            )
+        reference = request.reference
+        started_at, result, completed_at = self._call(
+            request=request,
+            tool_name="download_company_filing",
+            arguments={
+                "issuer": self._filing_issuer_arguments(request.issuer),
+                "filing_reference": {
+                    "filing_reference_id": reference.filing_reference_id,
+                    "category": reference.category.value,
+                    "provider_company_id": (
+                        reference.issuer.provider_company_id
+                    ),
+                    "provider_slug": reference.issuer.provider_slug,
+                    "source_page_url": reference.source_page_url,
+                    "artifact_url": reference.artifact_url,
+                    "discovery_fingerprint": (
+                        reference.source_discovery_fingerprint
+                    ),
+                },
+                "expected_source_url": reference.artifact_url,
+                "expected_provider_company_id": (
+                    reference.issuer.provider_company_id
+                ),
+            },
+        )
+        failed_status = self._filing_failure_status(result.status)
+        if failed_status is not None:
+            response = FundamentalFilingAcquisitionResult(
+                **self._response_metadata(
+                    request,
+                    started_at,
+                    completed_at,
+                ),
+                issuer=request.issuer,
+                status=failed_status,
+                limitations=(_STATUS_LIMITATIONS[result.status],),
+            )
+            return self._bind(request, response)
+        self._raise_terminal_tool_status(result.status, request=request)
+        payload = self._parse_payload(
+            TijoriCompanyFilingDownloadPayload,
+            result,
+            request=request,
+        )
+        if not started_at <= payload.downloaded_at <= completed_at:
+            self._raise_invalid_response(
+                request,
+                "Tijori filing download time is outside the request",
+            )
+        try:
+            artifact = importer.import_staged_artifact(
+                payload=payload,
+                reference=reference,
+                checked_at=completed_at,
+            )
+            response = FundamentalFilingAcquisitionResult(
+                **self._response_metadata(
+                    request,
+                    started_at,
+                    completed_at,
+                ),
+                issuer=request.issuer,
+                status=FundamentalRetrievalStatus.COMPLETED,
+                artifact=artifact,
+            )
+        except (OSError, ValidationError, TypeError, ValueError) as exc:
+            raise FundamentalResponseValidationError(
+                "Tijori staged filing could not be imported safely",
+                **self._error_context(request),
+            ) from exc
+        return self._bind(request, response)
 
     def retrieve_peer_comparison(
         self,
@@ -760,6 +1363,107 @@ class TijoriMcpAdapter(
             ) from exc
         return self._bind(request, response)
 
+    def retrieve_financial_document_package(
+        self,
+        *,
+        request: FundamentalFinancialDocumentPackageRequest,
+    ) -> FundamentalFinancialDocumentPackageResult:
+        """Return all financial documents from one validated provider snapshot."""
+
+        arguments = self._evidence_arguments(request)
+        arguments.update(
+            {
+                "document_type": "financial_package",
+                "reporting_basis": "not_applicable",
+            }
+        )
+        started_at, result, completed_at = self._call(
+            request=request,
+            tool_name="get_financials",
+            arguments=arguments,
+        )
+        self._raise_terminal_tool_status(result.status, request=request)
+        payload = self._parse_payload(
+            TijoriFinancialDocumentPackagePayload,
+            result,
+            request=request,
+        )
+        provider_package = payload.package
+        if not (
+            started_at <= provider_package.source.retrieved_at <= completed_at
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori financial package retrieval time is outside the request",
+            )
+        try:
+            documents = tuple(
+                self._normalize_package_document(request, provider_document)
+                for provider_document in provider_package.documents
+            )
+            retrieved_at = provider_package.source.retrieved_at
+            package = FundamentalFinancialDocumentPackage(
+                connection=request.connection,
+                issuer=request.issuer,
+                source_location=provider_package.source.location,
+                retrieved_at=retrieved_at,
+                expires_at=retrieved_at + timedelta(days=10),
+                documents=documents,
+            )
+            response = FundamentalFinancialDocumentPackageResult(
+                **self._response_metadata(request, started_at, completed_at),
+                issuer=request.issuer,
+                status=FundamentalRetrievalStatus.COMPLETED,
+                package=package,
+            )
+        except (ValidationError, InvalidOperation, ValueError) as exc:
+            raise FundamentalResponseValidationError(
+                "Tijori financial package could not be normalized safely",
+                **self._error_context(request),
+            ) from exc
+        return self._bind(request, response)
+
+    def _normalize_package_document(
+        self,
+        package_request: FundamentalFinancialDocumentPackageRequest,
+        provider_document,
+    ) -> StructuredFinancialDocument:
+        document_type = FinancialDocumentType(provider_document.document_type)
+        reporting_basis = FinancialReportingBasis(
+            provider_document.reporting_basis
+        )
+        request = FundamentalStructuredDocumentRequest(
+            request_id=package_request.request_id,
+            operation_id=package_request.operation_id,
+            connection=package_request.connection,
+            requested_at=package_request.requested_at,
+            issuer=package_request.issuer,
+            as_of_date=package_request.as_of_date,
+            document_type=document_type,
+            reporting_basis=reporting_basis,
+        )
+        self._validate_structured_document_identity(request, provider_document)
+        if isinstance(provider_document, TijoriGrowthTableDocument):
+            return self._normalize_growth_table_document(request, provider_document)
+        if isinstance(provider_document, TijoriProfitAndLossDocument):
+            return self._normalize_mixed_unit_statement_document(
+                request,
+                provider_document,
+            )
+        if isinstance(provider_document, TijoriRatiosDocument):
+            return self._normalize_mixed_unit_statement_document(
+                request,
+                provider_document,
+            )
+        if isinstance(provider_document, TijoriQuarterlyResultsDocument):
+            return self._normalize_mixed_unit_statement_document(
+                request,
+                provider_document,
+            )
+        if isinstance(provider_document, TijoriCashFlowDocument):
+            return self._normalize_cash_flow_document(request, provider_document)
+        return self._normalize_balance_sheet_document(request, provider_document)
+
     def _validate_structured_document_identity(
         self,
         request: FundamentalStructuredDocumentRequest,
@@ -994,6 +1698,11 @@ class TijoriMcpAdapter(
             return FundamentalValueKind.MONETARY, "INR crore", "INR crore"
         if any(value.casefold().endswith("x") for value in values):
             return FundamentalValueKind.RATIO, "ratio", "ratio"
+        if any(
+            value.casefold().endswith((" day", " days"))
+            for value in values
+        ):
+            return FundamentalValueKind.OTHER, "days", "days"
         return FundamentalValueKind.OTHER, "provider scalar", "provider scalar"
 
     @staticmethod
@@ -1007,9 +1716,20 @@ class TijoriMcpAdapter(
         if available:
             numeric = source.source_value.replace(",", "").replace("₹", "")
             numeric = numeric.replace("%", "")
-            numeric = numeric.removesuffix("Cr").removesuffix("cr")
-            numeric = numeric.removesuffix("x").removesuffix("X")
-            normalized_value = Decimal(numeric.strip())
+            numeric = numeric.strip()
+            accounting_negative = numeric.startswith("(") and numeric.endswith(")")
+            if accounting_negative:
+                numeric = numeric[1:-1].strip()
+            for suffix in ("cr", "days", "day", "x"):
+                if numeric.casefold().endswith(suffix):
+                    numeric = numeric[: -len(suffix)].strip()
+                    break
+            numeric_parts = numeric.rsplit(maxsplit=1)
+            if len(numeric_parts) == 2 and numeric_parts[1] == ".":
+                numeric = numeric_parts[0]
+            normalized_value = Decimal(numeric)
+            if accounting_negative:
+                normalized_value = -abs(normalized_value)
         return BenchmarkingCell(
             company_key=source.company_key,
             source_value=source.source_value,
@@ -1597,6 +2317,21 @@ class TijoriMcpAdapter(
             message = "Tijori returned an unsupported result status"
         raise error_type(message, **self._error_context(request))
 
+    @staticmethod
+    def _filing_failure_status(
+        status: TijoriToolStatus,
+    ) -> FundamentalRetrievalStatus | None:
+        return {
+            TijoriToolStatus.NOT_FOUND: FundamentalRetrievalStatus.NOT_FOUND,
+            TijoriToolStatus.NOT_ENTITLED: (
+                FundamentalRetrievalStatus.NOT_ENTITLED
+            ),
+            TijoriToolStatus.PAYWALLED: FundamentalRetrievalStatus.PAYWALLED,
+            TijoriToolStatus.UNAVAILABLE: (
+                FundamentalRetrievalStatus.PROVIDER_UNAVAILABLE
+            ),
+        }.get(status)
+
     def _mapped_transport_error(
         self,
         error: TijoriMcpTransportError,
@@ -1685,6 +2420,80 @@ class TijoriMcpAdapter(
                 else None
             ),
         }
+
+    @staticmethod
+    def _filing_issuer_arguments(
+        issuer: FundamentalIssuerIdentity,
+    ) -> dict[str, object]:
+        if (
+            issuer.provider_company_id is None
+            or issuer.provider_slug is None
+        ):
+            raise ValueError(
+                "filing operations require a resolved provider issuer"
+            )
+        return {
+            "exchange": issuer.exchange,
+            "symbol": issuer.symbol,
+            "legal_name": issuer.legal_name,
+            "isin": issuer.isin,
+            "provider_company_id": issuer.provider_company_id,
+            "provider_slug": issuer.provider_slug,
+        }
+
+    def _validate_filing_discovery_identity(
+        self,
+        request: FundamentalFilingDiscoveryRequest,
+        payload: TijoriCompanyFilingsPayload,
+    ) -> None:
+        issuer = request.issuer
+        if (
+            payload.issuer.exchange != issuer.exchange
+            or payload.issuer.symbol != issuer.symbol
+            or payload.issuer.legal_name != issuer.legal_name
+            or payload.issuer.isin != issuer.isin
+            or payload.issuer.provider_company_id
+            != issuer.provider_company_id
+            or payload.issuer.provider_slug != issuer.provider_slug
+        ):
+            self._raise_invalid_response(
+                request,
+                "Tijori filing discovery belongs to a different issuer",
+            )
+
+    @staticmethod
+    def _normalize_filing_reference(
+        request: FundamentalFilingDiscoveryRequest,
+        source: TijoriCompanyFilingReference,
+    ) -> FundamentalFilingReference:
+        return FundamentalFilingReference(
+            filing_reference_id=source.filing_reference_id,
+            connection=request.connection,
+            issuer=request.issuer,
+            provider=request.connection.provider,
+            source_discovery_fingerprint=source.discovery_fingerprint,
+            category=FundamentalFilingCategory(source.category),
+            source_class=FundamentalFilingSourceClass(source.source_class),
+            period=FundamentalFilingPeriod(
+                state=FundamentalFilingPeriodState(source.period.state),
+                period_type=FundamentalFilingPeriodType(
+                    source.period.period_type
+                ),
+                source_label=source.period.source_label,
+                fiscal_year=source.period.fiscal_year,
+                fiscal_quarter=source.period.fiscal_quarter,
+                period_start=source.period.period_start,
+                period_end=source.period.period_end,
+            ),
+            title=source.title,
+            provider_label=source.provider_label,
+            original_filename=source.original_filename,
+            source_page_url=source.source_page_url,
+            artifact_url=source.artifact_url,
+            provider_published_at=source.provider_published_at,
+            available_at=source.available_at,
+            discovered_at=source.discovered_at,
+        )
 
     def _validate_evidence_identity(
         self,

@@ -1,6 +1,7 @@
 import unittest
 
 from app.angel.client import (
+    AngelHistoricalRequestPolicy,
     AngelOneClient,
     _disable_unsafe_sdk_request_logging,
 )
@@ -155,6 +156,35 @@ class PersistentlyExpiredSmartConnect(ExpiringSmartConnect):
         }
 
 
+class RateLimitedHistoricalSmartConnect(FakeSmartConnect):
+    def __init__(self, api_key, *, failures=1):
+        super().__init__(api_key)
+        self.failures = failures
+        self.history_count = 0
+
+    def getCandleData(self, params):
+        self.history_count += 1
+        if self.history_count <= self.failures:
+            raise RuntimeError(
+                "Couldn't parse response: Access denied because of "
+                "exceeding access rate"
+            )
+        return super().getCandleData(params)
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 class _UnsafeSdkLogger:
     disabled = False
 
@@ -249,6 +279,85 @@ class AngelOneClientTests(unittest.TestCase):
 
         self.assertEqual(client.client.login_count, 2)
         self.assertEqual(client.client.history_count, 2)
+
+    def test_retries_plain_text_historical_rate_limit_with_bounded_backoff(self):
+        clock = _FakeClock()
+        sdk = RateLimitedHistoricalSmartConnect("test-api-key", failures=2)
+        client = AngelOneClient(
+            settings=self.settings,
+            client_factory=lambda api_key: sdk,
+            historical_request_policy=AngelHistoricalRequestPolicy(
+                retry_delays_seconds=(2.0, 5.0, 10.0)
+            ),
+            clock=clock,
+            sleep_fn=clock.sleep,
+        )
+        client.initialize()
+
+        with self.assertLogs("jarvis.angel.client", level="WARNING") as logs:
+            response = client.get_historical_candles(
+                exchange="NSE",
+                symbol_token="2885",
+                interval="ONE_HOUR",
+                from_date="2026-08-01 09:15",
+                to_date="2026-08-20 15:30",
+            )
+
+        self.assertTrue(response["status"])
+        self.assertEqual(sdk.history_count, 3)
+        self.assertEqual(clock.sleeps, [2.0, 5.0])
+        self.assertEqual(
+            [record.event for record in logs.records],
+            ["angel.history.rate_limited", "angel.history.rate_limited"],
+        )
+
+    def test_fails_safely_after_historical_rate_limit_retry_budget(self):
+        clock = _FakeClock()
+        sdk = RateLimitedHistoricalSmartConnect("test-api-key", failures=10)
+        client = AngelOneClient(
+            settings=self.settings,
+            client_factory=lambda api_key: sdk,
+            historical_request_policy=AngelHistoricalRequestPolicy(
+                retry_delays_seconds=(2.0, 5.0)
+            ),
+            clock=clock,
+            sleep_fn=clock.sleep,
+        )
+        client.initialize()
+
+        with self.assertRaises(MarketDataError) as context:
+            client.get_historical_candles(
+                exchange="NSE",
+                symbol_token="2885",
+                interval="ONE_HOUR",
+                from_date="2026-08-01 09:15",
+                to_date="2026-08-20 15:30",
+            )
+
+        self.assertEqual(sdk.history_count, 3)
+        self.assertEqual(clock.sleeps, [2.0, 5.0])
+        self.assertIsNotNone(context.exception.__cause__)
+
+    def test_enforces_published_per_second_historical_limit(self):
+        clock = _FakeClock()
+        client = AngelOneClient(
+            settings=self.settings,
+            client_factory=FakeSmartConnect,
+            clock=clock,
+            sleep_fn=clock.sleep,
+        )
+        client.initialize()
+
+        for _ in range(4):
+            client.get_historical_candles(
+                exchange="NSE",
+                symbol_token="2885",
+                interval="ONE_HOUR",
+                from_date="2026-08-01 09:15",
+                to_date="2026-08-20 15:30",
+            )
+
+        self.assertEqual(clock.sleeps, [1.0])
 
     def test_rejects_market_request_before_login(self):
         client = AngelOneClient(

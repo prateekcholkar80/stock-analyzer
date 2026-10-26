@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
+from app.models.evidence_hierarchy import HierarchicalEvidenceAssessment
 from app.models.multi_timeframe_evidence import (
     SwingAnalysisTimeframe,
     timeframe_interval,
@@ -199,6 +200,15 @@ class TimeframeInterpretationContractTests(unittest.TestCase):
         values.update(overrides)
         return MultiTimeframeSwingInterpretation(**values)
 
+    @staticmethod
+    def hierarchy(condition, *, release_eligible):
+        return HierarchicalEvidenceAssessment(
+            primary_condition=condition,
+            gate_states=(),
+            release_eligible=release_eligible,
+            rationale="Deterministic hierarchy result for interpretation.",
+        )
+
     def test_derives_every_alignment_without_agent_judgment(self):
         for daily in MarketCondition:
             for weekly in MarketCondition:
@@ -249,6 +259,55 @@ class TimeframeInterpretationContractTests(unittest.TestCase):
             interpretation.trade_decision.decision,
             TradeDecision.NO_TRADE,
         )
+
+    def test_version_two_preserves_hierarchy_as_condition_authority(self):
+        hierarchy = self.hierarchy(
+            MarketCondition.BULLISH,
+            release_eligible=True,
+        )
+        interpretation = self.build_combined(
+            MarketCondition.BULLISH,
+            MarketCondition.BEARISH,
+            schema_version="jarvis.multi_timeframe_interpretation.v2",
+            hierarchy_assessment=hierarchy,
+            trade_decision=TradeDecisionOutcome(
+                market_condition=MarketCondition.BULLISH,
+                decision=TradeDecision.BUY,
+                rationale="The hierarchy gates permit the buy setup.",
+            ),
+            risk_reward=self.feasible_risk_reward(),
+            tactical_readiness=TacticalReadiness.READY,
+            structural_risk=StructuralRisk.MODERATE,
+        )
+
+        self.assertIs(interpretation.hierarchy_assessment, hierarchy)
+        self.assertIs(interpretation.alignment, TimeframeAlignment.MIXED)
+        self.assertIs(
+            interpretation.trade_decision.market_condition,
+            hierarchy.primary_condition,
+        )
+
+    def test_version_two_requires_hierarchy_assessment(self):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "version-2 interpretation requires a hierarchy assessment",
+        ):
+            self.build_combined(
+                schema_version="jarvis.multi_timeframe_interpretation.v2"
+            )
+
+    def test_version_two_rejects_hierarchy_condition_mismatch(self):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "does not match its deterministic condition source",
+        ):
+            self.build_combined(
+                schema_version="jarvis.multi_timeframe_interpretation.v2",
+                hierarchy_assessment=self.hierarchy(
+                    MarketCondition.NEUTRAL,
+                    release_eligible=False,
+                ),
+            )
 
     def test_builds_bullish_no_trade_when_two_r_is_blocked(self):
         blocking_id = "daily:zone.resistance"

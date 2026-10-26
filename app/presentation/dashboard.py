@@ -28,13 +28,17 @@ from app.models.dashboard import (
     DashboardTradeDecision,
     DashboardTradePlan,
     JarvisDashboardView,
+    JarvisTechnicalResearchDashboardView,
 )
 from app.models.multi_timeframe_evidence import (
     NearestPriceZoneSummary,
     SwingAnalysisTimeframe,
     TimeframeTechnicalEvidenceContext,
 )
-from app.models.storage import MultiTimeframeEndToEndSwingAnalysisResult
+from app.models.storage import (
+    MultiTimeframeEndToEndSwingAnalysisResult,
+    MultiTimeframeResearchDivisionResult,
+)
 from app.models.timeframes import MultiTimeframeTechnicalAnalysis
 from app.models.technical_setup import TimeframeSwingSetup
 from app.models.timeframe_interpretation import (
@@ -131,14 +135,95 @@ class JarvisDashboardProjector:
             ),
             debate=self._debate_panel(result),
             trade_plan=self._trade_plan(result),
+            hierarchy_assessment=(
+                result.trade_plan_result.hierarchy_assessment
+            ),
             interpretation=self._interpretation(result.interpretation),
             activities=tuple(self._activity(event) for event in events),
             presentation=output.research_explanation,
         )
 
+    def project_technical_research(
+        self,
+        operation: BrowserOperationSnapshot,
+        output: BrowserOperationOutput,
+        events: Sequence[JarvisWorkflowEvent] = (),
+    ) -> JarvisTechnicalResearchDashboardView:
+        """Project completed technical agents without inventing a verdict."""
+
+        if operation.status is not BrowserOperationStatus.COMPLETED:
+            raise DashboardProjectionError(
+                "technical research dashboard requires a completed operation"
+            )
+        if output.operation_id != operation.request.operation_id:
+            raise DashboardProjectionError(
+                "technical research dashboard operation IDs do not match"
+            )
+        if output.session_id != operation.request.session_id:
+            raise DashboardProjectionError(
+                "technical research dashboard session IDs do not match"
+            )
+        if output.kind is not BrowserOperationKind.SWING_ANALYSIS:
+            raise DashboardProjectionError(
+                "technical research dashboard requires swing analysis"
+            )
+        response = output.research_response
+        if response is None or not isinstance(
+            response.research_division_result,
+            MultiTimeframeResearchDivisionResult,
+        ):
+            raise DashboardProjectionError(
+                "technical research dashboard requires retained technical "
+                "evidence"
+            )
+        if response.result is not None:
+            raise DashboardProjectionError(
+                "technical research dashboard cannot project a completed "
+                "trade conclusion"
+            )
+        research = response.research_division_result
+        package = research.technical_review.released_evidence
+        if package is None:
+            raise DashboardProjectionError(
+                "technical research dashboard evidence is unavailable"
+            )
+        technical = package.technical_analysis
+        return JarvisTechnicalResearchDashboardView(
+            operation_id=output.operation_id,
+            session_id=output.session_id,
+            completed_at=output.completed_at,
+            exchange=technical.timeframes.hourly.exchange,
+            symbol_token=technical.timeframes.hourly.symbol_token,
+            symbol=technical.timeframes.hourly.symbol,
+            source_retrieved_at=technical.timeframes.hourly.retrieved_at,
+            latest_quote=(
+                DashboardQuote(**research.latest_quote.model_dump())
+                if research.latest_quote is not None
+                else None
+            ),
+            refresh=self._refresh_provenance(research),
+            package_fingerprint=package.package_fingerprint,
+            daily=self._timeframe_panel(
+                SwingAnalysisTimeframe.DAILY,
+                package.daily,
+                technical,
+                set(),
+            ),
+            weekly=self._timeframe_panel(
+                SwingAnalysisTimeframe.WEEKLY,
+                package.weekly,
+                technical,
+                set(),
+            ),
+            activities=tuple(self._activity(event) for event in events),
+        )
+
     @staticmethod
     def _refresh_provenance(
-        result: MultiTimeframeEndToEndSwingAnalysisResult,
+        result: (
+            MultiTimeframeEndToEndSwingAnalysisResult
+            | MultiTimeframeResearchDivisionResult
+        ),
     ) -> DashboardRefreshProvenance:
         fetch = result.fetch
         series = fetch.stored.series

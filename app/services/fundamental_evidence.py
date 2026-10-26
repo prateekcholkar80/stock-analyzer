@@ -14,6 +14,9 @@ from app.gateways.fundamentals import (
     FundamentalCompanyOverviewRequest,
     FundamentalEvidenceGateway,
     FundamentalEvidenceRetrieval,
+    FundamentalFinancialDocumentPackageGateway,
+    FundamentalFinancialDocumentPackageRequest,
+    FundamentalFinancialDocumentPackageResult,
     FundamentalFinancialsRequest,
     FundamentalIssuerResolutionRequest,
     FundamentalIssuerResolutionResult,
@@ -43,7 +46,18 @@ from app.models.financial_document_storage import (
     StructuredDocumentCacheKey,
     stored_structured_financial_document,
 )
-from app.models.fundamentals import FundamentalIssuerIdentity
+from app.models.financial_documents import FinancialReportingBasis
+from app.models.fundamental_package import (
+    FundamentalEvidencePackage,
+    FundamentalPackageDataset,
+    FundamentalPackageItem,
+    FundamentalPackageItemKey,
+    FundamentalPackageManifest,
+)
+from app.models.fundamentals import (
+    FundamentalIssuerIdentity,
+    ProviderConnectionScope,
+)
 from app.models.peer_comparison_storage import (
     PeerComparisonCacheKey,
     StoredPeerComparisonDocument,
@@ -65,6 +79,13 @@ from app.storage.financial_document_repositories import (
     StructuredFinancialDocumentRepository,
 )
 from app.storage.peer_comparison_repositories import PeerComparisonRepository
+from app.storage.fundamental_package_repositories import (
+    FundamentalPackageRepository,
+    FundamentalPackageRepositoryScope,
+)
+from app.storage.fundamental_filing_evidence_repositories import (
+    FundamentalFilingEvidenceRepository,
+)
 
 
 class FundamentalEvidenceSource(StrEnum):
@@ -295,6 +316,9 @@ class FundamentalEvidenceCoordinator:
         structured_document_gateway: (
             FundamentalStructuredDocumentGateway | None
         ) = None,
+        financial_document_package_gateway: (
+            FundamentalFinancialDocumentPackageGateway | None
+        ) = None,
         structured_document_repository: (
             StructuredFinancialDocumentRepository | None
         ) = None,
@@ -305,6 +329,10 @@ class FundamentalEvidenceCoordinator:
         ) = None,
         benchmarking_financials_repository: (
             BenchmarkingFinancialsRepository | None
+        ) = None,
+        package_repository: FundamentalPackageRepository | None = None,
+        filing_evidence_repository: (
+            FundamentalFilingEvidenceRepository | None
         ) = None,
         clock: Callable[[], datetime] | None = None,
         retention: timedelta = FUNDAMENTAL_MAX_RETENTION,
@@ -331,6 +359,21 @@ class FundamentalEvidenceCoordinator:
         ):
             raise TypeError(
                 "structured document coordinator requires its repository"
+            )
+        if financial_document_package_gateway is None and isinstance(
+            gateway,
+            FundamentalFinancialDocumentPackageGateway,
+        ):
+            financial_document_package_gateway = gateway
+        if (
+            financial_document_package_gateway is not None
+            and not isinstance(
+                financial_document_package_gateway,
+                FundamentalFinancialDocumentPackageGateway,
+            )
+        ):
+            raise TypeError(
+                "financial package coordinator requires its gateway"
             )
         if peer_comparison_gateway is None and isinstance(
             gateway,
@@ -374,10 +417,25 @@ class FundamentalEvidenceCoordinator:
             raise TypeError(
                 "Benchmarking Financials coordinator requires its repository"
             )
+        if package_repository is not None and not isinstance(
+            package_repository,
+            FundamentalPackageRepository,
+        ):
+            raise TypeError("fundamental package coordinator requires its repository")
+        if filing_evidence_repository is not None and not isinstance(
+            filing_evidence_repository,
+            FundamentalFilingEvidenceRepository,
+        ):
+            raise TypeError(
+                "fundamental filing evidence coordinator requires its repository"
+            )
         if retention <= timedelta(0) or retention > FUNDAMENTAL_MAX_RETENTION:
             raise ValueError("fundamental coordinator retention is invalid")
         self._gateway = gateway
         self._structured_document_gateway = structured_document_gateway
+        self._financial_document_package_gateway = (
+            financial_document_package_gateway
+        )
         self._structured_document_repository = structured_document_repository
         self._peer_comparison_gateway = peer_comparison_gateway
         self._peer_comparison_repository = peer_comparison_repository
@@ -387,12 +445,34 @@ class FundamentalEvidenceCoordinator:
         self._benchmarking_financials_repository = (
             benchmarking_financials_repository
         )
+        self._package_repository = package_repository
+        self._filing_evidence_repository = filing_evidence_repository
         self._repository = repository
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._retention = retention
         self._cache_policy = FundamentalCachePolicy(
             repository,
             clock=self._clock,
+        )
+
+    def load_active_package(
+        self,
+        *,
+        connection: ProviderConnectionScope,
+        issuer: FundamentalIssuerIdentity,
+    ) -> FundamentalEvidencePackage | None:
+        """Read the current complete package inside an explicit tenant scope."""
+
+        repository = self._package_repository
+        if repository is None:
+            raise RuntimeError("fundamental package cache is not configured")
+        scope = FundamentalPackageRepositoryScope(
+            connection=connection,
+            issuer=issuer,
+        )
+        return repository.get_active_fundamental_package(
+            scope=scope,
+            as_of=self._clock(),
         )
 
     def load(
@@ -563,6 +643,103 @@ class FundamentalEvidenceCoordinator:
             result=result,
             stored_document=persisted,
             refresh_requested=refresh_requested,
+        )
+
+    def refresh_structured_document_package(
+        self,
+        request: FundamentalFinancialDocumentPackageRequest,
+    ) -> tuple[StructuredDocumentLoadResult, ...]:
+        """Retrieve and atomically cache all eleven financial documents."""
+
+        if not isinstance(request, FundamentalFinancialDocumentPackageRequest):
+            raise TypeError("financial package refresh requires its request")
+        gateway = self._financial_document_package_gateway
+        if gateway is None:
+            raise RuntimeError("financial package retrieval is not configured")
+        repository = self._structured_document_repository
+        if repository is None:
+            raise RuntimeError("structured document cache is not configured")
+
+        package_result = gateway.retrieve_financial_document_package(
+            request=request
+        )
+        if not isinstance(
+            package_result,
+            FundamentalFinancialDocumentPackageResult,
+        ):
+            raise ValueError("financial package gateway returned an invalid result")
+        validate_fundamental_response_binding(request, package_result)
+        package = package_result.package
+        if (
+            package_result.status is not FundamentalRetrievalStatus.COMPLETED
+            or package is None
+        ):
+            raise ValueError("financial package retrieval did not complete")
+
+        stored_at = self._clock()
+        requests = []
+        results = []
+        candidates = []
+        for document in package.documents:
+            document_request = FundamentalStructuredDocumentRequest(
+                request_id=request.request_id,
+                operation_id=request.operation_id,
+                connection=request.connection,
+                requested_at=request.requested_at,
+                issuer=request.issuer,
+                as_of_date=request.as_of_date,
+                document_type=document.document_type,
+                reporting_basis=document.reporting_basis,
+            )
+            document_result = FundamentalStructuredDocumentResult(
+                request_id=document_request.request_id,
+                request_fingerprint=document_request.request_fingerprint,
+                connection=document_request.connection,
+                requested_at=document_request.requested_at,
+                started_at=package_result.started_at,
+                completed_at=package_result.completed_at,
+                provider_contract_version=(
+                    package_result.provider_contract_version
+                ),
+                adapter_fingerprint=package_result.adapter_fingerprint,
+                issuer=document_request.issuer,
+                document_type=document_request.document_type,
+                reporting_basis=document_request.reporting_basis,
+                status=FundamentalRetrievalStatus.COMPLETED,
+                document=document,
+            )
+            validate_fundamental_response_binding(
+                document_request,
+                document_result,
+            )
+            requests.append(document_request)
+            results.append(document_result)
+            candidates.append(
+                stored_structured_financial_document(
+                    document_request,
+                    document_result,
+                    stored_at=stored_at,
+                    retention=self._retention,
+                )
+            )
+
+        scope = candidates[0].cache_key.repository_scope
+        persisted = repository.replace_structured_financial_document_package(
+            tuple(candidates),
+            scope=scope,
+        )
+        if len(persisted) != len(candidates):
+            raise ValueError(
+                "financial package repository returned an incomplete result"
+            )
+        return tuple(
+            StructuredDocumentLoadResult(
+                source=FundamentalEvidenceSource.PROVIDER,
+                result=result,
+                stored_document=stored,
+                refresh_requested=True,
+            )
+            for result, stored in zip(results, persisted, strict=True)
         )
 
     def load_peer_comparison(
@@ -747,6 +924,157 @@ class FundamentalEvidenceCoordinator:
             result=result,
             stored_document=persisted,
             refresh_requested=refresh_requested,
+        )
+
+    def publish_complete_package(
+        self,
+        *,
+        operation_id: str,
+        evidence_loads: tuple[FundamentalEvidenceLoadResult, ...],
+        structured_document_loads: tuple[StructuredDocumentLoadResult, ...],
+        peer_comparison_load: PeerComparisonLoadResult,
+        benchmarking_financials_load: BenchmarkingFinancialsLoadResult,
+    ) -> FundamentalEvidencePackage:
+        """Atomically activate one refresh only after every dataset succeeds."""
+
+        repository = self._package_repository
+        if repository is None:
+            raise RuntimeError("fundamental package repository is not configured")
+        if len(evidence_loads) != 3 or len(structured_document_loads) != 11:
+            raise ValueError(
+                "fundamental package publication requires all sixteen datasets"
+            )
+
+        snapshots = tuple(
+            self._require_successful_provider_artifact(
+                load,
+                load.stored_snapshot,
+                dataset="fundamental snapshot",
+            )
+            for load in evidence_loads
+        )
+        structured_documents = tuple(
+            self._require_successful_provider_artifact(
+                load,
+                load.stored_document,
+                dataset="structured financial document",
+            )
+            for load in structured_document_loads
+        )
+        peer_comparison = self._require_successful_provider_artifact(
+            peer_comparison_load,
+            peer_comparison_load.stored_document,
+            dataset="Peer Comparison",
+        )
+        benchmarking_financials = self._require_successful_provider_artifact(
+            benchmarking_financials_load,
+            benchmarking_financials_load.stored_document,
+            dataset="Benchmarking Financials",
+        )
+        artifacts = (
+            *snapshots,
+            *structured_documents,
+            peer_comparison,
+            benchmarking_financials,
+        )
+        if any(
+            artifact.request.operation_id != operation_id
+            for artifact in artifacts
+        ):
+            raise ValueError(
+                "fundamental package artifacts must belong to the refresh operation"
+            )
+
+        committed_at = self._clock()
+        requested_at = min(
+            artifact.request.requested_at for artifact in artifacts
+        )
+        items = tuple(
+            self._fundamental_package_item(artifact)
+            for artifact in artifacts
+        )
+        manifest = FundamentalPackageManifest(
+            operation_id=operation_id,
+            connection=artifacts[0].request.connection,
+            issuer=artifacts[0].request.issuer,
+            requested_at=requested_at,
+            committed_at=committed_at,
+            items=items,
+        )
+        package = FundamentalEvidencePackage(
+            manifest=manifest,
+            snapshots=snapshots,
+            structured_documents=structured_documents,
+            peer_comparison=peer_comparison,
+            benchmarking_financials=benchmarking_financials,
+        )
+        scope = FundamentalPackageRepositoryScope.from_package(package)
+        active = repository.get_active_fundamental_package(
+            scope=scope,
+            as_of=committed_at,
+        )
+        return repository.commit_fundamental_package(
+            package,
+            expected_active_package_id=(
+                active.package_id if active is not None else None
+            ),
+        )
+
+    @staticmethod
+    def _require_successful_provider_artifact(load, artifact, *, dataset: str):
+        result = getattr(load, "retrieval", None) or getattr(
+            load,
+            "result",
+            None,
+        )
+        if (
+            load.source is not FundamentalEvidenceSource.PROVIDER
+            or result is None
+            or result.status not in {
+                FundamentalRetrievalStatus.COMPLETED,
+                FundamentalRetrievalStatus.PARTIAL,
+            }
+            or artifact is None
+        ):
+            raise ValueError(
+                f"{dataset} did not complete through the provider; "
+                "active package was preserved"
+            )
+        return artifact
+
+    @staticmethod
+    def _fundamental_package_item(artifact) -> FundamentalPackageItem:
+        if isinstance(artifact, StoredFundamentalSnapshot):
+            dataset = FundamentalPackageDataset(
+                artifact.request.capability.value
+            )
+            reporting_basis = FinancialReportingBasis.NOT_APPLICABLE
+            content_fingerprint = artifact.snapshot_fingerprint
+        elif isinstance(artifact, StoredStructuredFinancialDocument):
+            dataset = FundamentalPackageDataset(
+                artifact.request.document_type.value
+            )
+            reporting_basis = artifact.request.reporting_basis
+            content_fingerprint = artifact.document_fingerprint
+        elif isinstance(artifact, StoredPeerComparisonDocument):
+            dataset = FundamentalPackageDataset.PEER_COMPARISON
+            reporting_basis = FinancialReportingBasis.NOT_APPLICABLE
+            content_fingerprint = artifact.document_fingerprint
+        elif isinstance(artifact, StoredBenchmarkingFinancialsDocument):
+            dataset = FundamentalPackageDataset.BENCHMARKING_FINANCIALS
+            reporting_basis = FinancialReportingBasis.NOT_APPLICABLE
+            content_fingerprint = artifact.document_fingerprint
+        else:
+            raise TypeError("unsupported fundamental package artifact")
+        return FundamentalPackageItem(
+            key=FundamentalPackageItemKey(
+                dataset=dataset,
+                reporting_basis=reporting_basis,
+            ),
+            cache_entry_id=artifact.cache_key.cache_entry_id,
+            content_fingerprint=content_fingerprint,
+            retrieved_at=artifact.retrieved_at,
+            expires_at=artifact.expires_at,
         )
 
     def _retrieve(

@@ -16,18 +16,31 @@ from app.exceptions import (
     LLMError,
     MarketDataError,
     FundamentalGatewayError,
+    StorageError,
 )
 from app.gateways.fundamentals import (
     FundamentalCompanyOverviewRequest,
+    FundamentalFilingDiscoveryRequest,
+    FundamentalFinancialDocumentPackageRequest,
     FundamentalFinancialsRequest,
     FundamentalIssuerLocator,
     FundamentalIssuerResolutionRequest,
     FundamentalShareholdingRequest,
     FundamentalStructuredDocumentRequest,
 )
+from app.analytics.fundamental_intelligence import (
+    FundamentalIntelligenceResult,
+    build_shadow_fundamental_intelligence,
+    normalize_committed_fundamental_package,
+)
+from app.analytics.fundamental_sector_profile import (
+    FundamentalSectorEvidence,
+    classify_fundamental_sector_profile,
+)
 from app.logging_config import get_logger
 from app.models.browser_operations import (
     BrowserBenchmarkingFinancialsReference,
+    BrowserFundamentalPackageReference,
     BrowserOperationFailure,
     BrowserOperationKind,
     BrowserOperationOutput,
@@ -51,6 +64,12 @@ from app.models.financial_documents import (
     FinancialDocumentType,
     FinancialReportingBasis,
 )
+from app.models.fundamental_analysis import (
+    FundamentalAnalysis,
+    FundamentalDocumentEvidence,
+)
+from app.models.fundamental_package import FundamentalEvidencePackage
+from app.models.fundamentals import FundamentalIssuerIdentity
 from app.models.presentation import (
     JarvisMultiTimeframeResearchExplanation,
     JarvisResearchExplanation,
@@ -59,12 +78,22 @@ from app.models.storage import (
     EndToEndSwingAnalysisResult,
     MultiTimeframeEndToEndSwingAnalysisResult,
 )
-from app.models.workflow import WorkflowEventState, WorkflowStage
+from app.models.workflow import (
+    WorkflowActivityDescriptor,
+    WorkflowEventState,
+    WorkflowParticipantKind,
+    WorkflowStage,
+)
 from app.services.fundamental_evidence import (
     BenchmarkingFinancialsLoadResult,
     FundamentalEvidenceLoadResult,
     FundamentalIssuerLoadResult,
+    PeerComparisonLoadResult,
     StructuredDocumentLoadResult,
+)
+from app.services.fundamental_filing_evidence import (
+    FundamentalFilingEvidenceCoordinationResult,
+    FundamentalFilingEvidenceCoordinationStatus,
 )
 from app.workflow.events import WorkflowEventEmitter
 from app.workflow.operations import BrowserOperationRegistry
@@ -73,6 +102,20 @@ from app.workflow.operations import BrowserOperationRegistry
 IST = ZoneInfo("Asia/Kolkata")
 RunnerClock = Callable[[], datetime]
 logger = get_logger("workflow.browser_runner")
+
+
+_FUNDAMENTAL_ANALYSIS = WorkflowActivityDescriptor(
+    activity_id="fundamentals.company.evaluate",
+    participant_id="fundamentals.fundamental_analyst",
+    participant_kind=WorkflowParticipantKind.ANALYST,
+    participant_label="Fundamental Analyst",
+)
+_CORPORATE_FILINGS_ANALYSIS = WorkflowActivityDescriptor(
+    activity_id="fundamentals.corporate_filings.prepare",
+    participant_id="fundamentals.corporate_filings_analyst",
+    participant_kind=WorkflowParticipantKind.ANALYST,
+    participant_label="Corporate Filings Analyst",
+)
 
 
 @runtime_checkable
@@ -213,6 +256,55 @@ class BrowserFundamentalEvidenceExecutor(Protocol):
     ) -> FundamentalEvidenceLoadResult:
         ...
 
+    def refresh_structured_document_package(
+        self,
+        request: FundamentalFinancialDocumentPackageRequest,
+    ) -> tuple[StructuredDocumentLoadResult, ...]:
+        ...
+
+    def load_active_package(
+        self,
+        *,
+        connection: ProviderConnectionScope,
+        issuer: FundamentalIssuerIdentity,
+    ) -> FundamentalEvidencePackage | None:
+        ...
+
+
+@runtime_checkable
+class BrowserFundamentalFilingEvidenceExecutor(Protocol):
+    def coordinate(
+        self,
+        request: FundamentalFilingDiscoveryRequest,
+        *,
+        refresh_requested: bool = False,
+    ) -> FundamentalFilingEvidenceCoordinationResult:
+        ...
+
+
+@runtime_checkable
+class BrowserFundamentalAnalyst(Protocol):
+    def analyze(
+        self,
+        *,
+        evidence: tuple[FundamentalDocumentEvidence, ...],
+        intelligence: FundamentalIntelligenceResult,
+        as_of: datetime,
+    ) -> FundamentalAnalysis:
+        ...
+
+
+@runtime_checkable
+class BrowserFundamentalSectorEvidenceResolver(Protocol):
+    def resolve(
+        self,
+        *,
+        issuer: FundamentalIssuerIdentity,
+        symbol: str,
+        as_of: datetime,
+    ) -> tuple[FundamentalSectorEvidence, ...]:
+        ...
+
 
 @runtime_checkable
 class BrowserResearchContextStore(Protocol):
@@ -286,8 +378,15 @@ class JarvisBrowserOperationHandler:
         fundamental_evidence_executor: (
             BrowserFundamentalEvidenceExecutor | None
         ) = None,
+        fundamental_filing_evidence_executor: (
+            BrowserFundamentalFilingEvidenceExecutor | None
+        ) = None,
         provider_scope_resolver: (
             Callable[[str], ProviderConnectionScope] | None
+        ) = None,
+        fundamental_analyst: BrowserFundamentalAnalyst | None = None,
+        fundamental_sector_evidence_resolver: (
+            BrowserFundamentalSectorEvidenceResolver | None
         ) = None,
         clock: RunnerClock | None = None,
     ) -> None:
@@ -318,17 +417,57 @@ class JarvisBrowserOperationHandler:
             raise ValueError(
                 "browser handler requires a fundamental evidence executor"
             )
+        if (
+            fundamental_filing_evidence_executor is not None
+            and fundamental_evidence_executor is None
+        ):
+            raise ValueError(
+                "browser filing execution requires fundamental issuer "
+                "resolution"
+            )
+        if (
+            fundamental_filing_evidence_executor is not None
+            and not isinstance(
+                fundamental_filing_evidence_executor,
+                BrowserFundamentalFilingEvidenceExecutor,
+            )
+        ):
+            raise ValueError(
+                "browser handler requires a filing evidence executor"
+            )
         if provider_scope_resolver is not None and not callable(
             provider_scope_resolver
         ):
             raise ValueError("browser handler requires a provider scope resolver")
+        if fundamental_analyst is not None and not isinstance(
+            fundamental_analyst,
+            BrowserFundamentalAnalyst,
+        ):
+            raise ValueError("browser handler requires a fundamental analyst")
+        if (
+            fundamental_sector_evidence_resolver is not None
+            and not isinstance(
+                fundamental_sector_evidence_resolver,
+                BrowserFundamentalSectorEvidenceResolver,
+            )
+        ):
+            raise ValueError(
+                "browser handler requires a sector evidence resolver"
+            )
         self._research_executor = research_executor
         self._presenter = presenter
         self._follow_up_executor = follow_up_executor
         self._user_name = _required_text("user name", user_name)
         self._contexts = resolved_context_store
         self._fundamental_evidence = fundamental_evidence_executor
+        self._fundamental_filing_evidence = (
+            fundamental_filing_evidence_executor
+        )
         self._provider_scope_resolver = provider_scope_resolver
+        self._fundamental_analyst = fundamental_analyst
+        self._fundamental_sector_evidence_resolver = (
+            fundamental_sector_evidence_resolver
+        )
         self._clock = clock or _ist_now
 
     def execute(
@@ -374,6 +513,11 @@ class JarvisBrowserOperationHandler:
         benchmarking_financials_reference: (
             BrowserBenchmarkingFinancialsReference | None
         ) = None
+        fundamental_package_reference: (
+            BrowserFundamentalPackageReference | None
+        ) = None
+        fundamental_analysis: FundamentalAnalysis | None = None
+        fundamental_failure: BrowserOperationFailure | None = None
         fundamental_future: Future | None = None
         fundamental_pool = (
             ThreadPoolExecutor(
@@ -390,12 +534,54 @@ class JarvisBrowserOperationHandler:
                 return
             if fundamental_future is not None:
                 raise RuntimeError("fundamental analysis was already started")
-            fundamental_future = fundamental_pool.submit(
-                self._load_fundamental_evidence,
-                request,
-                command,
-                token,
+            common = {
+                "exchange": command.exchange,
+                "symbol": command.symbol,
+                "activity": _FUNDAMENTAL_ANALYSIS,
+            }
+            emitter.emit(
+                WorkflowStage.ANALYSIS,
+                WorkflowEventState.STARTED,
+                **common,
             )
+
+            def load_with_terminal_event():
+                try:
+                    result = self._load_fundamental_evidence(
+                        request,
+                        command,
+                        emitter,
+                        token,
+                    )
+                except Exception:
+                    emitter.emit(
+                        WorkflowStage.ANALYSIS,
+                        WorkflowEventState.FAILED,
+                        **common,
+                    )
+                    raise
+                emitter.emit(
+                    WorkflowStage.ANALYSIS,
+                    (
+                        WorkflowEventState.FAILED
+                        if result[5] is not None
+                        else WorkflowEventState.COMPLETED
+                    ),
+                    **common,
+                )
+                return result
+
+            try:
+                fundamental_future = fundamental_pool.submit(
+                    load_with_terminal_event
+                )
+            except Exception:
+                emitter.emit(
+                    WorkflowStage.ANALYSIS,
+                    WorkflowEventState.FAILED,
+                    **common,
+                )
+                raise
 
         try:
             try:
@@ -415,11 +601,17 @@ class JarvisBrowserOperationHandler:
                     _safe_research_failure(exc)
                 ) from exc
             if fundamental_future is not None:
-                (
-                    fundamental_evidence,
-                    structured_document_references,
-                    benchmarking_financials_reference,
-                ) = fundamental_future.result()
+                try:
+                    (
+                        fundamental_evidence,
+                        structured_document_references,
+                        benchmarking_financials_reference,
+                        fundamental_package_reference,
+                        fundamental_analysis,
+                        fundamental_failure,
+                    ) = fundamental_future.result()
+                except BrowserOperationHandledFailure as exc:
+                    fundamental_failure = exc.failure
         finally:
             if fundamental_pool is not None:
                 fundamental_pool.shutdown(wait=True)
@@ -431,12 +623,27 @@ class JarvisBrowserOperationHandler:
             failure = response.failure
             if failure is None:
                 raise ValueError("LLM failure response is missing its payload")
-            raise BrowserOperationHandledFailure(
-                BrowserOperationFailure(
+            return BrowserOperationOutput(
+                operation_id=request.operation_id,
+                session_id=request.session_id,
+                kind=request.kind,
+                completed_at=self._clock(),
+                research_response=response,
+                decision_failure=BrowserOperationFailure(
                     code=f"llm.{failure.code.value}",
                     message=failure.display_message,
                     retryable=failure.retryable,
-                )
+                ),
+                fundamental_evidence=fundamental_evidence,
+                structured_document_references=(
+                    structured_document_references
+                ),
+                benchmarking_financials_reference=(
+                    benchmarking_financials_reference
+                ),
+                fundamental_package_reference=fundamental_package_reference,
+                fundamental_analysis=fundamental_analysis,
+                fundamental_failure=fundamental_failure,
             )
         if response.result is None:
             raise ValueError("completed research response is missing analysis")
@@ -485,6 +692,9 @@ class JarvisBrowserOperationHandler:
                 benchmarking_financials_reference=(
                     benchmarking_financials_reference
                 ),
+                fundamental_package_reference=fundamental_package_reference,
+                fundamental_analysis=fundamental_analysis,
+                fundamental_failure=fundamental_failure,
             )
         if not isinstance(
             explanation,
@@ -507,17 +717,24 @@ class JarvisBrowserOperationHandler:
             benchmarking_financials_reference=(
                 benchmarking_financials_reference
             ),
+            fundamental_package_reference=fundamental_package_reference,
+            fundamental_analysis=fundamental_analysis,
+            fundamental_failure=fundamental_failure,
         )
 
     def _load_fundamental_evidence(
         self,
         operation: BrowserOperationRequest,
         command: SwingAnalysisCommand,
+        emitter: WorkflowEventEmitter,
         token: BrowserCancellationToken,
     ) -> tuple[
         tuple[FundamentalEvidenceLoadResult, ...],
         tuple[BrowserStructuredDocumentReference, ...],
         BrowserBenchmarkingFinancialsReference | None,
+        BrowserFundamentalPackageReference | None,
+        FundamentalAnalysis | None,
+        BrowserOperationFailure | None,
     ]:
         executor = self._fundamental_evidence
         resolver = self._provider_scope_resolver
@@ -595,6 +812,14 @@ class JarvisBrowserOperationHandler:
                 )
             )
         issuer = resolution.issuer
+        self._prepare_filing_evidence(
+            operation=operation,
+            connection=connection,
+            issuer=issuer,
+            requested_at=requested_at,
+            emitter=emitter,
+            token=token,
+        )
         # Tijori supplies current provider-standardized evidence and does not
         # establish historical point-in-time availability.  The latest market
         # candle may legitimately predate today on weekends or holidays, so it
@@ -627,11 +852,19 @@ class JarvisBrowserOperationHandler:
             ),
         )
         loaded = []
+        structured_loads = []
         structured_references = []
+        document_evidence = []
         benchmarking_reference = None
+        package_reference = None
+        committed_package = None
+        fundamental_analysis = None
+        analyst_failure = None
+        retrieval_stage = "fundamental evidence"
         try:
             for request in requests:
                 token.raise_if_requested()
+                retrieval_stage = request.capability.value.replace("_", " ")
                 evidence = executor.load(
                     request,
                     refresh_requested=operation.refresh_requested,
@@ -785,20 +1018,59 @@ class JarvisBrowserOperationHandler:
                     reporting_basis=FinancialReportingBasis.STANDALONE,
                 ),
             )
-            for structured_request in structured_requests:
+            if operation.refresh_requested:
                 token.raise_if_requested()
-                structured_document = executor.load_structured_document(
-                    structured_request,
-                    refresh_requested=operation.refresh_requested,
+                retrieval_stage = "financial document package"
+                package_loads = executor.refresh_structured_document_package(
+                    FundamentalFinancialDocumentPackageRequest(
+                        request_id=(
+                            f"{operation.operation_id}.fundamental."
+                            "financial_package"
+                        ),
+                        operation_id=operation.operation_id,
+                        connection=connection,
+                        requested_at=requested_at,
+                        issuer=issuer,
+                        as_of_date=as_of_date,
+                    )
                 )
-                if not isinstance(
-                    structured_document,
-                    StructuredDocumentLoadResult,
+                if (
+                    not isinstance(package_loads, tuple)
+                    or len(package_loads) != len(structured_requests)
+                    or any(
+                        not isinstance(item, StructuredDocumentLoadResult)
+                        for item in package_loads
+                    )
                 ):
                     raise ValueError(
-                        "fundamental executor returned an invalid structured "
-                        "document result"
+                        "fundamental executor returned an incomplete financial "
+                        "document package"
                     )
+                structured_loads.extend(package_loads)
+            else:
+                for structured_request in structured_requests:
+                    token.raise_if_requested()
+                    retrieval_stage = (
+                        structured_request.document_type.value.replace("_", " ")
+                        + " ("
+                        + structured_request.reporting_basis.value
+                        + ")"
+                    )
+                    structured_document = executor.load_structured_document(
+                        structured_request,
+                        refresh_requested=False,
+                    )
+                    if not isinstance(
+                        structured_document,
+                        StructuredDocumentLoadResult,
+                    ):
+                        raise ValueError(
+                            "fundamental executor returned an invalid structured "
+                            "document result"
+                        )
+                    structured_loads.append(structured_document)
+
+            for structured_document in structured_loads:
                 stored_document = structured_document.stored_document
                 if stored_document is None:
                     continue
@@ -829,7 +1101,48 @@ class JarvisBrowserOperationHandler:
                         ),
                     )
                 )
+                document_evidence.append(
+                    FundamentalDocumentEvidence(
+                        reference_id=(
+                            stored_document.cache_key.cache_entry_id
+                        ),
+                        document_fingerprint=(
+                            stored_document.document_fingerprint
+                        ),
+                        document=document,
+                    )
+                )
             token.raise_if_requested()
+            retrieval_stage = "peer comparison"
+            peer_comparison = executor.load_peer_comparison(
+                requests[0],
+                refresh_requested=operation.refresh_requested,
+            )
+            if not isinstance(peer_comparison, PeerComparisonLoadResult):
+                raise ValueError(
+                    "fundamental executor returned an invalid Peer Comparison "
+                    "result"
+                )
+            stored_peer_comparison = peer_comparison.stored_document
+            if stored_peer_comparison is not None:
+                document = stored_peer_comparison.result.document
+                if document is None:
+                    raise ValueError(
+                        "stored Peer Comparison result is missing its document"
+                    )
+                document_evidence.append(
+                    FundamentalDocumentEvidence(
+                        reference_id=(
+                            stored_peer_comparison.cache_key.cache_entry_id
+                        ),
+                        document_fingerprint=(
+                            stored_peer_comparison.document_fingerprint
+                        ),
+                        document=document,
+                    )
+                )
+            token.raise_if_requested()
+            retrieval_stage = "benchmarking financials"
             benchmarking = executor.load_benchmarking_financials(
                 requests[0],
                 refresh_requested=operation.refresh_requested,
@@ -871,21 +1184,289 @@ class JarvisBrowserOperationHandler:
                         row_count=len(document.rows),
                     )
                 )
+                document_evidence.append(
+                    FundamentalDocumentEvidence(
+                        reference_id=(
+                            stored_benchmarking.cache_key.cache_entry_id
+                        ),
+                        document_fingerprint=(
+                            stored_benchmarking.document_fingerprint
+                        ),
+                        document=document,
+                    )
+                )
+            if operation.refresh_requested:
+                token.raise_if_requested()
+                try:
+                    committed_package = executor.publish_complete_package(
+                        operation_id=operation.operation_id,
+                        evidence_loads=tuple(loaded),
+                        structured_document_loads=tuple(structured_loads),
+                        peer_comparison_load=peer_comparison,
+                        benchmarking_financials_load=benchmarking,
+                    )
+                    package_reference = BrowserFundamentalPackageReference(
+                        package_id=committed_package.package_id,
+                        manifest_fingerprint=(
+                            committed_package.manifest.manifest_fingerprint
+                        ),
+                        expires_at=committed_package.manifest.expires_at,
+                    )
+                except (StorageError, ValueError) as exc:
+                    raise BrowserOperationHandledFailure(
+                        BrowserOperationFailure(
+                            code="fundamentals.refresh_incomplete",
+                            message=(
+                                "The complete fundamental refresh could not "
+                                "be published. The previous active package "
+                                "was preserved."
+                            ),
+                            retryable=isinstance(exc, StorageError),
+                        )
+                    ) from exc
+            if self._fundamental_analyst is not None and document_evidence:
+                token.raise_if_requested()
+                try:
+                    fundamental_analysis = self._analyze_fundamental_documents(
+                        executor=executor,
+                        connection=connection,
+                        issuer=issuer,
+                        symbol=command.symbol,
+                        committed_package=committed_package,
+                        document_evidence=tuple(document_evidence),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Fundamental Analyst synthesis failed",
+                        extra={
+                            "operation_id": operation.operation_id,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    analyst_failure = BrowserOperationFailure(
+                        code="fundamentals.analyst_unavailable",
+                        message=(
+                            "The Fundamental Analyst could not complete its "
+                            "explanation. The committed fundamental package "
+                            "remains available; no analyst conclusion was "
+                            "invented."
+                        ),
+                        retryable=(
+                            isinstance(exc, LLMError)
+                            and exc.context.retryable
+                        ),
+                    )
         except FundamentalGatewayError as exc:
             raise BrowserOperationHandledFailure(
                 BrowserOperationFailure(
                     code="fundamentals.unavailable",
                     message=(
-                        "Fundamental research could not be retrieved safely. "
+                        "Fundamental research could not retrieve "
+                        f"{retrieval_stage} safely. "
                         "No provider facts were invented or substituted."
                     ),
                     retryable=exc.context.retryable,
+                )
+            ) from exc
+        except ValueError as exc:
+            if (
+                operation.refresh_requested
+                and retrieval_stage == "financial document package"
+            ):
+                raise BrowserOperationHandledFailure(
+                    BrowserOperationFailure(
+                        code="fundamentals.refresh_incomplete",
+                        message=(
+                            "The complete fundamental refresh could not "
+                            "retrieve and validate every financial document. "
+                            "The previous active package was preserved."
+                        ),
+                        retryable=False,
+                    )
+                ) from exc
+            raise BrowserOperationHandledFailure(
+                BrowserOperationFailure(
+                    code="fundamentals.validation_failed",
+                    message=(
+                        "Fundamental research failed contract validation at "
+                        f"{retrieval_stage}. No unvalidated provider data was "
+                        "published."
+                    ),
+                    retryable=False,
                 )
             ) from exc
         return (
             tuple(loaded),
             tuple(structured_references),
             benchmarking_reference,
+            package_reference,
+            fundamental_analysis,
+            analyst_failure,
+        )
+
+    def _analyze_fundamental_documents(
+        self,
+        *,
+        executor: BrowserFundamentalEvidenceExecutor,
+        connection: ProviderConnectionScope,
+        issuer: FundamentalIssuerIdentity,
+        symbol: str,
+        committed_package: FundamentalEvidencePackage | None,
+        document_evidence: tuple[FundamentalDocumentEvidence, ...],
+    ) -> FundamentalAnalysis:
+        if committed_package is None:
+            committed_package = executor.load_active_package(
+                connection=connection,
+                issuer=issuer,
+            )
+        if committed_package is None:
+            raise ValueError(
+                "fundamental analyst requires an active complete package"
+            )
+        sector_evidence = ()
+        if self._fundamental_sector_evidence_resolver is not None:
+            sector_evidence = self._fundamental_sector_evidence_resolver.resolve(
+                issuer=issuer,
+                symbol=symbol,
+                as_of=self._clock(),
+            )
+        analysis_at = self._clock()
+        normalized_evidence = normalize_committed_fundamental_package(
+            committed_package,
+            normalized_at=analysis_at,
+        )
+        sector_classification = classify_fundamental_sector_profile(
+            package_id=normalized_evidence.package_id,
+            manifest_fingerprint=normalized_evidence.manifest_fingerprint,
+            issuer=normalized_evidence.issuer,
+            package_expires_at=normalized_evidence.package_expires_at,
+            evidence=sector_evidence,
+            classified_at=analysis_at,
+        )
+        intelligence = build_shadow_fundamental_intelligence(
+            normalized_evidence,
+            sector_classification=sector_classification,
+            assessed_at=analysis_at,
+        )
+        fundamental_analysis = self._fundamental_analyst.analyze(
+            evidence=document_evidence,
+            intelligence=intelligence,
+            as_of=analysis_at,
+        )
+        if not isinstance(fundamental_analysis, FundamentalAnalysis):
+            raise ValueError("fundamental analyst returned an invalid result")
+        return fundamental_analysis
+
+    def _prepare_filing_evidence(
+        self,
+        *,
+        operation: BrowserOperationRequest,
+        connection: ProviderConnectionScope,
+        issuer: FundamentalIssuerIdentity,
+        requested_at: datetime,
+        emitter: WorkflowEventEmitter,
+        token: BrowserCancellationToken,
+    ) -> None:
+        """Prepare primary filing evidence without blocking other research."""
+
+        executor = self._fundamental_filing_evidence
+        if executor is None:
+            return
+        common = {
+            "exchange": issuer.exchange,
+            "symbol": issuer.symbol,
+            "activity": _CORPORATE_FILINGS_ANALYSIS,
+        }
+        emitter.emit(
+            WorkflowStage.ANALYSIS,
+            WorkflowEventState.STARTED,
+            **common,
+        )
+        filing_request = FundamentalFilingDiscoveryRequest(
+            request_id=(
+                f"{operation.operation_id}.fundamental.filing_discovery"
+            ),
+            operation_id=operation.operation_id,
+            connection=connection,
+            requested_at=requested_at,
+            issuer=issuer,
+            through_date=requested_at.date(),
+        )
+        try:
+            token.raise_if_requested()
+            result = executor.coordinate(
+                filing_request,
+                refresh_requested=operation.refresh_requested,
+            )
+            token.raise_if_requested()
+            if not isinstance(
+                result,
+                FundamentalFilingEvidenceCoordinationResult,
+            ):
+                raise ValueError(
+                    "filing executor returned an invalid coordination result"
+                )
+            if (
+                result.request_fingerprint
+                != filing_request.request_fingerprint
+                or result.scope.connection != connection
+                or result.scope.issuer != issuer
+            ):
+                raise ValueError(
+                    "filing coordination result changed its request scope"
+                )
+        except BrowserOperationCancelled:
+            emitter.emit(
+                WorkflowStage.ANALYSIS,
+                WorkflowEventState.FAILED,
+                message="Corporate filing preparation was cancelled.",
+                **common,
+            )
+            raise
+        except Exception:
+            logger.error(
+                "Corporate filing preparation failed safely",
+                extra={"operation_id": operation.operation_id},
+            )
+            emitter.emit(
+                WorkflowStage.ANALYSIS,
+                WorkflowEventState.FAILED,
+                message=(
+                    "Corporate filings could not be prepared safely. "
+                    "Other research continued independently."
+                ),
+                **common,
+            )
+            return
+
+        if result.status in {
+            FundamentalFilingEvidenceCoordinationStatus.CACHE_REUSED,
+            FundamentalFilingEvidenceCoordinationStatus.PACKAGE_PUBLISHED,
+        }:
+            emitter.emit(
+                WorkflowStage.ANALYSIS,
+                WorkflowEventState.COMPLETED,
+                message=(
+                    "The Corporate Filings Analyst prepared a complete, "
+                    "validated filing package."
+                ),
+                **common,
+            )
+            return
+
+        failure = result.failure
+        emitter.emit(
+            WorkflowStage.ANALYSIS,
+            WorkflowEventState.FAILED,
+            message=(
+                failure.sanitized_message
+                if failure is not None
+                else (
+                    "Corporate filings could not be prepared safely. "
+                    "Other research continued independently."
+                )
+            ),
+            **common,
         )
 
     def _execute_follow_up(

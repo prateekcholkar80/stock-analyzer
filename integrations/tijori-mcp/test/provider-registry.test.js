@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { chmod, mkdtemp, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import { createTijoriProviderRegistry } from '../src/provider-registry.js';
@@ -10,6 +14,8 @@ const TOOL_NAMES = [
   'get_company_overview',
   'get_financials',
   'get_shareholding',
+  'list_company_filings',
+  'download_company_filing',
 ];
 const ISSUER = {
   exchange: 'NSE',
@@ -21,6 +27,14 @@ const RESOLVED_ISSUER = {
   provider_company_id: '123',
   provider_slug: 'tata-consultancy-services',
 };
+const SOURCE_PAGE_URL = (
+  'https://www.tijorifinance.com/company/tata-consultancy-services/'
+);
+const EARNINGS_URL = (
+  'https://files.tijorifinance.com/insight/india/123/'
+  + 'Earnings%20Release/ER-Jan26.pdf'
+);
+const PDF_BYTES = Buffer.from('%PDF-1.7\nprovider registry fixture\n%%EOF\n');
 
 function searchBrowser() {
   const state = { calls: 0, slug: null };
@@ -41,7 +55,56 @@ function searchBrowser() {
     };
   };
   const page = {
+    context() {
+      return { async cookies() { return []; } };
+    },
     async evaluate(callback) {
+      if (callback.toString().includes('#companyFilings')) {
+        return {
+          provider_years: ['2026', '2025'],
+          rows: [
+            {
+              label: 'Earnings Release',
+              class_names: ['name__cell', 'earnings-release'],
+              groups: [
+                {
+                  provider_year: '2026',
+                  entries: [{
+                    kind: 'available',
+                    label: 'Jan',
+                    href: (
+                      'https://files.tijorifinance.com/insight/india/123/'
+                      + 'Earnings%20Release/ER-Jan26.pdf'
+                    ),
+                  }],
+                },
+                {
+                  provider_year: '2025',
+                  entries: [{ kind: 'unavailable', label: 'Mar', href: null }],
+                },
+              ],
+            },
+            {
+              label: 'Conference Call',
+              class_names: ['name__cell', 'conference-call'],
+              groups: [
+                {
+                  provider_year: '2026',
+                  entries: [{
+                    kind: 'available',
+                    label: 'Jan',
+                    href: (
+                      'https://files.tijorifinance.com/insight/india/123/'
+                      + 'Conference%20Call/CC-Jan26.pdf'
+                    ),
+                  }],
+                },
+                { provider_year: '2025', entries: [] },
+              ],
+            },
+          ],
+        };
+      }
       if (callback.toString().includes('selectedColumns')) {
         return {
           metadata: {
@@ -112,7 +175,7 @@ function searchBrowser() {
   };
 }
 
-test('exposes exactly the approved five-tool registry', () => {
+test('exposes exactly the approved seven-tool registry', () => {
   const browser = searchBrowser();
   const registry = createTijoriProviderRegistry({ browserRunner: browser.runner });
 
@@ -224,6 +287,67 @@ test('routes get_shareholding through deterministic evidence normalization', asy
   assert.equal(browser.state.calls, 1);
 });
 
+test('routes list_company_filings through issuer-bound discovery', async () => {
+  const browser = searchBrowser();
+  const registry = createTijoriProviderRegistry({ browserRunner: browser.runner });
+
+  const result = await registry.invoke('list_company_filings', {
+    issuer: RESOLVED_ISSUER,
+    categories: ['earnings_release', 'conference_call'],
+    max_documents: 10,
+  });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.filings.length, 2);
+  assert.equal(result.payload.filings[0].provider_company_id, '123');
+  assert.equal(result.payload.filings[0].period.state, 'unclassified');
+  assert.deepEqual(result.payload.unavailable_period_labels, [
+    'earnings_release:Mar 2025',
+    'conference_call:2025',
+  ]);
+  assert.equal(browser.state.slug, 'tata-consultancy-services');
+  assert.equal(browser.state.calls, 1);
+});
+
+test('fails filing download closed when no staging boundary is configured', async () => {
+  const browser = searchBrowser();
+  const registry = createTijoriProviderRegistry({ browserRunner: browser.runner });
+
+  const result = await registry.invoke(
+    'download_company_filing',
+    filingDownloadRequest(),
+  );
+  assert.equal(result.status, 'unavailable');
+  assert.equal(browser.state.calls, 0);
+});
+
+test('routes filing download only through a configured staging boundary', async (context) => {
+  const stagingDirectory = await mkdtemp(join(tmpdir(), 'jarvis-registry-filings-'));
+  await chmod(stagingDirectory, 0o700);
+  context.after(async () => rm(stagingDirectory, { recursive: true, force: true }));
+  const browser = searchBrowser();
+  const registry = createTijoriProviderRegistry({
+    browserRunner: browser.runner,
+    filingStagingDirectory: stagingDirectory,
+    filingDownloadFetcher: async (url) => syntheticPdfResponse(url),
+    filingDownloadClock: () => new Date('2026-09-14T12:00:00+05:30'),
+  });
+
+  const result = await registry.invoke(
+    'download_company_filing',
+    filingDownloadRequest(),
+  );
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.provider_company_id, '123');
+  assert.equal(result.payload.validation_status, 'validated');
+  assert.match(result.payload.staged_artifact_key, /^[a-f0-9]{64}\.pdf$/);
+  assert.equal(JSON.stringify(result).includes(stagingDirectory), false);
+  assert.deepEqual(await readdir(stagingDirectory), [
+    result.payload.staged_artifact_key,
+  ]);
+});
+
 test('retains strict input validation before provider dispatch', async () => {
   const browser = searchBrowser();
   const registry = createTijoriProviderRegistry({ browserRunner: browser.runner });
@@ -246,3 +370,42 @@ test('rejects missing or malformed browser runners during composition', () => {
     );
   }
 });
+
+function filingDownloadRequest() {
+  const digest = createHash('sha256')
+    .update(`earnings_release\n${EARNINGS_URL}`, 'utf8')
+    .digest('hex');
+  return {
+    issuer: RESOLVED_ISSUER,
+    filing_reference: {
+      filing_reference_id: `filing.tcs.${digest.slice(0, 32)}`,
+      category: 'earnings_release',
+      provider_company_id: '123',
+      provider_slug: 'tata-consultancy-services',
+      source_page_url: SOURCE_PAGE_URL,
+      artifact_url: EARNINGS_URL,
+      discovery_fingerprint: 'a'.repeat(64),
+    },
+    expected_source_url: EARNINGS_URL,
+    expected_provider_company_id: '123',
+  };
+}
+
+function syntheticPdfResponse(url) {
+  const chunks = [PDF_BYTES];
+  return {
+    status: 200,
+    url,
+    headers: new Headers({
+      'content-type': 'application/pdf',
+      'content-length': String(PDF_BYTES.byteLength),
+    }),
+    body: new ReadableStream({
+      pull(controller) {
+        const chunk = chunks.shift();
+        if (chunk === undefined) controller.close();
+        else controller.enqueue(new Uint8Array(chunk));
+      },
+    }),
+  };
+}

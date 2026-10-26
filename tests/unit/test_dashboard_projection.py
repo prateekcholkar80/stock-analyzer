@@ -1,19 +1,30 @@
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from app.analytics.evidence_hierarchy import (
+    build_multi_timeframe_technical_findings,
+)
 from app.models.browser_operations import (
+    BrowserOperationFailure,
     BrowserOperationKind,
     BrowserOperationOutput,
     BrowserOperationRequest,
     BrowserOperationSnapshot,
     BrowserOperationStatus,
 )
+from app.models.dashboard import JarvisTechnicalResearchDashboardView
 from app.models.conversation import InputChannel
+from app.models.evidence_hierarchy import EvidenceFamily, EvidenceFamilyState
 from app.models.interaction import JarvisSwingAnalysisResponse
+from app.models.llm import JarvisLLMFailureResponse, LLMFailureCode
 from app.models.market_refresh import IntradayCandleGap
 from app.models.multi_timeframe_trade import MultiTimeframeTradeReason
-from app.models.storage import RollingFetchReceipt
+from app.models.storage import (
+    MultiTimeframeResearchDivisionResult,
+    RollingFetchReceipt,
+)
 from app.models.trade_decision import (
     MarketCondition,
     NoTradeReason,
@@ -21,6 +32,7 @@ from app.models.trade_decision import (
     TradeDecisionOutcome,
 )
 from app.models.workflow import WorkflowEventState, WorkflowStage
+from app.orchestration.agent_orchestrator import AgentOrchestrator
 from app.presentation.dashboard import (
     DashboardProjectionError,
     JarvisDashboardProjector,
@@ -116,6 +128,14 @@ class JarvisDashboardProjectorTests(unittest.TestCase):
             self.result.fetch.stored.series.candles[-1].timestamp,
         )
         self.assertEqual(view.package_fingerprint, package.package_fingerprint)
+        self.assertEqual(
+            view.hierarchy_assessment,
+            self.result.trade_plan_result.hierarchy_assessment,
+        )
+        self.assertEqual(
+            view.hierarchy_assessment,
+            self.result.interpretation.hierarchy_assessment,
+        )
         self.assertEqual(view.daily.interval, "ONE_DAY")
         self.assertEqual(view.weekly.interval, "ONE_WEEK")
         self.assertEqual(
@@ -204,6 +224,7 @@ class JarvisDashboardProjectorTests(unittest.TestCase):
                 {sweep.sweep_id for sweep in panel.chart.liquidity_sweeps},
                 expected_sweeps,
             )
+
             for zone in panel.chart.accumulation_zones:
                 source = next(
                     item
@@ -255,6 +276,104 @@ class JarvisDashboardProjectorTests(unittest.TestCase):
             self.result.interpretation.trade_decision.market_condition,
         )
 
+    def test_technical_research_contract_cannot_carry_a_conclusion(self):
+        completed = JarvisDashboardProjector().project(
+            self.operation,
+            self.output,
+        )
+
+        research = JarvisTechnicalResearchDashboardView(
+            operation_id=completed.operation_id,
+            session_id=completed.session_id,
+            completed_at=completed.completed_at,
+            exchange=completed.exchange,
+            symbol_token=completed.symbol_token,
+            symbol=completed.symbol,
+            source_retrieved_at=completed.source_retrieved_at,
+            latest_quote=completed.latest_quote,
+            refresh=completed.refresh,
+            package_fingerprint=completed.package_fingerprint,
+            daily=completed.daily,
+            weekly=completed.weekly,
+            activities=completed.activities,
+        )
+
+        payload = research.model_dump()
+        self.assertFalse(research.conclusion_available)
+        self.assertEqual(research.daily.chart, completed.daily.chart)
+        self.assertEqual(research.weekly.chart, completed.weekly.chart)
+        for forbidden in (
+            "debate",
+            "trade_plan",
+            "hierarchy_assessment",
+            "interpretation",
+            "presentation",
+        ):
+            self.assertNotIn(forbidden, payload)
+        with self.assertRaisesRegex(ValueError, "frozen"):
+            research.symbol = "ALTERED-EQ"
+
+    def test_projects_retained_technical_research_without_verdict(self):
+        retained = MultiTimeframeResearchDivisionResult(
+            use_case_id="jarvis.research_division.v1",
+            market_dataset_id=self.result.market_dataset_id,
+            fetch=self.result.fetch,
+            latest_quote=self.result.latest_quote,
+            technical_review=self.result.technical_review,
+        )
+        failure = JarvisLLMFailureResponse(
+            code=LLMFailureCode.AUTHENTICATION,
+            title="The Bull agent could not complete its case",
+            display_message="The configured debate credential was rejected.",
+            spoken_message="The Bull agent could not complete its case.",
+            recovery_action="Update the configured debate credential.",
+            retryable=False,
+            operation_id=self.request.operation_id,
+        )
+        output = BrowserOperationOutput(
+            operation_id=self.request.operation_id,
+            session_id=self.request.session_id,
+            kind=self.request.kind,
+            completed_at=self.at,
+            research_response=JarvisSwingAnalysisResponse.llm_failure(
+                operation_id=self.request.operation_id,
+                failure=failure,
+                research_division_result=retained,
+            ),
+            decision_failure=BrowserOperationFailure(
+                code="llm.authentication",
+                message=failure.display_message,
+                retryable=False,
+            ),
+        )
+
+        view = JarvisDashboardProjector().project_technical_research(
+            self.operation,
+            output,
+        )
+
+        self.assertFalse(view.conclusion_available)
+        self.assertEqual(
+            view.package_fingerprint,
+            retained.technical_review.released_evidence.package_fingerprint,
+        )
+        self.assertEqual(view.latest_quote.price, retained.latest_quote.price)
+        self.assertEqual(view.daily.interval, "ONE_DAY")
+        self.assertEqual(view.weekly.interval, "ONE_WEEK")
+        self.assertTrue(view.daily.chart.central_pivot_ranges)
+        self.assertTrue(view.weekly.chart.central_pivot_ranges)
+        self.assertFalse(any(item.decisive for item in view.daily.evidence))
+        self.assertFalse(any(item.decisive for item in view.weekly.evidence))
+
+        with self.assertRaisesRegex(
+            DashboardProjectionError,
+            "retained technical evidence",
+        ):
+            JarvisDashboardProjector().project_technical_research(
+                self.operation,
+                self.output,
+            )
+
     def test_projects_additive_interpretation_without_changing_v1_dashboard(self):
         view = JarvisDashboardProjector().project(self.operation, self.output)
 
@@ -294,10 +413,15 @@ class JarvisDashboardProjectorTests(unittest.TestCase):
         legacy_payload["trade_plan_result"] = (
             self.result.trade_plan_result.model_copy(
                 update={
+                    "schema_version": (
+                        "jarvis.multi_timeframe_long_trade_plan.v1"
+                    ),
+                    "policy_id": "jarvis.long_only_2r_swing_policy.v1",
                     "reason": (
                         MultiTimeframeTradeReason.DAILY_PROFILE_NOT_BULLISH
                     ),
                     "trade_decision": legacy_decision,
+                    "hierarchy_assessment": None,
                 }
             )
         )
@@ -476,12 +600,28 @@ class JarvisDashboardProjectorTests(unittest.TestCase):
         self.assertIsNone(view.trade_plan.target_3r_price)
 
     def test_actionable_plan_preserves_exact_two_and_three_r_values(self):
-        result = _use_case(timeframes=_trending_timeframes()).execute(
-            "NSE",
-            "2885",
-            "RELIANCE-EQ",
-            "ONE_HOUR",
+        timeframes = _trending_timeframes()
+        review = AgentOrchestrator().run_multi_timeframe_analysis(timeframes)
+        findings = build_multi_timeframe_technical_findings(
+            review.evidence_package
         )
+        forced_bullish_primary = tuple(
+            finding.model_copy(update={"state": EvidenceFamilyState.BULLISH})
+            if finding.family is EvidenceFamily.MARKET_STRUCTURE
+            else finding
+            for finding in findings
+        )
+        with patch(
+            "app.use_cases.build_multi_timeframe_long_trade_plan."
+            "build_multi_timeframe_technical_findings",
+            return_value=forced_bullish_primary,
+        ):
+            result = _use_case(timeframes=timeframes).execute(
+                "NSE",
+                "2885",
+                "RELIANCE-EQ",
+                "ONE_HOUR",
+            )
         output = self.output.model_copy(
             update={
                 "research_response": JarvisSwingAnalysisResponse.completed(

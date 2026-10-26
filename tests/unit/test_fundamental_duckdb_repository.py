@@ -72,10 +72,10 @@ class DuckDBFundamentalSnapshotRepositoryTests(unittest.TestCase):
             clock=self.clock,
         )
 
-    def test_implements_contract_and_creates_version_five_schema(self):
+    def test_implements_contract_and_creates_current_schema(self):
         with self.storage() as storage:
             self.assertIsInstance(storage, FundamentalSnapshotRepository)
-            self.assertEqual(storage.schema_version, 5)
+            self.assertEqual(storage.schema_version, 6)
 
         connection = duckdb.connect(str(self.database), read_only=True)
         try:
@@ -90,7 +90,7 @@ class DuckDBFundamentalSnapshotRepositoryTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(version, "5")
+        self.assertEqual(version, "6")
         self.assertTrue(FUNDAMENTAL_TABLES.issubset(tables))
 
     def test_persists_envelope_and_normalized_evidence_relations(self):
@@ -471,6 +471,32 @@ class DuckDBFundamentalSnapshotRepositoryTests(unittest.TestCase):
             },
         )
 
+    def test_explicit_refresh_replaces_evidence_after_database_reopen(self):
+        old = build_entry()
+        later = timedelta(hours=2)
+        refreshed = build_entry(
+            requested_at=REQUESTED_AT + later,
+            completed_at=COMPLETED_AT + later,
+        )
+        self.clock.now = old.stored_at
+        with self.storage() as storage:
+            storage.save_fundamental_snapshot(old)
+
+        self.clock.now = refreshed.stored_at
+        with self.storage() as reopened:
+            saved = reopened.replace_fundamental_snapshot(
+                refreshed,
+                scope=self.scope,
+            )
+            source_count = reopened._connection.execute(
+                "SELECT count(*) FROM jarvis_fundamental_sources "
+                "WHERE cache_entry_id = ?",
+                [refreshed.cache_key.cache_entry_id],
+            ).fetchone()[0]
+
+        self.assertEqual(saved, refreshed)
+        self.assertEqual(source_count, 1)
+
     def test_failed_explicit_refresh_rolls_back_without_losing_evidence(self):
         old = build_entry()
         later = timedelta(hours=2)
@@ -633,7 +659,7 @@ class DuckDBFundamentalSnapshotRepositoryTests(unittest.TestCase):
                 ).fetchall()
             }
 
-        self.assertEqual(version, "5")
+        self.assertEqual(version, "6")
         self.assertTrue(FUNDAMENTAL_TABLES.issubset(tables))
 
     def test_concurrent_identical_and_conflicting_saves_are_atomic(self):
