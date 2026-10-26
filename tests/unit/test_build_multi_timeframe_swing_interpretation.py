@@ -1,5 +1,11 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+from app.analytics.evidence_hierarchy import (
+    build_multi_timeframe_technical_findings,
+)
+from app.models.evidence_hierarchy import EvidenceFamily, EvidenceFamilyState
 from app.models.technical_setup import (
     SwingSetupStepId,
     SwingSetupStepState,
@@ -22,24 +28,71 @@ from tests.unit.test_run_end_to_end_multi_timeframe_swing_analysis import (
     _trending_timeframes,
     _use_case,
 )
+from tests.unit.test_build_multi_timeframe_evidence import (
+    _cyclical_timeframes,
+)
+
+
+def _build_interpretation_directly(
+    *,
+    timeframes=None,
+    winner="bullish",
+    force_bullish_primary=False,
+):
+    resolved = timeframes or _cyclical_timeframes()
+    workflow = _use_case(timeframes=resolved, winner=winner)
+    review = workflow.agent_orchestrator.run_multi_timeframe_analysis(resolved)
+    debate = workflow.debate_orchestrator.run_multi_timeframe_debate(review)
+    patcher = None
+    if force_bullish_primary:
+        findings = build_multi_timeframe_technical_findings(
+            review.evidence_package
+        )
+        findings = tuple(
+            finding.model_copy(update={"state": EvidenceFamilyState.BULLISH})
+            if finding.family is EvidenceFamily.MARKET_STRUCTURE
+            else finding
+            for finding in findings
+        )
+        patcher = patch(
+            "app.use_cases.build_multi_timeframe_long_trade_plan."
+            "build_multi_timeframe_technical_findings",
+            return_value=findings,
+        )
+        patcher.start()
+    try:
+        trade_plan = workflow.trade_plan_builder.execute(review, debate)
+    finally:
+        if patcher is not None:
+            patcher.stop()
+    interpretation = BuildMultiTimeframeSwingInterpretation().execute(
+        review,
+        trade_plan,
+    )
+    return SimpleNamespace(
+        technical_review=review,
+        trade_plan_result=trade_plan,
+        interpretation=interpretation,
+    )
 
 
 class BuildMultiTimeframeSwingInterpretationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.baseline = _use_case().execute(
-            "NSE",
-            "2885",
-            "RELIANCE-EQ",
-            "ONE_HOUR",
+        cls.baseline = _build_interpretation_directly()
+        cls.actionable = _build_interpretation_directly(
+            timeframes=_trending_timeframes(),
+            force_bullish_primary=True,
         )
-        cls.actionable = _use_case(
-            timeframes=_trending_timeframes()
-        ).execute(
-            "NSE",
-            "2885",
-            "RELIANCE-EQ",
-            "ONE_HOUR",
+
+    def test_preserves_exact_trade_plan_hierarchy_assessment(self):
+        self.assertIs(
+            self.baseline.interpretation.hierarchy_assessment,
+            self.baseline.trade_plan_result.hierarchy_assessment,
+        )
+        self.assertEqual(
+            self.baseline.interpretation.schema_version,
+            "jarvis.multi_timeframe_interpretation.v2",
         )
 
     def test_baseline_exposes_both_complete_setup_matrices(self):
@@ -175,14 +228,10 @@ class BuildMultiTimeframeSwingInterpretationTests(unittest.TestCase):
         self.assertIn("CPR policy", interpretation.rationale)
 
     def test_judge_cannot_rewrite_bullish_timeframe_character(self):
-        result = _use_case(
+        result = _build_interpretation_directly(
             timeframes=_trending_timeframes(),
             winner="bearish",
-        ).execute(
-            "NSE",
-            "2885",
-            "RELIANCE-EQ",
-            "ONE_HOUR",
+            force_bullish_primary=True,
         )
         interpretation = result.interpretation
 

@@ -1,5 +1,6 @@
 import unittest
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from tests.unit._debate_fixtures import build_approved_technical_result
 
@@ -13,17 +14,32 @@ from app.models.debate import (
     DebateTerminationReason,
     DebateTranscript,
 )
+from app.models.runtime_skill import RuntimeAgentRole
+from app.orchestration.agent_orchestrator import AgentOrchestrator
+from app.runtime_skill_loader import RuntimeSkillLoader
+from tests.unit.test_build_multi_timeframe_evidence import (
+    _cyclical_timeframes,
+)
+
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 class FakeGateway:
-    def __init__(self, draft_payloads, model="fake-judge-model"):
+    def __init__(
+        self,
+        draft_payloads,
+        model="fake-judge-model",
+        fingerprint="c" * 64,
+    ):
         self.draft_payloads = list(draft_payloads)
         self.calls = []
         self.model = model
+        self.fingerprint = fingerprint
 
     @property
     def configuration_fingerprint(self):
-        return "c" * 64
+        return self.fingerprint
 
     def generate(self, *, system, messages, response_model):
         self.calls.append({"system": system, "messages": messages})
@@ -37,6 +53,17 @@ class FakeGateway:
 
 
 class DebateJudgeAgentTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        skills = RuntimeSkillLoader(
+            _REPOSITORY_ROOT / "runtime-skills" / "manifest.yaml"
+        ).load()
+        cls.judge_runtime_skill = skills.skill_for(RuntimeAgentRole.JUDGE)
+        cls.bull_runtime_skill = skills.skill_for(RuntimeAgentRole.BULL)
+        cls.technical_review = AgentOrchestrator().run_multi_timeframe_analysis(
+            _cyclical_timeframes()
+        )
+
     def setUp(self):
         technical_result = build_approved_technical_result()
         self.profile = technical_result.submission.profile
@@ -79,9 +106,99 @@ class DebateJudgeAgentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "validated"):
             DebateJudgeAgent(FakeGateway([]), config=object())
 
+    def test_rejects_unverified_or_wrong_role_runtime_skill(self):
+        with self.assertRaisesRegex(ValueError, "must be verified"):
+            DebateJudgeAgent(FakeGateway([]), runtime_skill=object())
+        with self.assertRaisesRegex(ValueError, "requires the Judge"):
+            DebateJudgeAgent(
+                FakeGateway([]),
+                runtime_skill=self.bull_runtime_skill,
+            )
+
     def test_rejects_non_gateway_dependency(self):
         with self.assertRaisesRegex(ValueError, "structured LLM gateway"):
             DebateJudgeAgent(object())
+
+    def test_configuration_fingerprint_includes_runtime_skill(self):
+        embedded = DebateJudgeAgent(FakeGateway([]))
+        static = DebateJudgeAgent(
+            FakeGateway([]),
+            runtime_skill=self.judge_runtime_skill,
+        )
+
+        self.assertNotEqual(
+            embedded.configuration_fingerprint,
+            static.configuration_fingerprint,
+        )
+
+    def test_verified_skill_is_multi_timeframe_system_instruction(self):
+        package = self.technical_review.released_evidence
+        weekly_id = package.weekly.evidence[0].qualified_evidence_id
+        daily_id = package.daily.evidence[0].qualified_evidence_id
+        base_time = datetime(2026, 1, 1, tzinfo=UTC)
+        transcript = DebateTranscript(
+            rounds=(
+                DebateRound(
+                    round_number=1,
+                    bull_argument=BullBearArgument(
+                        argument_id="bull:multi:1",
+                        side=DebateSide.BULL,
+                        round_number=1,
+                        thesis="Weekly evidence supports the bullish case.",
+                        evidence_citations=(weekly_id,),
+                        model_id="fake-bull",
+                        generated_at=base_time,
+                        timeframe_relationship="mixed",
+                    ),
+                    bear_argument=BullBearArgument(
+                        argument_id="bear:multi:1",
+                        side=DebateSide.BEAR,
+                        round_number=1,
+                        thesis="Daily evidence supports caution.",
+                        evidence_citations=(daily_id,),
+                        rebuts_argument_id="bull:multi:1",
+                        model_id="fake-bear",
+                        generated_at=base_time + timedelta(seconds=1),
+                        timeframe_relationship="mixed",
+                    ),
+                ),
+            ),
+            termination_reason=DebateTerminationReason.MAX_ROUNDS_REACHED,
+        )
+        gateway = FakeGateway(
+            [
+                {
+                    "winner": "neutral",
+                    "confidence_percentage": 35.0,
+                    "decisive_evidence_ids": [weekly_id, daily_id],
+                    "bull_case_summary": "Weekly evidence supports Bull.",
+                    "bear_case_summary": "Daily evidence supports caution.",
+                    "rationale": "The timeframes remain mixed.",
+                }
+            ]
+        )
+        agent = DebateJudgeAgent(
+            gateway,
+            runtime_skill=self.judge_runtime_skill,
+        )
+
+        agent.render_multi_timeframe_verdict(
+            technical_review=self.technical_review,
+            transcript=transcript,
+        )
+
+        self.assertEqual(
+            gateway.calls[0]["system"],
+            self.judge_runtime_skill.system_instructions,
+        )
+        self.assertIn(
+            "# Jarvis Runtime Evidence Grounding",
+            gateway.calls[0]["system"],
+        )
+        self.assertIn(
+            "# Jarvis Judge Runtime Skill",
+            gateway.calls[0]["system"],
+        )
 
     def test_prompt_includes_evidence_and_transcript(self):
         gateway = FakeGateway(

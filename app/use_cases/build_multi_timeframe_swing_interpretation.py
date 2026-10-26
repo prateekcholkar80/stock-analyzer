@@ -1,11 +1,13 @@
 from collections.abc import Iterable
 
-from app.analytics.cpr_policy import (
-    CPRDirectionalBias,
-    evaluate_cpr_trade_policy,
-)
+from app.analytics.cpr_policy import evaluate_cpr_trade_policy
 from app.models.accumulation import LiquidityPoolSide
 from app.models.agentic import TradePlanningReason
+from app.models.evidence_hierarchy import (
+    EvidenceFamily,
+    EvidenceFamilyState,
+    HierarchicalEvidenceAssessment,
+)
 from app.models.multi_timeframe_evidence import (
     MultiTimeframeEvidenceReview,
     QualifiedTechnicalEvidence,
@@ -40,7 +42,6 @@ from app.models.trade_decision import (
     MarketCondition,
     NoTradeReason,
     TradeDecision,
-    combined_profile_market_condition,
     market_condition_from_profile,
 )
 from app.models.trade_setup import TradeTargetFeasibility
@@ -77,6 +78,11 @@ class BuildMultiTimeframeSwingInterpretation:
             raise ValueError(
                 "interpretation requires the version-2 trade decision"
             )
+        hierarchy = trade_plan.hierarchy_assessment
+        if hierarchy is None:
+            raise ValueError(
+                "interpretation requires the version-2 hierarchy assessment"
+            )
 
         analysis = package.technical_analysis
         daily = self._timeframe(
@@ -87,22 +93,19 @@ class BuildMultiTimeframeSwingInterpretation:
             package.weekly,
             analysis.weekly_submission.profile,
         )
-        expected_condition = combined_profile_market_condition(
-            analysis.daily_submission.profile,
-            analysis.weekly_submission.profile,
-        )
+        expected_condition = hierarchy.primary_condition
         if decision.market_condition is not expected_condition:
             raise ValueError(
                 "interpretation decision does not match deterministic "
-                "timeframe profiles"
+                "hierarchical primary context"
             )
 
         cpr_policy = evaluate_cpr_trade_policy(
             package.daily.cpr,
             package.weekly.cpr,
         )
-        tactical = _tactical_readiness(decision)
-        structural = _structural_risk(weekly, decision, cpr_policy)
+        tactical = _tactical_readiness(decision, hierarchy)
+        structural = _structural_risk(hierarchy)
         risk_reward = _risk_reward(package.daily, trade_plan)
         decisive_ids = tuple(
             dict.fromkeys(
@@ -111,6 +114,7 @@ class BuildMultiTimeframeSwingInterpretation:
             )
         )
         return MultiTimeframeSwingInterpretation(
+            schema_version="jarvis.multi_timeframe_interpretation.v2",
             daily=daily,
             weekly=weekly,
             alignment=derive_timeframe_alignment(
@@ -121,6 +125,7 @@ class BuildMultiTimeframeSwingInterpretation:
             structural_risk=structural,
             risk_reward=risk_reward,
             trade_decision=decision,
+            hierarchy_assessment=hierarchy,
             decisive_evidence_ids=decisive_ids,
             decision_change_conditions=_decision_change_conditions(
                 decision,
@@ -128,9 +133,11 @@ class BuildMultiTimeframeSwingInterpretation:
             rationale=(
                 "Deterministic daily/weekly synthesis: daily is "
                 f"{daily.market_condition.value}, weekly is "
-                f"{weekly.market_condition.value}, and the resulting "
-                f"decision is {decision.decision.value}. "
-                f"{decision.rationale} {cpr_policy.rationale}"
+                f"{weekly.market_condition.value}; hierarchical primary "
+                f"context is {hierarchy.primary_condition.value}, and the "
+                f"resulting decision is {decision.decision.value}. "
+                f"{hierarchy.rationale} {decision.rationale} "
+                f"{cpr_policy.rationale}"
             ),
             interpreted_at=max(daily.evaluated_at, weekly.evaluated_at),
         )
@@ -857,56 +864,62 @@ def _timeframe_cpr_rationale(context):
     )
 
 
-def _tactical_readiness(decision):
-    if decision.market_condition is MarketCondition.INSUFFICIENT:
+def _tactical_readiness(decision, hierarchy):
+    if hierarchy.primary_condition is MarketCondition.INSUFFICIENT:
         return TacticalReadiness.INSUFFICIENT
-    if decision.market_condition is not MarketCondition.BULLISH:
+    if hierarchy.primary_condition is not MarketCondition.BULLISH:
         return TacticalReadiness.NOT_APPLICABLE
-    if decision.decision is TradeDecision.BUY:
+    entry_state = _gate_state(hierarchy, EvidenceFamily.ENTRY_TRIGGER)
+    if (
+        decision.decision is TradeDecision.BUY
+        and entry_state is EvidenceFamilyState.PASS
+    ):
         return TacticalReadiness.READY
     reasons = set(decision.no_trade_reasons)
     if NoTradeReason.JUDGE_REJECTED_BULLISH_CASE in reasons:
         return TacticalReadiness.BLOCKED
-    if reasons & {
-        NoTradeReason.BUY_SETUP_INVALIDATED,
-        NoTradeReason.ACTIVE_BEARISH_BREAK,
-    }:
+    if entry_state is EvidenceFamilyState.FAIL:
         return TacticalReadiness.BLOCKED
-    if NoTradeReason.DAILY_TRIGGER_INCOMPLETE in reasons:
+    if entry_state is EvidenceFamilyState.INSUFFICIENT:
         return TacticalReadiness.DEVELOPING
-    if NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE in reasons:
-        return TacticalReadiness.DEVELOPING
-    if reasons & {
-        NoTradeReason.CPR_BEARISH_RISK,
-        NoTradeReason.CPR_FAILED_BREAK_RISK,
-        NoTradeReason.CPR_TIMEFRAME_CONFLICT,
-    }:
-        return TacticalReadiness.BLOCKED
     return TacticalReadiness.READY
 
 
-def _structural_risk(weekly, decision, cpr_policy):
-    reasons = set(decision.no_trade_reasons)
-    if NoTradeReason.STRUCTURAL_STOP_UNAVAILABLE in reasons:
-        return StructuralRisk.HIGH
-    if weekly.market_condition is MarketCondition.INSUFFICIENT:
+def _structural_risk(hierarchy):
+    condition = hierarchy.primary_condition
+    if condition is MarketCondition.INSUFFICIENT:
         return StructuralRisk.UNKNOWN
-    if cpr_policy.weekly_bias is CPRDirectionalBias.BEARISH:
+    if condition is MarketCondition.BEARISH:
         return StructuralRisk.PROHIBITIVE
-    if reasons & {
-        NoTradeReason.CPR_FAILED_BREAK_RISK,
-        NoTradeReason.CPR_TIMEFRAME_CONFLICT,
-    }:
+    if condition is MarketCondition.CONFLICTED:
         return StructuralRisk.HIGH
-    if NoTradeReason.CPR_BEARISH_RISK in reasons:
-        return StructuralRisk.HIGH
-    if weekly.market_condition is MarketCondition.BEARISH:
-        return StructuralRisk.PROHIBITIVE
-    if weekly.market_condition is MarketCondition.CONFLICTED:
-        return StructuralRisk.HIGH
-    if weekly.market_condition is MarketCondition.NEUTRAL:
+    if condition is MarketCondition.NEUTRAL:
         return StructuralRisk.MODERATE
-    return StructuralRisk.LOW
+    risk_state = _gate_state(
+        hierarchy,
+        EvidenceFamily.RISK_TARGET_FEASIBILITY,
+    )
+    if risk_state is EvidenceFamilyState.PASS:
+        return StructuralRisk.LOW
+    if risk_state is EvidenceFamilyState.FAIL:
+        return StructuralRisk.HIGH
+    return StructuralRisk.UNKNOWN
+
+
+def _gate_state(
+    hierarchy: HierarchicalEvidenceAssessment,
+    family: EvidenceFamily,
+) -> EvidenceFamilyState:
+    matches = tuple(
+        finding
+        for finding in hierarchy.gate_states
+        if finding.family is family
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            f"hierarchy assessment requires one {family.value} gate finding"
+        )
+    return matches[0].state
 
 
 def _risk_reward(context, trade_plan):

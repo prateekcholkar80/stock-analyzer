@@ -116,6 +116,46 @@ class NseSectorMasterCatalogTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(downloader.calls), 1)
 
+    def test_returns_exact_record_with_source_provenance(self):
+        payload = _csv_payload(
+            ("TCS", "Tata Consultancy Services Limited", "IT", "Software"),
+        )
+        downloader = RecordingDownloader(payload=payload)
+        with TemporaryDirectory() as tmp:
+            catalog = NseSectorMasterCatalog(
+                NseSectorMasterConfig(
+                    cache_path=Path(tmp) / "nse_sector_master.json"
+                ),
+                downloader=downloader,
+            )
+
+            observation = catalog.observation_for_symbol("TCS-EQ")
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation.symbol, "TCS")
+        self.assertEqual(observation.sector, "IT")
+        self.assertEqual(observation.industry, "Software")
+        self.assertTrue(observation.source_location.startswith("https://"))
+        self.assertEqual(len(observation.source_payload_fingerprint), 64)
+        self.assertEqual(len(observation.source_record_fingerprint), 64)
+        self.assertIsNotNone(observation.retrieved_at.tzinfo)
+
+    def test_unknown_symbol_returns_no_observation_without_guessing(self):
+        payload = _csv_payload(
+            ("TCS", "Tata Consultancy Services Limited", "IT", "Software"),
+        )
+        with TemporaryDirectory() as tmp:
+            catalog = NseSectorMasterCatalog(
+                NseSectorMasterConfig(
+                    cache_path=Path(tmp) / "nse_sector_master.json"
+                ),
+                downloader=RecordingDownloader(payload=payload),
+            )
+
+            observation = catalog.observation_for_symbol("TCSFINANCE-EQ")
+
+        self.assertIsNone(observation)
+
     def test_reuses_sticky_cache_across_new_catalog_instances(self):
         payload = _csv_payload(
             ("RELIANCE", "Reliance Industries Limited", "Energy", "Oil & Gas"),

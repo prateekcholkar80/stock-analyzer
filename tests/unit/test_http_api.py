@@ -38,10 +38,15 @@ from app.fundamentals.provider_connections import (
 )
 from app.models.browser_operations import (
     BrowserBenchmarkingFinancialsReference,
+    BrowserFundamentalPackageReference,
+    BrowserOperationFailure,
+    BrowserOperationKind,
     BrowserOperationOutput,
+    BrowserOperationRequest,
     BrowserOperationStatus,
     BrowserStructuredDocumentReference,
 )
+from app.models.conversation import InputChannel
 from app.models.financial_documents import (
     FinancialDocumentType,
     FinancialReportingBasis,
@@ -59,17 +64,25 @@ from app.models.benchmarking_financials_storage import (
     stored_benchmarking_financials_document,
 )
 from app.models.interaction import JarvisSwingAnalysisResponse
+from app.models.llm import JarvisLLMFailureResponse, LLMFailureCode
+from app.models.storage import MultiTimeframeResearchDivisionResult
 from app.models.fundamentals import ProviderConnectionScope
 from app.services.provider_sessions import ProviderSessionCommandError
 from app.services.fundamental_evidence import FundamentalEvidenceSource
 from app.models.debate import JudgeFollowUpAnswer
-from app.models.workflow import WorkflowEventState, WorkflowStage
+from app.models.workflow import (
+    WorkflowActivityDescriptor,
+    WorkflowEventState,
+    WorkflowParticipantKind,
+    WorkflowStage,
+)
 from app.stt.gateway import Transcription
 from app.tts.gateway import SpeechSynthesis
 from app.workflow.browser_runner import (
     AsyncBrowserOperationRunner,
     InMemoryBrowserOperationResultStore,
 )
+from app.workflow.events import WorkflowEventEmitter
 from app.workflow.operations import InMemoryBrowserOperationRegistry
 from tests.unit.test_jarvis_conversation import (
     RecordingPresenter,
@@ -108,8 +121,10 @@ class _ApiHandler:
         blocking=False,
         structured_entry=None,
         benchmarking_entry=None,
+        clock=None,
     ):
         self.blocking = blocking
+        self.clock = clock or (lambda: datetime.now(IST))
         self.calls = 0
         self.started = threading.Event()
         self.release = threading.Event()
@@ -137,7 +152,7 @@ class _ApiHandler:
                 operation_id=request.operation_id,
                 session_id=request.session_id,
                 kind=request.kind,
-                completed_at=datetime.now(IST),
+                completed_at=self.clock(),
                 judge_follow_up=JudgeFollowUpAnswer(
                     question=request.message,
                     answer="Weekly support remains at the cited support zone.",
@@ -148,10 +163,10 @@ class _ApiHandler:
                     ),
                     judge_agent_id="jarvis.debate_judge_agent.v1",
                     model_id="fake-judge",
-                    generated_at=datetime.now(IST),
+                    generated_at=self.clock(),
                 ),
             )
-        reference_time = datetime.now(IST)
+        reference_time = self.clock()
         if self.structured_entry is None:
             reference_values = {
                 "cache_entry_id": "financial_document:aaaaaaaa",
@@ -205,7 +220,7 @@ class _ApiHandler:
             operation_id=request.operation_id,
             session_id=request.session_id,
             kind=request.kind,
-            completed_at=datetime.now(IST),
+            completed_at=self.clock(),
             research_response=JarvisSwingAnalysisResponse.completed(
                 operation_id=request.operation_id,
                 result=self.result,
@@ -265,15 +280,6 @@ class JarvisHttpApiTests(unittest.TestCase):
         self.registry = InMemoryBrowserOperationRegistry()
         self.results = InMemoryBrowserOperationResultStore()
         self.structured_entry = build_entry()
-        self.document_clock = MutableClock(
-            self.structured_entry.stored_at + timedelta(minutes=1)
-        )
-        self.structured_documents = (
-            InMemoryStructuredFinancialDocumentRepository(
-                clock=self.document_clock,
-                initial_entries=(self.structured_entry,),
-            )
-        )
         connection = ProviderConnectionScope(
             tenant_id="tenant.prateek",
             provider_connection_id="provider.tijori.prateek",
@@ -294,20 +300,43 @@ class JarvisHttpApiTests(unittest.TestCase):
             benchmark_result,
             stored_at=benchmark_result.completed_at + timedelta(seconds=1),
         )
+        # Both fixture records must exist and be unexpired at the shared time.
+        self.document_clock = MutableClock(
+            max(
+                self.structured_entry.stored_at,
+                self.benchmarking_entry.stored_at,
+            ) + timedelta(minutes=1)
+        )
+        self.assertLess(
+            self.document_clock.now,
+            min(
+                self.structured_entry.expires_at,
+                self.benchmarking_entry.expires_at,
+            ),
+        )
+        self.structured_documents = (
+            InMemoryStructuredFinancialDocumentRepository(
+                clock=self.document_clock,
+                initial_entries=(self.structured_entry,),
+            )
+        )
         self.benchmarking_documents = (
             InMemoryBenchmarkingFinancialsRepository(
+                clock=self.document_clock,
                 initial_entries=(self.benchmarking_entry,)
             )
         )
         self.handler = _ApiHandler(
             structured_entry=self.structured_entry,
             benchmarking_entry=self.benchmarking_entry,
+            clock=self.document_clock,
         )
         self.runner = AsyncBrowserOperationRunner(
             self.registry,
             self.handler,
             self.results,
             max_workers=1,
+            clock=self.document_clock,
         )
         self.authorizer = InMemoryBrowserSessionAuthorizer()
         self.provider_sessions = _ProviderSessions()
@@ -339,6 +368,7 @@ class JarvisHttpApiTests(unittest.TestCase):
             create_jarvis_http_app(
                 self.runner,
                 conversation=self.conversation,
+                clock=self.document_clock,
                 provider_sessions=self.provider_sessions,
                 provider_connection_scope_resolver=self.resolve_scope,
                 browser_session_ownership=self.connection_registry,
@@ -838,6 +868,42 @@ class JarvisHttpApiTests(unittest.TestCase):
         )
         self.assertEqual(unavailable.status_code, 410)
 
+    def test_document_references_expire_at_the_exact_boundary(self):
+        session_id, token = self._session()
+        operations_path = f"/api/v1/sessions/{session_id}/operations"
+        self.client.post(
+            operations_path,
+            json=self._operation_body(),
+            headers=self._headers(token),
+        )
+        self._wait_for_status(session_id, token, "operation-1", "completed")
+
+        for resource, entry in (
+            ("financial-documents", self.structured_entry),
+            ("benchmarking-financials", self.benchmarking_entry),
+        ):
+            document_path = (
+                f"{operations_path}/operation-1/{resource}/"
+                f"{entry.cache_key.cache_entry_id}"
+            )
+            for offset, expected_status in (
+                (timedelta(microseconds=-1), 200),
+                (timedelta(0), 410),
+                (timedelta(microseconds=1), 410),
+            ):
+                with self.subTest(resource=resource, offset=offset):
+                    self.document_clock.now = entry.expires_at + offset
+                    response = self.client.get(
+                        document_path,
+                        headers=self._headers(token),
+                    )
+                    self.assertEqual(response.status_code, expected_status)
+                    if expected_status == 200:
+                        self.assertEqual(
+                            response.json()["reference"]["cache_entry_id"],
+                            entry.cache_key.cache_entry_id,
+                        )
+
     def test_completed_analysis_exposes_dashboard_read_model(self):
         session_id, token = self._session()
         path = f"/api/v1/sessions/{session_id}/operations"
@@ -881,6 +947,19 @@ class JarvisHttpApiTests(unittest.TestCase):
             body["interpretation"]["trade_decision"]["decision"],
             "no_trade",
         )
+        expected_hierarchy = (
+            self.handler.result.trade_plan_result.hierarchy_assessment
+        )
+        self.assertEqual(
+            body["hierarchy_assessment"],
+            expected_hierarchy.model_dump(mode="json"),
+        )
+        self.assertEqual(
+            body["hierarchy_assessment"]["primary_condition"],
+            body["interpretation"]["trade_decision"]["market_condition"],
+        )
+        self.assertIn("supporting_groups", body["hierarchy_assessment"])
+        self.assertIn("gate_states", body["hierarchy_assessment"])
         self.assertGreaterEqual(len(body["activities"]), 1)
         self.assertIn(body["debate"]["winner"], ("bullish", "bearish", "neutral"))
 
@@ -888,6 +967,88 @@ class JarvisHttpApiTests(unittest.TestCase):
             "components"
         ]["schemas"]["JarvisDashboardView"]
         self.assertIn("interpretation", dashboard_schema["properties"])
+        self.assertIn(
+            "hierarchy_assessment",
+            dashboard_schema["properties"],
+        )
+
+    def test_authenticated_dashboard_exposes_retained_technical_research(self):
+        session_id, token = self._session()
+        at = datetime.now(IST)
+        operation_id = "operation-retained-research"
+        request = BrowserOperationRequest(
+            operation_id=operation_id,
+            session_id=session_id,
+            idempotency_key="request-retained-research",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            input_channel=InputChannel.TEXT,
+            message="Analyze Reliance for me",
+            requested_at=at,
+        )
+        self.registry.submit(request)
+        self.registry.mark_running(
+            operation_id,
+            at=at + timedelta(seconds=1),
+        )
+        result = self.handler.result
+        retained = MultiTimeframeResearchDivisionResult(
+            use_case_id="jarvis.research_division.v1",
+            market_dataset_id=result.market_dataset_id,
+            fetch=result.fetch,
+            latest_quote=result.latest_quote,
+            technical_review=result.technical_review,
+        )
+        failure = JarvisLLMFailureResponse(
+            code=LLMFailureCode.AUTHENTICATION,
+            title="The Bull agent could not complete its case",
+            display_message="The configured debate credential was rejected.",
+            spoken_message="The Bull agent could not complete its case.",
+            recovery_action="Update the configured debate credential.",
+            retryable=False,
+            operation_id=operation_id,
+        )
+        self.results.save(
+            BrowserOperationOutput(
+                operation_id=operation_id,
+                session_id=session_id,
+                kind=BrowserOperationKind.SWING_ANALYSIS,
+                completed_at=at + timedelta(seconds=2),
+                research_response=JarvisSwingAnalysisResponse.llm_failure(
+                    operation_id=operation_id,
+                    failure=failure,
+                    research_division_result=retained,
+                ),
+                decision_failure=BrowserOperationFailure(
+                    code="llm.authentication",
+                    message=failure.display_message,
+                    retryable=False,
+                ),
+            )
+        )
+        self.registry.mark_completed(
+            operation_id,
+            at=at + timedelta(seconds=2),
+        )
+        path = (
+            f"/api/v1/sessions/{session_id}/operations/"
+            f"{operation_id}/dashboard"
+        )
+
+        self.assertEqual(self.client.get(path).status_code, 401)
+        response = self.client.get(path, headers=self._headers(token))
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            body["schema_version"],
+            "jarvis.technical_research_dashboard.v1",
+        )
+        self.assertFalse(body["conclusion_available"])
+        self.assertEqual(body["symbol"], "RELIANCE-EQ")
+        self.assertEqual(body["daily"]["interval"], "ONE_DAY")
+        self.assertEqual(body["weekly"]["interval"], "ONE_WEEK")
+        self.assertNotIn("debate", body)
+        self.assertNotIn("trade_plan", body)
 
     def test_sse_stream_replays_events_and_finishes_with_terminal_state(self):
         session_id, token = self._session()
@@ -917,6 +1078,246 @@ class JarvisHttpApiTests(unittest.TestCase):
         self.assertIn("event: workflow", response.text)
         self.assertIn("event: terminal", response.text)
         self.assertIn('"status":"completed"', response.text)
+
+    def test_operation_id_returns_complete_authenticated_audit_log(self):
+        session_id, token = self._session()
+        path = f"/api/v1/sessions/{session_id}/operations"
+        self.client.post(
+            path,
+            json=self._operation_body(),
+            headers=self._headers(token),
+        )
+        self._wait_for_status(
+            session_id,
+            token,
+            "operation-1",
+            "completed",
+        )
+
+        missing_auth = self.client.get(f"{path}/operation-1/audit")
+        response = self.client.get(
+            f"{path}/operation-1/audit",
+            headers=self._headers(token),
+        )
+
+        self.assertEqual(missing_auth.status_code, 401)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            body["operation"]["request"]["operation_id"],
+            "operation-1",
+        )
+        self.assertEqual(
+            len(body["events"]),
+            body["operation"]["last_event_sequence"],
+        )
+        self.assertEqual(
+            [event["sequence"] for event in body["events"]],
+            list(range(1, len(body["events"]) + 1)),
+        )
+        self.assertIn("agent_outcomes", body)
+        self.assertTrue(
+            all(
+                outcome["operation_id"] == "operation-1"
+                for outcome in body["agent_outcomes"]
+            )
+        )
+        self.assertEqual(body["result"]["operation_id"], "operation-1")
+
+    def test_audit_shows_committed_package_and_failed_analyst_separately(self):
+        session_id, token = self._session()
+        at = datetime.now(IST)
+        operation_id = "operation-package-analyst-failed"
+        request = BrowserOperationRequest(
+            operation_id=operation_id,
+            session_id=session_id,
+            idempotency_key="request-package-analyst-failed",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            input_channel=InputChannel.TEXT,
+            message="Analyze Coforge and refresh the fundamentals",
+            requested_at=at,
+            fundamentals_requested=True,
+            refresh_requested=True,
+        )
+        self.registry.submit(request)
+        self.registry.mark_running(operation_id, at=at + timedelta(seconds=1))
+        event_times = iter(
+            (at + timedelta(seconds=2), at + timedelta(seconds=3))
+        )
+        emitter = WorkflowEventEmitter(
+            operation_id,
+            self.registry,
+            clock=lambda: next(event_times),
+        )
+        activity = WorkflowActivityDescriptor(
+            activity_id="fundamentals.company.evaluate",
+            participant_id="fundamentals.fundamental_analyst",
+            participant_kind=WorkflowParticipantKind.ANALYST,
+            participant_label="Fundamental Analyst",
+        )
+        emitter.emit(
+            WorkflowStage.ANALYSIS,
+            WorkflowEventState.STARTED,
+            activity=activity,
+        )
+        emitter.emit(
+            WorkflowStage.ANALYSIS,
+            WorkflowEventState.FAILED,
+            activity=activity,
+        )
+        reference = BrowserFundamentalPackageReference(
+            package_id="fundamental_package:" + "a" * 64,
+            manifest_fingerprint="a" * 64,
+            expires_at=at + timedelta(days=10),
+        )
+        debate_failure = JarvisLLMFailureResponse(
+            code=LLMFailureCode.AUTHENTICATION,
+            title="The debate could not start",
+            display_message="The debate credential was rejected.",
+            spoken_message="The debate could not start.",
+            recovery_action="Update the configured credential.",
+            retryable=False,
+            operation_id=operation_id,
+        )
+        self.results.save(
+            BrowserOperationOutput(
+                operation_id=operation_id,
+                session_id=session_id,
+                kind=BrowserOperationKind.SWING_ANALYSIS,
+                completed_at=at + timedelta(seconds=4),
+                research_response=JarvisSwingAnalysisResponse.llm_failure(
+                    operation_id=operation_id,
+                    failure=debate_failure,
+                ),
+                decision_failure=BrowserOperationFailure(
+                    code="llm.authentication",
+                    message=debate_failure.display_message,
+                    retryable=False,
+                ),
+                fundamental_package_reference=reference,
+                fundamental_failure=BrowserOperationFailure(
+                    code="fundamentals.analyst_unavailable",
+                    message="The analyst explanation could not be produced.",
+                    retryable=False,
+                ),
+            )
+        )
+        self.registry.mark_completed(operation_id, at=at + timedelta(seconds=5))
+
+        response = self.client.get(
+            f"/api/v1/sessions/{session_id}/operations/{operation_id}/audit",
+            headers=self._headers(token),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        publication = body["fundamental_package_publication"]
+        self.assertEqual(publication["status"], "committed")
+        self.assertEqual(publication["reference"]["package_id"], reference.package_id)
+        outcomes = {
+            item["participant_id"]: item for item in body["agent_outcomes"]
+        }
+        self.assertEqual(
+            outcomes["fundamentals.fundamental_analyst"]["status"],
+            "failed",
+        )
+        self.assertEqual(
+            outcomes["fundamentals.fundamental_analyst"]["failure"]["code"],
+            "fundamentals.analyst_unavailable",
+        )
+
+    def test_failed_operation_audit_identifies_exact_agent(self):
+        session_id, token = self._session()
+        requested_at = datetime.now(IST)
+        request = BrowserOperationRequest(
+            operation_id="operation-debate-failed",
+            session_id=session_id,
+            idempotency_key="request-debate-failed",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            input_channel=InputChannel.TEXT,
+            message="Analyze Coforge for me",
+            requested_at=requested_at,
+        )
+        self.registry.submit(request)
+        self.registry.mark_running(
+            request.operation_id,
+            at=requested_at + timedelta(seconds=1),
+        )
+        event_times = iter(
+            (
+                requested_at + timedelta(seconds=2),
+                requested_at + timedelta(seconds=3),
+                requested_at + timedelta(seconds=4),
+            )
+        )
+        emitter = WorkflowEventEmitter(
+            request.operation_id,
+            self.registry,
+            clock=lambda: next(event_times),
+        )
+        emitter.emit(
+            WorkflowStage.BULL_DEBATING,
+            WorkflowEventState.STARTED,
+            round_number=1,
+        )
+        emitter.emit(
+            WorkflowStage.BULL_DEBATING,
+            WorkflowEventState.FAILED,
+            round_number=1,
+        )
+        emitter.emit(WorkflowStage.FAILED, WorkflowEventState.FAILED)
+        self.registry.mark_failed(
+            request.operation_id,
+            BrowserOperationFailure(
+                code="llm.authentication",
+                message="The debate provider rejected its credential.",
+                retryable=False,
+            ),
+            at=requested_at + timedelta(seconds=5),
+        )
+
+        response = self.client.get(
+            (
+                f"/api/v1/sessions/{session_id}/operations/"
+                f"{request.operation_id}/audit"
+            ),
+            headers=self._headers(token),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["operation"]["status"], "failed")
+        self.assertIsNone(body["result"])
+        failed_agents = [
+            event["activity"]["participant_id"]
+            for event in body["events"]
+            if event["state"] == "failed"
+            and event["activity"]["participant_kind"]
+            in {"analyst", "advocate", "judge", "presenter"}
+        ]
+        self.assertEqual(failed_agents, ["debate.bull"])
+        outcomes = {
+            item["invocation_id"]: item for item in body["agent_outcomes"]
+        }
+        self.assertEqual(
+            outcomes["debate.bull:round:1"]["status"],
+            "failed",
+        )
+        self.assertEqual(
+            outcomes["debate.bull:round:1"]["failure"]["code"],
+            "llm.authentication",
+        )
+        for invocation_id in (
+            "debate.bear:round:1",
+            "judge.debate",
+            "research.trade_planner",
+            "jarvis.presenter",
+        ):
+            with self.subTest(invocation_id=invocation_id):
+                self.assertEqual(
+                    outcomes[invocation_id]["status"],
+                    "skipped_dependency",
+                )
 
     def test_sse_reconnect_cursor_avoids_duplicate_events(self):
         session_id, token = self._session()

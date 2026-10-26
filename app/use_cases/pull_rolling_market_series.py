@@ -1,6 +1,8 @@
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Event, RLock
 from typing import Protocol, runtime_checkable
 from zoneinfo import ZoneInfo
 
@@ -20,6 +22,16 @@ from app.services.market_data import MarketDataService
 
 _EXCHANGE_TIMEZONE = ZoneInfo("Asia/Kolkata")
 _ANGEL_DATE_FORMAT = "%Y-%m-%d %H:%M"
+_BROKER_MAX_DAYS_PER_REQUEST = {
+    "ONE_MINUTE": 30,
+    "THREE_MINUTE": 60,
+    "FIVE_MINUTE": 100,
+    "TEN_MINUTE": 100,
+    "FIFTEEN_MINUTE": 200,
+    "THIRTY_MINUTE": 200,
+    "ONE_HOUR": 400,
+    "ONE_DAY": 2_000,
+}
 _INTRADAY_INTERVAL_MINUTES = {
     "ONE_MINUTE": 1,
     "THREE_MINUTE": 3,
@@ -75,12 +87,20 @@ class RollingFetchConfig(TechnicalModel):
         allow_inf_nan=False,
     )
 
-    max_days_per_chunk: int = Field(default=30, ge=1)
+    max_days_per_chunk: int | None = Field(default=None, ge=1)
     inter_request_delay_seconds: float = Field(default=1.0, ge=0)
-    default_lookback_days: int = Field(default=365, ge=1)
+    # 3,653 days is at least ten calendar years across leap-year layouts.
+    default_lookback_days: int = Field(default=3_653, ge=1)
     # Seven calendar days normally cover five recent trading sessions
     # without requiring an exchange-holiday calendar at this layer.
     correction_overlap_days: int = Field(default=7, ge=0, le=30)
+
+
+@dataclass
+class _MarketPullFlight:
+    completed: Event
+    result: RollingFetchReceipt | None = None
+    error: Exception | None = None
 
 
 class PullRollingMarketSeries:
@@ -104,6 +124,8 @@ class PullRollingMarketSeries:
         self._archive = archive
         self.config = config or RollingFetchConfig()
         self._sleep_fn = sleep_fn
+        self._flight_lock = RLock()
+        self._inflight: dict[tuple[str, ...], _MarketPullFlight] = {}
 
     def execute(
         self,
@@ -118,6 +140,58 @@ class PullRollingMarketSeries:
             to_date.tzinfo is None or to_date.utcoffset() is None
         ):
             raise ValueError("to_date must include timezone information")
+        flight_key = (
+            exchange.strip().upper(),
+            symbol_token.strip(),
+            symbol.strip().upper(),
+            interval.strip().upper(),
+            to_date.astimezone(UTC).isoformat() if to_date else "latest",
+        )
+        with self._flight_lock:
+            flight = self._inflight.get(flight_key)
+            is_leader = flight is None
+            if flight is None:
+                flight = _MarketPullFlight(completed=Event())
+                self._inflight[flight_key] = flight
+
+        if not is_leader:
+            flight.completed.wait()
+            if flight.error is not None:
+                raise flight.error
+            if flight.result is None:
+                raise RuntimeError(
+                    "completed market pull did not publish a result"
+                )
+            return flight.result.model_copy(deep=True)
+
+        try:
+            result = self._execute_once(
+                exchange=exchange,
+                symbol_token=symbol_token,
+                symbol=symbol,
+                interval=interval,
+                to_date=to_date,
+            )
+        except Exception as exc:
+            flight.error = exc
+            raise
+        else:
+            flight.result = result
+            return result
+        finally:
+            with self._flight_lock:
+                self._inflight.pop(flight_key, None)
+                flight.completed.set()
+
+    def _execute_once(
+        self,
+        *,
+        exchange: str,
+        symbol_token: str,
+        symbol: str,
+        interval: str,
+        to_date: datetime | None,
+    ) -> RollingFetchReceipt:
         effective_to_date = to_date or datetime.now(UTC)
 
         previous_stored, resumed_from = self._resume_point(
@@ -129,19 +203,30 @@ class PullRollingMarketSeries:
         previous_series = (
             previous_stored.series if previous_stored is not None else None
         )
-        from_date = (
-            resumed_from
-            - timedelta(days=self.config.correction_overlap_days)
-            if resumed_from is not None
-            else effective_to_date
-            - timedelta(days=self.config.default_lookback_days)
+        target_history_start = effective_to_date - timedelta(
+            days=self.config.default_lookback_days
+        )
+        request_ranges = _history_request_ranges(
+            previous_series=previous_series,
+            resumed_from=resumed_from,
+            target_history_start=target_history_start,
+            effective_to_date=effective_to_date,
+            correction_overlap_days=self.config.correction_overlap_days,
         )
 
-        windows = _chunk_windows(
-            from_date,
-            effective_to_date,
+        max_days_per_chunk = _resolved_max_days_per_chunk(
+            interval,
             self.config.max_days_per_chunk,
         )
+        windows = [
+            window
+            for request_start, request_end in request_ranges
+            for window in _chunk_windows(
+                request_start,
+                request_end,
+                max_days_per_chunk,
+            )
+        ]
 
         fetched_candles: list[Candle] = []
         fetched_source: str | None = None
@@ -203,6 +288,13 @@ class PullRollingMarketSeries:
         if unchanged:
             stored = previous_stored
         else:
+            history_requested_from, history_requested_to = (
+                _updated_history_coverage(
+                    previous_series=previous_series,
+                    target_history_start=target_history_start,
+                    effective_to_date=effective_to_date,
+                )
+            )
             merged_series = HistoricalCandleSeries(
                 exchange=exchange,
                 symbol_token=symbol_token,
@@ -218,8 +310,31 @@ class PullRollingMarketSeries:
                         else "angel_one"
                     )
                 ),
+                history_requested_from=history_requested_from,
+                history_requested_to=history_requested_to,
             )
             stored = self._archive.archive_market_series(merged_series)
+
+        if unchanged and previous_series is not None:
+            coverage_from, coverage_to = _updated_history_coverage(
+                previous_series=previous_series,
+                target_history_start=target_history_start,
+                effective_to_date=effective_to_date,
+            )
+            coverage_changed = (
+                previous_series.history_requested_from != coverage_from
+                or previous_series.history_requested_to != coverage_to
+            )
+            if coverage_changed:
+                merged_series = previous_series.model_copy(
+                    update={
+                        "retrieved_at": checked_at,
+                        "history_requested_from": coverage_from,
+                        "history_requested_to": coverage_to,
+                    }
+                )
+                stored = self._archive.archive_market_series(merged_series)
+                unchanged = False
 
         return RollingFetchReceipt(
             use_case_id=self.use_case_id,
@@ -232,7 +347,11 @@ class PullRollingMarketSeries:
             ),
             chunk_request_count=len(windows),
             resumed_from=resumed_from,
-            requested_from=from_date,
+            requested_from=(
+                min(start for start, _ in request_ranges)
+                if request_ranges
+                else None
+            ),
             requested_to=effective_to_date,
             checked_at=checked_at,
             reused_existing_dataset=unchanged,
@@ -269,14 +388,17 @@ class PullRollingMarketSeries:
         candidates = [
             summary
             for summary in summaries
-            if summary.last_candle_at and summary.symbol == symbol
+            if summary.symbol == symbol
         ]
         if not candidates:
             return None, None
 
         latest_summary = max(
             candidates,
-            key=lambda summary: summary.last_candle_at,
+            key=lambda summary: (
+                summary.last_candle_at or summary.stored_at,
+                summary.stored_at,
+            ),
         )
         stored = self._archive.get_market_series(latest_summary.dataset_id)
         return stored, latest_summary.last_candle_at
@@ -295,6 +417,89 @@ def _chunk_windows(
         windows.append((current_start, current_end))
         current_start = current_end
     return windows
+
+
+def _history_request_ranges(
+    *,
+    previous_series: HistoricalCandleSeries | None,
+    resumed_from: datetime | None,
+    target_history_start: datetime,
+    effective_to_date: datetime,
+    correction_overlap_days: int,
+) -> tuple[tuple[datetime, datetime], ...]:
+    if previous_series is None:
+        return ((target_history_start, effective_to_date),)
+
+    ranges: list[tuple[datetime, datetime]] = []
+    known_coverage_start = previous_series.history_requested_from
+    if known_coverage_start is None:
+        known_coverage_start = (
+            previous_series.candles[0].timestamp
+            if previous_series.candles
+            else effective_to_date
+        )
+    if target_history_start < known_coverage_start:
+        ranges.append((target_history_start, known_coverage_start))
+
+    recent_anchor = resumed_from or previous_series.history_requested_to
+    if recent_anchor is None:
+        return ((target_history_start, effective_to_date),)
+    recent_start = recent_anchor - timedelta(days=correction_overlap_days)
+    ranges.append((recent_start, effective_to_date))
+    return _merge_request_ranges(ranges)
+
+
+def _merge_request_ranges(
+    ranges: list[tuple[datetime, datetime]],
+) -> tuple[tuple[datetime, datetime], ...]:
+    ordered = sorted(
+        (start, end) for start, end in ranges if start < end
+    )
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in ordered:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+    return tuple(merged)
+
+
+def _updated_history_coverage(
+    *,
+    previous_series: HistoricalCandleSeries | None,
+    target_history_start: datetime,
+    effective_to_date: datetime,
+) -> tuple[datetime, datetime]:
+    if (
+        previous_series is None
+        or previous_series.history_requested_from is None
+        or previous_series.history_requested_to is None
+    ):
+        return target_history_start, effective_to_date
+    if target_history_start < previous_series.history_requested_from:
+        return (
+            target_history_start,
+            max(effective_to_date, previous_series.history_requested_to),
+        )
+    return (
+        previous_series.history_requested_from,
+        previous_series.history_requested_to,
+    )
+
+
+def _resolved_max_days_per_chunk(
+    interval: str,
+    configured_max_days: int | None,
+) -> int:
+    broker_max_days = _BROKER_MAX_DAYS_PER_REQUEST.get(interval.upper())
+    if broker_max_days is None:
+        raise ValueError(
+            "rolling fetch interval has no configured broker range policy"
+        )
+    if configured_max_days is None:
+        return broker_max_days
+    return min(configured_max_days, broker_max_days)
 
 
 def _merge_candles(

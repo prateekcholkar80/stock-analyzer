@@ -197,6 +197,71 @@ export type SetupStepState =
   | "invalidated"
   | "unavailable";
 
+export type MarketCondition =
+  | "bullish"
+  | "neutral"
+  | "bearish"
+  | "conflicted"
+  | "insufficient";
+
+export type EvidenceFamily =
+  | "market_structure"
+  | "price_location"
+  | "participation"
+  | "trend_confirmation"
+  | "momentum_confirmation"
+  | "cpr_context"
+  | "candlestick_context"
+  | "volatility_context"
+  | "fundamental_health"
+  | "entry_trigger"
+  | "risk_target_feasibility";
+
+export type EvidenceFamilyState =
+  | "bullish"
+  | "neutral"
+  | "bearish"
+  | "conflicted"
+  | "pass"
+  | "fail"
+  | "not_applicable"
+  | "insufficient";
+
+export type EvidenceCorrelationGroup =
+  | "market_structure"
+  | "price_context"
+  | "participation"
+  | "ohlc_derived_confirmation"
+  | "fundamental"
+  | "entry"
+  | "risk";
+
+export type EvidenceFamilyFinding = {
+  family: EvidenceFamily;
+  state: EvidenceFamilyState;
+  evidence_ids: string[];
+  rationale: string;
+};
+
+export type EvidenceCorrelationAssessment = {
+  correlation_group: EvidenceCorrelationGroup;
+  families: EvidenceFamily[];
+  condition: MarketCondition;
+  evidence_ids: string[];
+};
+
+export type HierarchicalEvidenceAssessment = {
+  schema_version: "jarvis.evidence_hierarchy_assessment.v1";
+  primary_condition: MarketCondition;
+  supporting_groups: EvidenceCorrelationAssessment[];
+  gate_states: EvidenceFamilyFinding[];
+  blocking_families: EvidenceFamily[];
+  not_applicable_families: EvidenceFamily[];
+  release_eligible: boolean;
+  evidence_ids: string[];
+  rationale: string;
+};
+
 export type DashboardSetupStep = {
   step_id: string;
   label: string;
@@ -222,12 +287,7 @@ export type DashboardTimeframeInterpretation = {
   timeframe: "daily" | "weekly";
   interval: string;
   evaluated_at: string;
-  market_condition:
-    | "bullish"
-    | "neutral"
-    | "bearish"
-    | "conflicted"
-    | "insufficient";
+  market_condition: MarketCondition;
   bullish_setup: DashboardSwingSetup;
   bearish_setup: DashboardSwingSetup;
   decisive_evidence_ids: string[];
@@ -272,12 +332,7 @@ export type DashboardMultiTimeframeInterpretation = {
     target_3r: RewardRiskTargetInterpretation;
   };
   trade_decision: {
-    market_condition:
-      | "bullish"
-      | "neutral"
-      | "bearish"
-      | "conflicted"
-      | "insufficient";
+    market_condition: MarketCondition;
     decision: "buy" | "no_trade";
     no_trade_reasons: string[];
     rationale: string;
@@ -288,15 +343,28 @@ export type DashboardMultiTimeframeInterpretation = {
   interpreted_at: string;
 };
 
-export type Dashboard = {
+type DashboardTechnicalBase = {
+  operation_id: string;
+  session_id: string;
   symbol: string;
+  symbol_token: string;
   exchange: string;
   completed_at: string;
   source_retrieved_at: string;
   latest_quote: DashboardQuote | null;
   refresh: RefreshProvenance;
+  package_fingerprint: string;
   daily: TimeframePanel;
   weekly: TimeframePanel;
+};
+
+export type TechnicalResearchDashboard = DashboardTechnicalBase & {
+  schema_version: "jarvis.technical_research_dashboard.v1";
+  conclusion_available: false;
+};
+
+export type Dashboard = DashboardTechnicalBase & {
+  schema_version: "jarvis.dashboard.v1";
   debate: {
     winner: string;
     confidence_percentage: number;
@@ -317,6 +385,8 @@ export type Dashboard = {
     target_2r_price: number | null;
     target_3r_price: number | null;
   };
+  /** Exact deterministic hierarchy released by the backend; null for legacy results. */
+  hierarchy_assessment?: HierarchicalEvidenceAssessment | null;
   /** Additive field: absent/null when reading a pre-interpretation result. */
   interpretation?: DashboardMultiTimeframeInterpretation | null;
   presentation: {
@@ -329,3 +399,11 @@ export type Dashboard = {
     summary?: string;
   } | null;
 };
+
+export type DashboardResponse = Dashboard | TechnicalResearchDashboard;
+
+export function isTechnicalResearchDashboard(
+  dashboard: DashboardResponse,
+): dashboard is TechnicalResearchDashboard {
+  return dashboard.schema_version === "jarvis.technical_research_dashboard.v1";
+}

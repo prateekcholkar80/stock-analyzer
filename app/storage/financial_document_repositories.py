@@ -42,6 +42,20 @@ class StructuredFinancialDocumentRepository(Protocol):
         """Atomically replace one scoped entry with newer validated content."""
         ...
 
+    def replace_structured_financial_document_package(
+        self,
+        stored: tuple[StoredStructuredFinancialDocument, ...],
+        *,
+        scope: StructuredDocumentRepositoryScope,
+    ) -> tuple[StoredStructuredFinancialDocument, ...]:
+        """Atomically replace a complete, single-company document package.
+
+        Implementations must validate every candidate and all package-level
+        conflicts before changing active state. Any failure must leave every
+        previously active document unchanged.
+        """
+        ...
+
     def get_structured_financial_document(
         self,
         key: StructuredDocumentCacheKey,

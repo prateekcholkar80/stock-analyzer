@@ -23,6 +23,12 @@ from app.models.financial_documents import (
     StructuredFinancialDocument,
     StructuredPeerComparisonDocument,
 )
+from app.models.fundamental_filings import (
+    FundamentalFilingArtifactManifest,
+    FundamentalFilingCategory,
+    FundamentalFilingDiscoverySnapshot,
+    FundamentalFilingReference,
+)
 from app.models.fundamentals import (
     FundamentalEvidenceSnapshot,
     FundamentalIssuerIdentity,
@@ -65,6 +71,8 @@ class FundamentalCapability(StrEnum):
     COMPANY_OVERVIEW = "company_overview"
     FINANCIAL_STATEMENTS = "financial_statements"
     SHAREHOLDING_HISTORY = "shareholding_history"
+    FILING_DISCOVERY = "filing_discovery"
+    FILING_ACQUISITION = "filing_acquisition"
 
 
 class FundamentalCapabilityStatus(StrEnum):
@@ -105,7 +113,7 @@ class FundamentalCapabilityDescriptor(FundamentalModel):
 
     capability: FundamentalCapability
     status: FundamentalCapabilityStatus
-    read_only: Literal[True] = True
+    read_only: bool = True
     idempotent: Literal[True] = True
     supports_history: bool
     max_periods: int | None = Field(default=None, ge=1, le=120)
@@ -120,6 +128,12 @@ class FundamentalCapabilityDescriptor(FundamentalModel):
 
     @model_validator(mode="after")
     def validate_history_contract(self) -> Self:
+        if (
+            self.capability is FundamentalCapability.FILING_ACQUISITION
+        ) != (not self.read_only):
+            raise ValueError(
+                "only filing acquisition may be non-read-only"
+            )
         if not self.supports_history and self.max_periods is not None:
             raise ValueError(
                 "non-historical capability cannot advertise max periods"
@@ -385,12 +399,75 @@ class FundamentalStructuredDocumentRequest(FundamentalIssuerEvidenceRequest):
     reporting_basis: FinancialReportingBasis
 
 
+class FundamentalFinancialDocumentPackageRequest(
+    FundamentalIssuerEvidenceRequest
+):
+    """Request every required financial document from one provider snapshot."""
+
+    capability: Literal[FundamentalCapability.FINANCIAL_STATEMENTS] = (
+        FundamentalCapability.FINANCIAL_STATEMENTS
+    )
+
+
 class FundamentalShareholdingRequest(FundamentalIssuerEvidenceRequest):
     capability: Literal[FundamentalCapability.SHAREHOLDING_HISTORY] = (
         FundamentalCapability.SHAREHOLDING_HISTORY
     )
     quarters: int = Field(default=8, ge=1, le=40)
     include_promoter_pledge: bool = True
+
+
+class FundamentalFilingDiscoveryRequest(FundamentalGatewayRequest):
+    """Discover bounded filing references for one verified issuer."""
+
+    capability: Literal[FundamentalCapability.FILING_DISCOVERY] = (
+        FundamentalCapability.FILING_DISCOVERY
+    )
+    issuer: FundamentalIssuerIdentity
+    categories: tuple[FundamentalFilingCategory, ...] = (
+        FundamentalFilingCategory.EARNINGS_RELEASE,
+        FundamentalFilingCategory.CONFERENCE_CALL,
+    )
+    from_fiscal_year: int | None = Field(default=None, ge=1900, le=2200)
+    through_date: date
+    max_documents: int = Field(default=200, ge=1, le=500)
+
+    @field_validator("categories")
+    @classmethod
+    def validate_categories(
+        cls,
+        values: tuple[FundamentalFilingCategory, ...],
+    ) -> tuple[FundamentalFilingCategory, ...]:
+        if not values or len(values) != len(set(values)):
+            raise ValueError("filing discovery categories must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def validate_discovery_window(self) -> Self:
+        if self.through_date > self.requested_at.date():
+            raise ValueError("filing discovery cannot request a future date")
+        return self
+
+
+class FundamentalFilingAcquisitionRequest(FundamentalGatewayRequest):
+    """Acquire one exact reference from a validated discovery snapshot."""
+
+    capability: Literal[FundamentalCapability.FILING_ACQUISITION] = (
+        FundamentalCapability.FILING_ACQUISITION
+    )
+    issuer: FundamentalIssuerIdentity
+    reference: FundamentalFilingReference
+    discovery_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_reference_scope(self) -> Self:
+        if self.reference.connection != self.connection:
+            raise ValueError("filing acquisition connection does not match")
+        if self.reference.issuer != self.issuer:
+            raise ValueError("filing acquisition issuer does not match")
+        if self.reference.discovered_at > self.requested_at:
+            raise ValueError("filing acquisition cannot predate discovery")
+        return self
 
 
 class FundamentalIssuerCandidate(FundamentalModel):
@@ -698,6 +775,127 @@ class FundamentalStructuredDocumentResult(FundamentalGatewayResponse):
         return sha256(payload.encode("utf-8")).hexdigest()
 
 
+class FundamentalFinancialDocumentPackage(FundamentalModel):
+    """Immutable provider-neutral set of all required financial documents."""
+
+    schema_version: Literal["jarvis.financial_document_package.v1"] = (
+        "jarvis.financial_document_package.v1"
+    )
+    connection: ProviderConnectionScope
+    issuer: FundamentalIssuerIdentity
+    source_location: str = Field(min_length=1, max_length=2_000)
+    retrieved_at: datetime
+    expires_at: datetime
+    documents: tuple[StructuredFinancialDocument, ...] = Field(
+        min_length=11,
+        max_length=11,
+    )
+
+    @field_validator("retrieved_at", "expires_at")
+    @classmethod
+    def validate_package_time(cls, value: datetime) -> datetime:
+        return _require_timezone(value, "financial package time")
+
+    @model_validator(mode="after")
+    def validate_package(self) -> Self:
+        if self.expires_at <= self.retrieved_at:
+            raise ValueError("financial package expiry must follow retrieval")
+        expected_scenarios = {
+            (
+                FinancialDocumentType.GROWTH_TABLE,
+                FinancialReportingBasis.NOT_APPLICABLE,
+            ),
+            *(
+                (document_type, reporting_basis)
+                for document_type in (
+                    FinancialDocumentType.BALANCE_SHEET,
+                    FinancialDocumentType.PROFIT_AND_LOSS,
+                    FinancialDocumentType.CASH_FLOW,
+                    FinancialDocumentType.RATIOS,
+                    FinancialDocumentType.QUARTERLY_RESULTS,
+                )
+                for reporting_basis in (
+                    FinancialReportingBasis.CONSOLIDATED,
+                    FinancialReportingBasis.STANDALONE,
+                )
+            ),
+        }
+        scenarios = tuple(
+            (document.document_type, document.reporting_basis)
+            for document in self.documents
+        )
+        if len(scenarios) != len(set(scenarios)):
+            raise ValueError("financial package scenarios must be unique")
+        if set(scenarios) != expected_scenarios:
+            raise ValueError("financial package is incomplete")
+        for document in self.documents:
+            if document.connection != self.connection:
+                raise ValueError("financial package mixes connection scopes")
+            if document.issuer != self.issuer:
+                raise ValueError("financial package mixes issuer identities")
+            if document.source_location != self.source_location:
+                raise ValueError("financial package mixes source locations")
+            if document.retrieved_at != self.retrieved_at:
+                raise ValueError("financial package mixes retrieval snapshots")
+            if document.expires_at != self.expires_at:
+                raise ValueError("financial package mixes expiry boundaries")
+        return self
+
+    @computed_field
+    @property
+    def package_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"package_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
+class FundamentalFinancialDocumentPackageResult(FundamentalGatewayResponse):
+    """All-or-nothing provider-neutral financial package result."""
+
+    capability: Literal[FundamentalCapability.FINANCIAL_STATEMENTS] = (
+        FundamentalCapability.FINANCIAL_STATEMENTS
+    )
+    issuer: FundamentalIssuerIdentity
+    status: FundamentalRetrievalStatus
+    package: FundamentalFinancialDocumentPackage | None = None
+    limitations: tuple[str, ...] = ()
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_package_limitations(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if any(not value or len(value) > 500 for value in values):
+            raise ValueError("package limitations must be non-blank and bounded")
+        return _require_unique_strings(values, "package limitations")
+
+    @model_validator(mode="after")
+    def validate_package_result(self) -> Self:
+        completed = self.status is FundamentalRetrievalStatus.COMPLETED
+        if completed and self.package is None:
+            raise ValueError("completed package retrieval requires a package")
+        if completed and self.limitations:
+            raise ValueError("completed package retrieval cannot be partial")
+        if not completed and self.package is not None:
+            raise ValueError("failed package retrieval cannot release a package")
+        if not completed and not self.limitations:
+            raise ValueError("failed package retrieval requires an explanation")
+        if self.package is not None:
+            if self.package.connection != self.connection:
+                raise ValueError("package and result connection scopes must match")
+            if self.package.issuer != self.issuer:
+                raise ValueError("package and result issuers must match")
+            if self.package.retrieved_at > self.completed_at:
+                raise ValueError("package cannot be retrieved after completion")
+        return self
+
+    @computed_field
+    @property
+    def result_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"result_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
 class FundamentalPeerComparisonResult(FundamentalGatewayResponse):
     """All-or-nothing provider-neutral Peer Comparison result."""
 
@@ -819,6 +1017,105 @@ class FundamentalBenchmarkingFinancialsResult(FundamentalGatewayResponse):
         return sha256(payload.encode("utf-8")).hexdigest()
 
 
+class FundamentalFilingDiscoveryResult(FundamentalGatewayResponse):
+    """All-or-nothing provider-neutral filing discovery result."""
+
+    capability: Literal[FundamentalCapability.FILING_DISCOVERY] = (
+        FundamentalCapability.FILING_DISCOVERY
+    )
+    issuer: FundamentalIssuerIdentity
+    status: FundamentalRetrievalStatus
+    discovery: FundamentalFilingDiscoverySnapshot | None = None
+    limitations: tuple[str, ...] = ()
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not value or len(value) > 500 for value in values):
+            raise ValueError(
+                "filing discovery limitations must be non-blank and bounded"
+            )
+        return _require_unique_strings(values, "filing discovery limitations")
+
+    @model_validator(mode="after")
+    def validate_discovery_result(self) -> Self:
+        completed = self.status is FundamentalRetrievalStatus.COMPLETED
+        if completed and self.discovery is None:
+            raise ValueError("completed filing discovery requires a snapshot")
+        if completed and self.limitations:
+            raise ValueError("completed filing discovery cannot be partial")
+        if not completed and self.discovery is not None:
+            raise ValueError("failed filing discovery cannot release a snapshot")
+        if not completed and not self.limitations:
+            raise ValueError("failed filing discovery requires an explanation")
+        if self.discovery is not None:
+            if self.discovery.connection != self.connection:
+                raise ValueError("filing discovery connection scopes must match")
+            if self.discovery.issuer != self.issuer:
+                raise ValueError("filing discovery issuers must match")
+            if self.discovery.discovered_at > self.completed_at:
+                raise ValueError("filing discovery cannot follow completion")
+            if (
+                self.discovery.validation_status
+                is not FundamentalValidationStatus.VALIDATED
+            ):
+                raise ValueError("completed filing discovery must be validated")
+        return self
+
+    @computed_field
+    @property
+    def result_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"result_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
+class FundamentalFilingAcquisitionResult(FundamentalGatewayResponse):
+    """All-or-nothing result for one validated durable filing artifact."""
+
+    capability: Literal[FundamentalCapability.FILING_ACQUISITION] = (
+        FundamentalCapability.FILING_ACQUISITION
+    )
+    issuer: FundamentalIssuerIdentity
+    status: FundamentalRetrievalStatus
+    artifact: FundamentalFilingArtifactManifest | None = None
+    limitations: tuple[str, ...] = ()
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not value or len(value) > 500 for value in values):
+            raise ValueError(
+                "filing acquisition limitations must be non-blank and bounded"
+            )
+        return _require_unique_strings(values, "filing acquisition limitations")
+
+    @model_validator(mode="after")
+    def validate_acquisition_result(self) -> Self:
+        completed = self.status is FundamentalRetrievalStatus.COMPLETED
+        if completed and self.artifact is None:
+            raise ValueError("completed filing acquisition requires an artifact")
+        if completed and self.limitations:
+            raise ValueError("completed filing acquisition cannot be partial")
+        if not completed and self.artifact is not None:
+            raise ValueError("failed filing acquisition cannot release an artifact")
+        if not completed and not self.limitations:
+            raise ValueError("failed filing acquisition requires an explanation")
+        if self.artifact is not None:
+            if self.artifact.reference.connection != self.connection:
+                raise ValueError("filing artifact connection scopes must match")
+            if self.artifact.reference.issuer != self.issuer:
+                raise ValueError("filing artifact issuers must match")
+            if self.artifact.downloaded_at > self.completed_at:
+                raise ValueError("filing acquisition cannot follow completion")
+        return self
+
+    @computed_field
+    @property
+    def result_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"result_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
 def validate_fundamental_response_binding(
     request: FundamentalGatewayRequest,
     response: FundamentalGatewayResponse,
@@ -846,6 +1143,14 @@ def validate_fundamental_response_binding(
             raise ValueError(
                 "structured-document response reporting basis does not match"
             )
+    if isinstance(request, FundamentalFinancialDocumentPackageRequest):
+        if not isinstance(
+            response,
+            FundamentalFinancialDocumentPackageResult,
+        ):
+            raise ValueError("financial-package request requires its result type")
+        if response.issuer != request.issuer:
+            raise ValueError("financial-package response issuer does not match")
     if isinstance(response, FundamentalPeerComparisonResult):
         if not isinstance(request, FundamentalCompanyOverviewRequest):
             raise ValueError(
@@ -862,6 +1167,28 @@ def validate_fundamental_response_binding(
             raise ValueError(
                 "Benchmarking Financials response issuer does not match"
             )
+    if isinstance(request, FundamentalFilingDiscoveryRequest):
+        if not isinstance(response, FundamentalFilingDiscoveryResult):
+            raise ValueError("filing discovery request requires its result type")
+        if response.issuer != request.issuer:
+            raise ValueError("filing discovery response issuer does not match")
+        if response.discovery is not None and (
+            response.discovery.categories != request.categories
+            or response.discovery.from_fiscal_year != request.from_fiscal_year
+            or response.discovery.through_date != request.through_date
+            or response.discovery.max_documents != request.max_documents
+        ):
+            raise ValueError("filing discovery response scope does not match")
+    if isinstance(request, FundamentalFilingAcquisitionRequest):
+        if not isinstance(response, FundamentalFilingAcquisitionResult):
+            raise ValueError("filing acquisition request requires its result type")
+        if response.issuer != request.issuer:
+            raise ValueError("filing acquisition response issuer does not match")
+        if (
+            response.artifact is not None
+            and response.artifact.reference != request.reference
+        ):
+            raise ValueError("filing acquisition artifact does not match request")
 
 
 @runtime_checkable
@@ -934,6 +1261,22 @@ class FundamentalStructuredDocumentGateway(Protocol):
 
 
 @runtime_checkable
+class FundamentalFinancialDocumentPackageGateway(Protocol):
+    """Single-snapshot boundary used by complete financial refreshes."""
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        ...
+
+    def retrieve_financial_document_package(
+        self,
+        *,
+        request: FundamentalFinancialDocumentPackageRequest,
+    ) -> FundamentalFinancialDocumentPackageResult:
+        ...
+
+
+@runtime_checkable
 class FundamentalPeerComparisonGateway(Protocol):
     """Narrow provider-neutral boundary for Peer Comparison retrieval."""
 
@@ -962,4 +1305,27 @@ class FundamentalBenchmarkingFinancialsGateway(Protocol):
         *,
         request: FundamentalCompanyOverviewRequest,
     ) -> FundamentalBenchmarkingFinancialsResult:
+        ...
+
+
+@runtime_checkable
+class FundamentalFilingGateway(Protocol):
+    """Provider-neutral boundary for filing discovery and acquisition."""
+
+    @property
+    def configuration_fingerprint(self) -> str:
+        ...
+
+    def discover_filings(
+        self,
+        *,
+        request: FundamentalFilingDiscoveryRequest,
+    ) -> FundamentalFilingDiscoveryResult:
+        ...
+
+    def acquire_filing(
+        self,
+        *,
+        request: FundamentalFilingAcquisitionRequest,
+    ) -> FundamentalFilingAcquisitionResult:
         ...

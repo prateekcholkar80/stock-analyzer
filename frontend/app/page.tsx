@@ -11,14 +11,18 @@ import {
 } from "react";
 
 import { TechnicalChart } from "@/components/TechnicalChart";
+import { EvidenceHierarchyPanel } from "@/components/EvidenceHierarchyPanel";
 import { ExecutiveBriefing } from "@/components/ExecutiveBriefing";
+import { FundamentalAnalystBriefing } from "@/components/FundamentalAnalystBriefing";
 import { HolographicAgent } from "@/components/HolographicAgent";
-import type {
-  Dashboard,
-  DashboardQuote,
-  DashboardSwingSetup,
-  DashboardTimeframeInterpretation,
-  TimeframePanel,
+import {
+  isTechnicalResearchDashboard,
+  type DashboardResponse,
+  type Dashboard,
+  type DashboardQuote,
+  type DashboardSwingSetup,
+  type DashboardTimeframeInterpretation,
+  type TimeframePanel,
 } from "@/lib/dashboard";
 import {
   SETUP_STATE_META,
@@ -48,6 +52,20 @@ import {
 import { AGENT_VISUALS, type AgentVisualSpec } from "@/lib/agent-visuals";
 import { NeuralAudioEngine } from "@/lib/neural-audio";
 import {
+  parseAgentExecutionOutcomes,
+  parseFundamentalPackagePublication,
+  type AgentExecutionOutcome,
+  type FundamentalPackagePublication,
+  type OperationAudit,
+  type OperationDecisionFailure,
+} from "@/lib/operation-audit";
+import {
+  parseFundamentalAnalysis,
+  parseFundamentalPackageReference,
+  type FundamentalAnalysis,
+  type FundamentalPackageReference,
+} from "@/lib/fundamental-analysis";
+import {
   fetchBenchmarkingFinancials,
   fetchStructuredFinancialDocument,
   type BenchmarkingFinancialsDocumentResponse,
@@ -58,16 +76,27 @@ import {
 
 import {
   MATRIX_STEPS,
+  agentOutcomeProgress,
   matchesBear,
+  matchesBearOutcome,
   matchesBull,
+  matchesBullOutcome,
   matchesDaily,
+  matchesDailyOutcome,
   matchesEvidence,
+  matchesEvidenceOutcome,
+  matchesFundamental,
+  matchesFundamentalOutcome,
   matchesBriefing,
+  matchesBriefingOutcome,
   matchesJudge,
+  matchesJudgeOutcome,
   matchesMarket,
   matchesWeekly,
+  matchesWeeklyOutcome,
   timeframeLabel,
   workflowProgress,
+  type AgentOutcomeMatcher,
   type ProgressStatus,
   type WorkflowActivity,
   type WorkflowMatcher,
@@ -106,12 +135,13 @@ type OperationTerminal = {
 type OperationStatus = "standby" | "queued" | "running" | "completed" | "failed" | "cancelled";
 type AgentTone = "cyan" | "amber" | "rose" | "violet";
 type CreatedSession = { session: Session; access_token: string };
-type OperationResultResponse = {
-  schema_version: "jarvis.http_operation_result.v1";
-  output: {
-    structured_document_references?: StructuredDocumentReference[];
-    benchmarking_financials_reference?: BenchmarkingFinancialsReference | null;
-  } | null;
+type RetainedOperationOutput = {
+  decision_failure?: OperationDecisionFailure | null;
+  fundamental_failure?: OperationDecisionFailure | null;
+  structured_document_references?: StructuredDocumentReference[];
+  benchmarking_financials_reference?: BenchmarkingFinancialsReference | null;
+  fundamental_package_reference?: unknown;
+  fundamental_analysis?: unknown;
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_JARVIS_API_URL?.replace(/\/$/, "") ?? "http://127.0.0.1:8000";
@@ -387,12 +417,17 @@ export default function Home() {
   const [conversation, setConversation] = useState<ConversationSnapshot | null>(null);
   const [command, setCommand] = useState("");
   const [activities, setActivities] = useState<WorkflowActivity[]>([]);
+  const [agentOutcomes, setAgentOutcomes] = useState<AgentExecutionOutcome[]>([]);
   const [activeOperation, setActiveOperation] = useState<string | null>(null);
   const [displayOperation, setDisplayOperation] = useState<string | null>(null);
   const [operationStatus, setOperationStatus] = useState<OperationStatus>("standby");
-  const [dashboard, setDashboard] = useState<Dashboard | null>(null);
+  const [dashboard, setDashboard] = useState<DashboardResponse | null>(null);
   const [structuredDocuments, setStructuredDocuments] = useState<StructuredDocumentReference[]>([]);
   const [benchmarkingReference, setBenchmarkingReference] = useState<BenchmarkingFinancialsReference | null>(null);
+  const [fundamentalAnalysis, setFundamentalAnalysis] = useState<FundamentalAnalysis | null>(null);
+  const [fundamentalFailure, setFundamentalFailure] = useState<OperationDecisionFailure | null>(null);
+  const [fundamentalPackageReference, setFundamentalPackageReference] = useState<FundamentalPackageReference | null>(null);
+  const [fundamentalPackagePublication, setFundamentalPackagePublication] = useState<FundamentalPackagePublication | null>(null);
   const [selectedFinancialDocument, setSelectedFinancialDocument] = useState<StructuredFinancialDocumentResponse | null>(null);
   const [selectedBenchmarking, setSelectedBenchmarking] = useState<BenchmarkingFinancialsDocumentResponse | null>(null);
   const [financialDocumentLoading, setFinancialDocumentLoading] = useState<string | null>(null);
@@ -748,28 +783,72 @@ export default function Home() {
     };
   }, []);
 
-  const fetchCompletedOperation = useCallback(async (operationId: string) => {
+  const fetchOperationAudit = useCallback(async (operationId: string) => {
     if (!session || !token) return;
     const operationBase = `${API_BASE}/api/v1/sessions/${session.session_id}/operations/${operationId}`;
-    const [dashboardResponse, resultResponse] = await Promise.all([
-      fetch(`${operationBase}/dashboard`, { headers: authHeaders }),
-      fetch(`${operationBase}/result`, { headers: authHeaders }),
-    ]);
+    const auditResponse = await fetch(`${operationBase}/audit`, { headers: authHeaders });
+    if (!auditResponse.ok) {
+      throw new Error("Jarvis completed, but its operation audit is unavailable.");
+    }
+    const audit = await auditResponse.json() as OperationAudit<RetainedOperationOutput>;
+    const verifiedOutcomes = parseAgentExecutionOutcomes(audit.agent_outcomes);
+    setActivities(audit.events);
+    setAgentOutcomes(verifiedOutcomes);
+    return { audit, operationBase };
+  }, [authHeaders, session, token]);
+
+  const fetchCompletedOperation = useCallback(async (operationId: string) => {
+    const audited = await fetchOperationAudit(operationId);
+    if (!audited) return;
+    const { audit, operationBase } = audited;
+    if (!audit.result) {
+      throw new Error("Jarvis completed without a retained operation result.");
+    }
+    const operationResult = audit.result;
+    const publication = parseFundamentalPackagePublication(
+      audit.fundamental_package_publication,
+    );
+    const packageReference = parseFundamentalPackageReference(
+      operationResult.fundamental_package_reference,
+    );
+    if ((publication?.reference.package_id ?? null) !== (packageReference?.package_id ?? null)) {
+      throw new Error("Operation audit package publication does not match its retained result.");
+    }
+    setFundamentalPackagePublication(publication);
+    setStructuredDocuments(operationResult.structured_document_references ?? []);
+    setBenchmarkingReference(operationResult.benchmarking_financials_reference ?? null);
+    setFundamentalAnalysis(
+      parseFundamentalAnalysis(operationResult.fundamental_analysis),
+    );
+    setFundamentalFailure(operationResult.fundamental_failure ?? null);
+    setFundamentalPackageReference(packageReference);
+    const dashboardResponse = await fetch(`${operationBase}/dashboard`, {
+      headers: authHeaders,
+    });
     if (!dashboardResponse.ok) {
       throw new Error("Jarvis completed, but the dashboard projection is unavailable.");
     }
-    if (!resultResponse.ok) {
-      throw new Error("Jarvis completed, but the financial-document inventory is unavailable.");
+    const dashboardResult = await dashboardResponse.json() as DashboardResponse;
+    setDashboard(dashboardResult);
+    if (operationResult.decision_failure) {
+      const failedOutcome = [...audit.agent_outcomes]
+        .reverse()
+        .find((outcome) => outcome.status === "failed");
+      const failureLocation = failedOutcome?.participant_label ?? "Debate Chamber";
+      const round = failedOutcome?.round_number
+        ? ` in round ${failedOutcome.round_number}`
+        : "";
+      setNotice(
+        `Research Division completed. ${failureLocation} failed${round}; no trade conclusion was produced.`,
+      );
+      setError(
+        `${failureLocation}: ${operationResult.decision_failure.message}`,
+      );
+      setActiveOperation(null);
+      return;
     }
-    const [nextDashboard, operationResult] = await Promise.all([
-      dashboardResponse.json() as Promise<Dashboard>,
-      resultResponse.json() as Promise<OperationResultResponse>,
-    ]);
-    setDashboard(nextDashboard);
-    setStructuredDocuments(operationResult.output?.structured_document_references ?? []);
-    setBenchmarkingReference(operationResult.output?.benchmarking_financials_reference ?? null);
     setActiveOperation(null);
-  }, [authHeaders, session, token]);
+  }, [authHeaders, fetchOperationAudit]);
 
   const inspectFinancialDocument = useCallback(async (
     reference: StructuredDocumentReference,
@@ -856,6 +935,7 @@ export default function Home() {
           } else {
             neuralAudioRef.current?.play("fault");
             setActiveOperation(null);
+            void fetchOperationAudit(operationId).catch(() => undefined);
             if (
               terminal.failure
               && RECOVERABLE_INSTRUMENT_FAILURES.has(terminal.failure.code)
@@ -881,7 +961,7 @@ export default function Home() {
           setOperationStatus("failed");
         }
       });
-  }, [authHeaders, fetchCompletedOperation, session, token]);
+  }, [authHeaders, fetchCompletedOperation, fetchOperationAudit, session, token]);
 
   const playSpokenMessage = useCallback(async (message: string | null | undefined) => {
     if (!shouldPlaySpokenMessage(voiceEnabled, message) || !session || !token) return;
@@ -976,10 +1056,15 @@ export default function Home() {
         setDashboard(null);
         setStructuredDocuments([]);
         setBenchmarkingReference(null);
+        setFundamentalAnalysis(null);
+        setFundamentalFailure(null);
+        setFundamentalPackageReference(null);
+        setFundamentalPackagePublication(null);
         setSelectedFinancialDocument(null);
         setSelectedBenchmarking(null);
         setFinancialDocumentError(null);
         setActivities([]);
+        setAgentOutcomes([]);
         setActiveOperation(operationId);
         setDisplayOperation(operationId);
         setOperationStatus("queued");
@@ -1119,16 +1204,35 @@ export default function Home() {
   };
 
   const progress = (matches: WorkflowMatcher) => workflowProgress(activities, matches);
-  const evidenceState = progress(matchesEvidence);
-  const judgeState = progress(matchesJudge);
-  const briefingState = progress(matchesBriefing);
+  const outcomeAwareProgress = (
+    matches: WorkflowMatcher,
+    matchesOutcome: AgentOutcomeMatcher,
+  ) => {
+    const authoritative = agentOutcomeProgress(agentOutcomes, matchesOutcome);
+    if (authoritative) return { ...authoritative, authoritative: true };
+    return {
+      ...progress(matches),
+      statusLabel: null,
+      authoritative: false,
+    };
+  };
+  const evidenceState = outcomeAwareProgress(matchesEvidence, matchesEvidenceOutcome);
+  const judgeState = outcomeAwareProgress(matchesJudge, matchesJudgeOutcome);
+  const briefingState = outcomeAwareProgress(matchesBriefing, matchesBriefingOutcome);
+  const fundamentalProgress = outcomeAwareProgress(
+    matchesFundamental,
+    matchesFundamentalOutcome,
+  );
   const agentStates = {
     research: progress(matchesMarket),
-    daily: progress(matchesDaily),
-    weekly: progress(matchesWeekly),
-    bull: progress(matchesBull),
-    bear: progress(matchesBear),
-    judge: progress((item) => matchesEvidence(item) || matchesJudge(item)),
+    daily: outcomeAwareProgress(matchesDaily, matchesDailyOutcome),
+    weekly: outcomeAwareProgress(matchesWeekly, matchesWeeklyOutcome),
+    bull: outcomeAwareProgress(matchesBull, matchesBullOutcome),
+    bear: outcomeAwareProgress(matchesBear, matchesBearOutcome),
+    judge: outcomeAwareProgress(
+      (item) => matchesEvidence(item) || matchesJudge(item),
+      (item) => matchesEvidenceOutcome(item) || matchesJudgeOutcome(item),
+    ),
   };
   const researchLink = agentStates.research.status === "active"
     ? {
@@ -1160,20 +1264,26 @@ export default function Home() {
   const fundamentalDocumentCount = structuredDocuments.length + (benchmarkingReference ? 1 : 0);
   const fundamentalStatus: ProgressStatus = providerCommand
     ? "active"
-    : fundamentalDocumentCount > 0
-      ? "complete"
-    : providerLifecycle?.status === "ready"
-      ? "complete"
-      : providerLifecycle?.status === "expired"
+    : fundamentalProgress.authoritative || fundamentalProgress.status !== "standby"
+      ? fundamentalProgress.status
+      : fundamentalDocumentCount > 0
+        ? "complete"
+        : providerLifecycle?.status === "expired"
         ? "failed"
         : "standby";
   const fundamentalStatusLabel = providerCommand
     ? "Connecting"
-    : fundamentalDocumentCount > 0
-      ? `${fundamentalDocumentCount} documents ready`
-    : providerLifecycle?.status === "ready"
-      ? "Provider ready"
-      : providerLifecycle?.status === "expired"
+    : fundamentalProgress.authoritative && fundamentalProgress.status !== "complete"
+      ? fundamentalProgress.statusLabel
+    : fundamentalProgress.status === "active"
+      ? "Analyzing"
+      : fundamentalProgress.status === "failed"
+        ? "Failed"
+        : fundamentalProgress.status === "complete" || fundamentalDocumentCount > 0
+          ? `${fundamentalDocumentCount} documents ready`
+          : providerLifecycle?.status === "ready"
+            ? "Provider ready"
+            : providerLifecycle?.status === "expired"
         ? "Reconnect"
         : "Standby";
   const fundamentalLink = providerCommand === "provision"
@@ -1194,7 +1304,19 @@ export default function Home() {
           direction: "to-agent" as const,
           label: "Revoke access",
         }
-        : fundamentalDocumentCount > 0
+        : fundamentalProgress.status === "failed"
+          ? {
+            status: "failed" as const,
+            direction: "to-jarvis" as const,
+            label: "Fundamental fault",
+          }
+          : fundamentalProgress.status === "active"
+            ? {
+              status: "active" as const,
+              direction: "bidirectional" as const,
+              label: "Evaluating fundamentals",
+            }
+            : fundamentalProgress.status === "complete" || fundamentalDocumentCount > 0
           ? {
             status: "active" as const,
             direction: "to-jarvis" as const,
@@ -1219,11 +1341,14 @@ export default function Home() {
             };
   const recentActivities = activities.slice(-8).reverse();
   const state = conversation?.state ?? "dormant";
-  const decisionView = dashboard
+  const completedDashboard = dashboard && !isTechnicalResearchDashboard(dashboard)
+    ? dashboard
+    : null;
+  const decisionView = completedDashboard
     ? judgeDecisionView(
-      dashboard.debate.winner,
-      dashboard.debate.confidence_percentage,
-      dashboard.trade_plan.disposition,
+      completedDashboard.debate.winner,
+      completedDashboard.debate.confidence_percentage,
+      completedDashboard.trade_plan.disposition,
     )
     : null;
 
@@ -1255,7 +1380,7 @@ export default function Home() {
             />
           </div>
           <div ref={(node) => { researchNodeRefs.current.daily = node; }} className="research-agent-node node-daily">
-            <AgentCard id="D" label="Daily Analyst" specialty="Tactical structure" tone="violet" status={agentStates.daily.status} visual={AGENT_VISUALS.daily} />
+            <AgentCard id="D" label="Daily Analyst" specialty="Tactical structure" tone="violet" status={agentStates.daily.status} statusLabel={agentStates.daily.statusLabel ?? undefined} visual={AGENT_VISUALS.daily} />
             <CommunicationLink
               agent="daily"
               status={evidenceReturning ? "active" : agentStates.daily.status}
@@ -1265,7 +1390,7 @@ export default function Home() {
             />
           </div>
           <div ref={(node) => { researchNodeRefs.current.weekly = node; }} className="research-agent-node node-weekly">
-            <AgentCard id="W" label="Weekly Analyst" specialty="Strategic structure" tone="amber" status={agentStates.weekly.status} visual={AGENT_VISUALS.weekly} />
+            <AgentCard id="W" label="Weekly Analyst" specialty="Strategic structure" tone="amber" status={agentStates.weekly.status} statusLabel={agentStates.weekly.statusLabel ?? undefined} visual={AGENT_VISUALS.weekly} />
             <CommunicationLink
               agent="weekly"
               status={evidenceReturning ? "active" : agentStates.weekly.status}
@@ -1281,7 +1406,7 @@ export default function Home() {
               specialty="Company fundamentals"
               tone="cyan"
               status={fundamentalStatus}
-              statusLabel={fundamentalStatusLabel}
+              statusLabel={fundamentalStatusLabel ?? undefined}
               visual={AGENT_VISUALS.financial}
             />
             <CommunicationLink
@@ -1307,6 +1432,29 @@ export default function Home() {
                 )}
               </div>
               {providerNotice && <p className="provider-session-notice" role="status">{providerNotice}</p>}
+              {fundamentalPackagePublication && (
+                <div className="fundamental-publication-outcome" role="status">
+                  <strong>Complete package committed · 16 datasets</strong>
+                  <span>
+                    Package {fundamentalPackagePublication.reference.package_id.slice(-12)}
+                    {" · "}manifest {fundamentalPackagePublication.reference.manifest_fingerprint.slice(0, 12)}…
+                    {" · "}valid until {new Date(fundamentalPackagePublication.reference.expires_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST
+                  </span>
+                </div>
+              )}
+              {fundamentalFailure && (
+                <div className="fundamental-analyst-outcome" role="alert">
+                  <strong>
+                    {fundamentalFailure.code === "fundamentals.analyst_unavailable"
+                      ? "Fundamental Analyst explanation failed"
+                      : "Fundamental research failed"}
+                  </strong>
+                  <span>
+                    {fundamentalFailure.message}
+                    {fundamentalFailure.retryable ? " You can retry this research request." : ""}
+                  </span>
+                </div>
+              )}
               {fundamentalDocumentCount > 0 && (
                 <details className="financial-document-inventory">
                   <summary>
@@ -1476,15 +1624,15 @@ export default function Home() {
         <aside className="agent-column right-agents">
           <p className="section-label">Debate chamber</p>
           <div ref={(node) => { debateNodeRefs.current.bull = node; }} className="debate-agent-node node-bull">
-            <AgentCard id="♉" label="Bull" specialty="Constructive advocate" tone="amber" status={agentStates.bull.status} visual={AGENT_VISUALS.bull} />
+            <AgentCard id="♉" label="Bull" specialty="Constructive advocate" tone="amber" status={agentStates.bull.status} statusLabel={agentStates.bull.statusLabel ?? undefined} visual={AGENT_VISUALS.bull} />
             <CommunicationLink agent="bull" status={agentStates.bull.status} direction="bidirectional" label="Bull debate" style={debateLinkGeometry.bull} />
           </div>
           <div ref={(node) => { debateNodeRefs.current.bear = node; }} className="debate-agent-node node-bear">
-            <AgentCard id="♙" label="Bear" specialty="Risk advocate" tone="rose" status={agentStates.bear.status} visual={AGENT_VISUALS.bear} />
+            <AgentCard id="♙" label="Bear" specialty="Risk advocate" tone="rose" status={agentStates.bear.status} statusLabel={agentStates.bear.statusLabel ?? undefined} visual={AGENT_VISUALS.bear} />
             <CommunicationLink agent="bear" status={agentStates.bear.status} direction="bidirectional" label="Bear debate" style={debateLinkGeometry.bear} />
           </div>
           <div ref={(node) => { debateNodeRefs.current.judge = node; }} className="debate-agent-node node-judge">
-            <AgentCard id="J" label="Senior Judge" specialty="Evidence synthesis" tone="cyan" status={agentStates.judge.status} visual={AGENT_VISUALS.judge} />
+            <AgentCard id="J" label="Senior Judge" specialty="Evidence synthesis" tone="cyan" status={agentStates.judge.status} statusLabel={agentStates.judge.statusLabel ?? undefined} visual={AGENT_VISUALS.judge} />
             <CommunicationLink
               agent="judge"
               status={judgeBriefing ? "active" : agentStates.judge.status}
@@ -1506,14 +1654,16 @@ export default function Home() {
         </div>
         <div className="matrix-track">
           {MATRIX_STEPS.map((step) => {
-            const stepProgress = progress(step.matches);
+            const stepProgress = step.matchesOutcome
+              ? outcomeAwareProgress(step.matches, step.matchesOutcome)
+              : { ...progress(step.matches), statusLabel: null };
             return (
               <div className={`matrix-step ${stepProgress.status}`} key={step.key}>
                 <i />
                 <span>{step.label}</span>
                 <small>
                   {stepProgress.roundNumber ? `Round ${stepProgress.roundNumber} · ` : ""}
-                  {stepProgress.status}
+                  {stepProgress.statusLabel ?? stepProgress.status}
                 </small>
               </div>
             );
@@ -1559,14 +1709,28 @@ export default function Home() {
                   : "Broker LTP unavailable for this completed operation"}
               </p>
             </div>
-            <div className={`verdict decision-${decisionView?.tone}`}>
-              <span>Judge verdict · {decisionView?.actionLabel}</span>
-              <b>{decisionView?.verdictLabel}</b>
-              <em>{decisionView?.confidenceLabel}</em>
-            </div>
+            {completedDashboard ? (
+              <div className={`verdict decision-${decisionView?.tone}`}>
+                <span>Judge verdict · {decisionView?.actionLabel}</span>
+                <b>{decisionView?.verdictLabel}</b>
+                <em>{decisionView?.confidenceLabel}</em>
+              </div>
+            ) : (
+              <div className="verdict decision-neutral" role="status">
+                <span>Decision phase incomplete</span>
+                <b>No trade conclusion</b>
+                <em>Daily and weekly research is available; no decision was inferred.</em>
+              </div>
+            )}
           </div>
           {financialDocumentError && (
             <p className="financial-document-error" role="alert">{financialDocumentError}</p>
+          )}
+          {fundamentalAnalysis && (
+            <FundamentalAnalystBriefing
+              analysis={fundamentalAnalysis}
+              packageReference={fundamentalPackageReference}
+            />
           )}
           {selectedFinancialDocument && (
             <article className="financial-document-inspector glass-panel">
@@ -1678,27 +1842,36 @@ export default function Home() {
               </footer>
             </article>
           )}
-          {dashboard.interpretation && <SwingProtocol interpretation={dashboard.interpretation} />}
+          {completedDashboard?.interpretation && (
+            <SwingProtocol interpretation={completedDashboard.interpretation} />
+          )}
+          {completedDashboard?.hierarchy_assessment && (
+            <EvidenceHierarchyPanel assessment={completedDashboard.hierarchy_assessment} />
+          )}
           <TimeframeResult
             panel={dashboard.daily}
             quote={dashboard.latest_quote}
-            interpretation={dashboard.interpretation?.daily}
+            interpretation={completedDashboard?.interpretation?.daily}
           />
           <TimeframeResult
             panel={dashboard.weekly}
             quote={dashboard.latest_quote}
-            interpretation={dashboard.interpretation?.weekly}
+            interpretation={completedDashboard?.interpretation?.weekly}
           />
-          <article className="debate-panel glass-panel">
-            <div className="debate-side bull"><p className="eyebrow">Bull case</p><p>{dashboard.debate.bull_case_summary}</p></div>
-            <div className={`judge-seal decision-${decisionView?.tone}`}>
-              <span>JUDGE</span>
-              <b>{dashboard.debate.confidence_percentage.toFixed(0)}%</b>
-              <small>{decisionView?.verdictLabel}</small>
-            </div>
-            <div className="debate-side bear"><p className="eyebrow">Bear case</p><p>{dashboard.debate.bear_case_summary}</p></div>
-          </article>
-          <ExecutiveBriefing dashboard={dashboard} />
+          {completedDashboard && (
+            <>
+              <article className="debate-panel glass-panel">
+                <div className="debate-side bull"><p className="eyebrow">Bull case</p><p>{completedDashboard.debate.bull_case_summary}</p></div>
+                <div className={`judge-seal decision-${decisionView?.tone}`}>
+                  <span>JUDGE</span>
+                  <b>{completedDashboard.debate.confidence_percentage.toFixed(0)}%</b>
+                  <small>{decisionView?.verdictLabel}</small>
+                </div>
+                <div className="debate-side bear"><p className="eyebrow">Bear case</p><p>{completedDashboard.debate.bear_case_summary}</p></div>
+              </article>
+              <ExecutiveBriefing dashboard={completedDashboard} />
+            </>
+          )}
         </section>
       )}
 

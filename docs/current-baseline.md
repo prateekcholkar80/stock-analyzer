@@ -584,24 +584,50 @@ parameter at all).
   `(exchange, symbol_token, interval)` — found via existing
   `MarketSeriesSummary.last_candle_at` + `list_market_series()` filtering,
   **no new storage schema needed** — falling back to
-  `RollingFetchConfig.default_lookback_days` (default 365) when nothing is
-  stored. A resume re-fetches a configurable overlap (default seven calendar
-  days) so broker corrections to recent candles can be detected. Splits the
-  needed range into `max_days_per_chunk`-day windows
-  (default 30) with `inter_request_delay_seconds` (default 1.0) between
-  Angel One calls, merges newly-fetched candles with whatever was already
+  `RollingFetchConfig.default_lookback_days` (default 3,653, guaranteeing at
+  least ten calendar years) when nothing is stored. A shorter-listed company
+  naturally contributes only the candles the provider actually returns; no
+  pre-listing periods are fabricated. A resume still re-fetches only a
+  configurable overlap (default seven calendar days) so broker corrections to
+  recent candles can be detected. The default request window is selected from
+  Angel One's published per-interval historical caps (`ONE_HOUR`: 400 days),
+  and an explicit smaller override remains available. It merges newly-fetched
+  candles with whatever was already
   stored (dedup by timestamp, new data wins), and archives the merged series as
   a new immutable dataset only when at least one candle is new or corrected.
   An unchanged refresh reuses the existing dataset identity. The receipt
   reports new, corrected, and duplicate fetched counts; chunk count; requested,
   stored, resumed, and checked timestamps; adapter identity; and whether the
-  dataset was reused. **`max_days_per_chunk` and
-  `inter_request_delay_seconds` are conservative estimates, not verified
-  against Angel One's current SmartAPI rate limits/range caps — tune
-  before relying on this for large historical pulls.** Built for hourly
+  dataset was reused. Built for hourly
   (`ONE_HOUR`) as the single source of truth, specifically so daily/
   weekly views can be derived locally rather than pulled as separate,
   potentially-drifting datasets.
+
+- Each newly archived `HistoricalCandleSeries` carries timezone-aware
+  `history_requested_from` / `history_requested_to` coverage metadata inside
+  its fingerprinted JSON payload. This records the provider range that was
+  attempted, which is deliberately different from the first and last candles
+  actually returned. Legacy one-year archives have no watermark, so their
+  missing older segment is backfilled once; the watermark then prevents a
+  recently listed company from repeatedly requesting nonexistent pre-listing
+  candles. The ordinary recent correction segment is still fetched in the same
+  operation, without re-downloading the already archived middle range.
+
+- `AngelOneClient` applies a thread-safe sliding-window limiter to historical
+  requests using Angel One's published client-code limits: 3 requests/second,
+  180/minute and 5,000/hour. The provider's non-JSON 403 rate-limit response is
+  recognized without logging its raw body and retried after bounded 2, 5 and
+  10 second delays. Exhaustion remains a `MarketDataError`, preserving the
+  browser workflow's candid safe failure rather than returning partial history
+  as complete.
+- `PullRollingMarketSeries` also provides keyed single-flight coordination for
+  simultaneous identical instrument/timeframe/target requests. One operation
+  performs the pull; in-process waiters receive defensive copies of the same
+  immutable receipt. A failed leader publishes the failure to its waiters and
+  removes the flight so a later deliberate retry can run. This prevents
+  duplicate overlap inside one Jarvis backend process. A multi-process or
+  distributed deployment will require an external lease/lock, because Angel's
+  limit is calculated across the client code rather than one Python process.
 
 - Gap detection is deliberately narrow. A missing cadence interval is reported
   only when two adjacent candles are on the same IST calendar date. Overnight,
@@ -1732,6 +1758,19 @@ replacement. `DuckDBJarvisStorage` implements the same contracts durably with
 indexed tenant, connection, issuer, document-type, reporting-basis,
 fingerprint, and expiry metadata while retaining the complete validated JSON.
 
+Sector-sensitive fundamental policy selection is now evidence-cited and
+fail-closed. `NseSectorMasterCatalog` exposes an exact-symbol observation with
+the source URL, cache/download timestamp, payload fingerprint, and per-record
+fingerprint. `NseFundamentalSectorEvidenceResolver` translates that record
+into a provider-neutral, bounded-freshness citation. The versioned
+`jarvis.fundamental_sector_profile` classifier uses reviewed exact sector and
+industry labels only: it never infers from an issuer name, description, peer
+set, or substring. Current agreeing evidence selects `non_financial` or
+`bfsi`; missing, expired, unsupported, cross-issuer, or conflicting evidence
+fails closed to `unknown`. The classification is bound to the same committed
+package and is preserved in the deterministic intelligence supplied to the
+Fundamental Analyst.
+
 `FundamentalEvidenceCoordinator` reuses a scoped unexpired document, calls the
 provider only on cache miss, expiry, or explicit refresh, atomically replaces
 successful refreshed evidence, and preserves the current valid cache after a
@@ -1743,19 +1782,163 @@ resolve against the released result. The frontend API client supports those
 references. Benchmarking data remains analyst evidence rather than a required
 visual matrix.
 
+For an explicit 16-dataset refresh, the browser workflow publishes the
+complete fundamental package before invoking the Fundamental Analyst. Analyst
+normalization, sector assessment, scorecard construction, and LLM explanation
+form a separate, non-transactional outcome: their failure does not roll back
+the package or discard its operation-owned document references. The operation
+records a safe `fundamentals.analyst_unavailable` failure and a failed analyst
+event while retaining the package ID, manifest fingerprint, expiry, and any
+independent technical/debate outcome. No analyst conclusion is fabricated.
+The authenticated operation audit exposes this as a distinct, immutable
+`fundamental_package_publication` outcome bound to the retained result. The
+agent ledger continues to report Fundamental Analyst success or failure
+independently. The Research Division UI displays the committed 16-dataset
+package and any analyst explanation failure as separate status rows.
+
 Provider connection remains user-owned. The UI can explicitly open a headed
 login, check readiness and expiry, and securely revoke the owner-only session;
 Jarvis never receives the user's Tijori credential. Connection registration is
 still local/in-memory and therefore not yet a hosted multi-tenant identity
 service.
 
+Authenticated filing acquisition is now composed for the executable browser
+runtime. The hardened stdio transport forwards only its bounded session,
+contract-version, locale, and owner-only filing-staging paths to the MCP
+subprocess; it still does not inherit the backend environment. The fundamental
+composition root requires staging and durable artifact roots together,
+validates both before provider I/O, constructs `TijoriFilingArtifactImporter`,
+and injects it into `TijoriMcpAdapter`. A missing, relative, symlinked,
+shared-permission, wrong-owner, or identical root fails closed. The local
+runtime uses distinct pre-existing mode-0700 directories. PDF bytes remain on
+the filesystem and outside DuckDB and browser responses.
+
+`InMemoryFundamentalFilingRepository` is the reference implementation of the
+database-neutral filing persistence port. It keeps artifact metadata and full
+filing packages as defensive immutable copies, scopes every read by tenant,
+provider connection and verified issuer, provides deterministic content-hash
+and version queries, and publishes complete packages through a thread-safe
+compare-and-swap active pointer. Failed or concurrent CAS attempts expose
+neither candidate packages nor their candidate artifacts. Exact repeated
+writes are idempotent; conflicting metadata and inconsistent or dangling
+duplicate/supersession links fail before mutation.
+
+The ten-day `recheck_after` boundary is freshness metadata, not retention
+expiry: due artifacts and the active package remain readable until a complete
+replacement is published. Deletion requires an exact immutable human
+authorization. A retained-package reference blocks artifact deletion; deleting
+an active package atomically clears its pointer but leaves its PDF artifact
+metadata available for separately authorized cleanup.
+
+`DuckDBJarvisStorage` now implements the same filing repository port with
+storage schema version 7. It transactionally stores immutable artifact
+metadata, complete filing-package JSON, package-to-artifact relationships,
+audited deletion receipts, and one compare-and-swap active pointer per tenant,
+provider connection, and verified issuer. Candidate artifact and package rows
+roll back together when CAS, lineage, validation, or persistence fails; a
+successful replacement retains the prior package for history while moving the
+active pointer atomically. Scoped reads and content-hash/version queries cannot
+cross a tenant, connection, or issuer boundary.
+
+The DuckDB filing schema intentionally has no PDF-byte or BLOB column. It keeps
+only validated metadata and the content-addressed `safe_relative_path`; the
+immutable PDF remains under the separately configured owner-only durable
+filesystem root. Recheck timestamps remain non-destructive freshness markers.
+Package and artifact deletion still require separate exact authorizations, and
+each requested deletion result is durably auditable and idempotent by audit ID.
+
+The provider-neutral `jarvis.fundamental_filing_evidence.v1` extraction
+contract now preserves every physical PDF page, including partial and
+unreadable pages. It models page dimensions and rotation, ordered text blocks
+and headings, table geometry and mixed source-observed units, explicit or
+unresolved speaker turns, exact page-span citations, observed facts,
+management-adjusted metrics, management claims, guidance commitments, risk
+disclosures, extraction warnings, material limitations, and deterministic
+coverage. All records are immutable and bounded.
+
+Every citation is bound to the immutable artifact ID, PDF content hash, page,
+source element, coordinates, exact excerpt and optional character offsets.
+Semantic evidence can cite only released filing-citation IDs, and speaker-
+attributed evidence can reference only extracted turns. The aggregate enforces
+physical page order, globally unique source/evidence IDs, canonical collection
+ordering, page geometry, explicit OCR policy configuration, and complete
+coverage accounting. Exact excerpt/value verification remains the separate
+document-evidence validator responsibility; no PDF parser or LLM behavior is
+part of this contract milestone.
+
+`DeterministicFundamentalFilingExtractor` now implements native-PDF parsing
+with the exactly locked `pdfplumber` engine. Before parsing, it resolves the
+manifest-owned content-addressed path below the configured durable root and
+revalidates every directory and file for containment, regular-file type,
+ownership, owner-only permissions, byte length, SHA-256, and declared page
+count. It never accepts PDF bytes from an API or LLM input.
+
+The extractor preserves every physical page and emits ordered native text
+blocks, deterministic heading classifications, top-left PDF-point geometry,
+ruled-table cells, source-observed units and numeric values, printed page
+labels, and only explicitly labelled transcript speakers. It releases exact
+text-block, table-cell, and speaker-turn citations. Blank, unreadable, and
+table-degraded pages produce attributable warnings and limitations instead of
+being omitted. The native extractor does not execute OCR and rejects an OCR-
+enabled policy until a separate versioned OCR adapter exists. It also leaves
+facts, claims, guidance, risks, and investment interpretation empty for later
+validated processing; no LLM participates in extraction.
+
+`DeterministicFundamentalFilingEvidenceValidator` now provides the versioned,
+fail-closed release boundary after extraction. The caller must supply the
+verified operation issuer, fiscal period, and expected source class; the
+validator never derives or guesses these identities from document prose. It
+returns an immutable, fingerprinted result containing seven independently
+attributable findings for issuer identity, period identity, physical page
+spans, unit integrity, duplicate semantic content, source classification, and
+citation completeness.
+
+The validator rechecks complete citation coverage for every extracted text
+block, table cell, and speaker turn; exact excerpt/offset presence and source
+geometry; semantic-record citation availability; source-observed numeric
+values and unit multipliers; guidance horizon and range consistency; and
+management attribution for issuer-classified transcript evidence. It derives
+canonical page spans for semantic records and rejects non-monotonic speaker
+lineage. Failed findings make the extraction non-releaseable without changing
+or deleting it. No semantic evidence, issuer identity, period, unit, citation,
+or source class is repaired or inferred by this validator.
+
+Extracted filing evidence now has a database-neutral persistence boundary.
+`StoredFundamentalFilingEvidence` retains the complete immutable extraction and
+its complete deterministic validation result while explicitly binding the PDF
+artifact ID/fingerprint, extraction-policy fingerprint, validation-policy
+fingerprint, extraction fingerprint, and validation fingerprint. Its record ID
+is content-derived and excludes the adapter persistence timestamp, so an
+attempt to store different metadata under the same evidence identity is a
+conflict rather than a silent new version. Strict adapter-owned JSON methods
+round-trip the standard immutable validation dataclasses without weakening the
+global Pydantic boundary or accepting computed/extra fields.
+
+`FundamentalFilingEvidenceRepository` defines only scoped immutable save,
+exact-record read, artifact-version listing, and exact-policy lookup methods.
+Every read requires the tenant/provider/verified-issuer scope and an aware
+`as_of` timestamp. Filing evidence is retained with its source PDF and does not
+inherit cache expiry from a provider recheck date; the port intentionally has
+no broad SQL, cross-tenant listing, automatic purge, or deletion operation.
+Failed validation results remain durable for audit but are never represented
+as releaseable.
+
+`InMemoryFundamentalFilingEvidenceRepository` is the thread-safe reference
+adapter. It revalidates records through the strict storage JSON boundary,
+provides idempotent defensive-copy saves, rejects identity conflicts and
+future writes, filters future records from point-in-time reads, preserves
+tenant/provider/issuer isolation, and returns versions in deterministic
+extraction/storage/record order.
+
 The frontend command deck uses event-bound holographic identities for Market
 Data, Daily, Weekly, Fundamental, Bull, Bear, and Judge participants. Agent
 motion, packet links, completion glow, reduced-motion behaviour, and opt-in
 procedural neural sounds are presentation-only and never delay backend work.
 The Bull asset is stored with its licence manifest. The Fundamental Analyst is
-named and represented in the UI, but its deterministic scorecard and LLM skill
-are not yet implemented.
+named and represented in the UI; its verified runtime skill receives the
+bounded deterministic mandatory checks, framework applicability, shadow
+scorecard, sector-profile rationale, and source citations. These outputs do
+not yet influence trade release or enter the debate agents.
 
 Validation for this milestone is **2,171 passing Python tests**, **224 passing
 Tijori MCP tests**, and a successful frontend production build with **51
@@ -1786,6 +1969,8 @@ JARVIS_TIJORI_SERVER_ENTRYPOINT="/absolute/path/to/integrations/tijori-mcp/src/i
 JARVIS_TIJORI_SERVER_SHA256="64-lowercase-hex-characters"
 JARVIS_TIJORI_SESSION_ROOT="/absolute/path/to/owner-only-session-directory"
 JARVIS_TIJORI_PROVIDER_CONTRACT_VERSION="tijori.local_contract.v1"
+JARVIS_TIJORI_FILING_STAGING_DIRECTORY="/absolute/path/to/owner-only-filing-staging"
+JARVIS_FUNDAMENTAL_FILING_ARTIFACT_DIRECTORY="/absolute/path/to/owner-only-fundamental-artifacts"
 
 JARVIS_BULL_LLM_TEMPERATURE="0.4"
 JARVIS_BEAR_LLM_TEMPERATURE="0.4"
@@ -1931,13 +2116,14 @@ preserve:
   The lower-level deterministic planner, execution engine, storage schema, and
   walk-forward metrics intentionally still support both long and short research
   scenarios. The default Jarvis conversation can release only long or no-trade.
-- **No Fundamental Analyst, sentiment agent, or macro agent analysis yet.**
-  User-owned Tijori session controls and complete cached structured financial,
-  peer, and benchmarking JSON now exist across provider-neutral contracts,
-  in-memory/DuckDB repositories, browser workflow references, and authenticated
-  resolution. The deterministic scorecard, red-flag engine, versioned
-  Fundamental Analyst skill, and combined technical/fundamental debate remain
-  pending. Annual reports are explicitly deferred.
+- **No combined technical/fundamental debate, sentiment agent, or macro agent
+  analysis yet.** User-owned Tijori session controls, the committed fundamental
+  package, deterministic normalization/checks/applicability/shadow scorecard,
+  evidence-cited sector classification, and the verified Fundamental Analyst
+  runtime exist. Bounded fundamental decision evidence for Bull, Bear, and
+  Judge remains pending. BFSI is classified safely but its sector-specific
+  check and scoring policies remain fail-closed until separately approved.
+  Annual reports are explicitly deferred.
 - **No genuine order-flow pipeline.** Current hourly/daily/weekly OHLCV, OBV,
   accumulation, volume expansion, and liquidity-sweep calculations are
   price-volume evidence, not bid/ask aggressor flow. Genuine evaluation needs

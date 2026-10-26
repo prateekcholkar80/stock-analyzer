@@ -8,7 +8,11 @@ import * as z from 'zod/v4';
 import { probeAuthentication } from './authentication-probe.js';
 import { createBrowserSessionRunner } from './browser-session.js';
 import { createTijoriProviderRegistry } from './provider-registry.js';
-import { failureResult, serializeToolResult } from './result-envelope.js';
+import {
+  APPROVED_TOOL_NAMES,
+  failureResult,
+  serializeToolResult,
+} from './result-envelope.js';
 import { loadSessionBoundary } from './session-boundary.js';
 import { createToolRegistry } from './tool-registry.js';
 
@@ -17,6 +21,9 @@ const SERVER_INFO = Object.freeze({
   name: 'jarvis-local-tijori-mcp',
   version: '0.1.0',
 });
+export const FILING_STAGING_DIRECTORY_ENV = (
+  'JARVIS_TIJORI_FILING_STAGING_DIRECTORY'
+);
 
 const locatorSchema = z.looseObject({
   exchange: z.string().optional().nullable(),
@@ -36,7 +43,39 @@ const issuerSchema = z.looseObject({
   provider_slug: z.string().optional().nullable(),
 });
 
-const TOOL_INPUT_SCHEMAS = Object.freeze({
+const resolvedFilingIssuerSchema = z.strictObject({
+  exchange: z.string().min(1).max(32),
+  symbol: z.string().min(1).max(100),
+  legal_name: z.string().min(1).max(300),
+  isin: z.string().length(12).optional().nullable(),
+  provider_company_id: z.string().min(1).max(128),
+  provider_slug: z.string().min(1).max(240),
+});
+
+const filingCategorySchema = z.enum([
+  'earnings_release',
+  'conference_call',
+]);
+const filingIdentifierSchema = z.string()
+  .min(1)
+  .max(240)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/);
+const filingFingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/);
+const filingHttpsUrlSchema = z.string()
+  .min(1)
+  .max(2_000)
+  .regex(/^https:\/\/[^\s]+$/i);
+const filingReferenceSchema = z.strictObject({
+  filing_reference_id: filingIdentifierSchema.max(180),
+  category: filingCategorySchema,
+  provider_company_id: filingIdentifierSchema.max(128),
+  provider_slug: filingIdentifierSchema,
+  source_page_url: filingHttpsUrlSchema,
+  artifact_url: filingHttpsUrlSchema,
+  discovery_fingerprint: filingFingerprintSchema,
+});
+
+export const TOOL_INPUT_SCHEMAS = Object.freeze({
   search_company: z.looseObject({
     query: z.string(),
     exchanges: z.array(z.string()).optional(),
@@ -61,6 +100,7 @@ const TOOL_INPUT_SCHEMAS = Object.freeze({
     period_types: z.array(z.string()).optional(),
     max_periods: z.number().int().optional(),
     document_type: z.enum([
+      'financial_package',
       'growth_table',
       'balance_sheet',
       'profit_and_loss',
@@ -80,6 +120,27 @@ const TOOL_INPUT_SCHEMAS = Object.freeze({
     quarters: z.number().int().optional(),
     include_promoter_pledge: z.boolean().optional(),
   }),
+  list_company_filings: z.strictObject({
+    issuer: resolvedFilingIssuerSchema,
+    categories: z.array(filingCategorySchema).min(1).max(2).optional(),
+    from_fiscal_year: z.number()
+      .int()
+      .min(1900)
+      .max(2200)
+      .optional()
+      .nullable(),
+    through_date: z.string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/)
+      .optional()
+      .nullable(),
+    max_documents: z.number().int().min(1).max(200).optional(),
+  }),
+  download_company_filing: z.strictObject({
+    issuer: resolvedFilingIssuerSchema,
+    filing_reference: filingReferenceSchema,
+    expected_source_url: filingHttpsUrlSchema,
+    expected_provider_company_id: filingIdentifierSchema.max(128),
+  }),
 });
 
 const READ_ONLY_ANNOTATIONS = Object.freeze({
@@ -87,6 +148,10 @@ const READ_ONLY_ANNOTATIONS = Object.freeze({
   destructiveHint: false,
   idempotentHint: true,
   openWorldHint: true,
+});
+const STAGING_ANNOTATIONS = Object.freeze({
+  ...READ_ONLY_ANNOTATIONS,
+  readOnlyHint: false,
 });
 
 const UNCONFIGURED_SESSION = Object.freeze({
@@ -96,7 +161,7 @@ const UNCONFIGURED_SESSION = Object.freeze({
 
 export function createUnavailableRegistry() {
   const handlers = Object.fromEntries(
-    Object.keys(TOOL_INPUT_SCHEMAS).map((toolName) => [
+    APPROVED_TOOL_NAMES.map((toolName) => [
       toolName,
       async () => failureResult(toolName, 'unavailable'),
     ]),
@@ -124,7 +189,9 @@ export function createTijoriMcpServer(
       {
         description: definition.description,
         inputSchema: TOOL_INPUT_SCHEMAS[definition.name],
-        annotations: READ_ONLY_ANNOTATIONS,
+        annotations: definition.name === 'download_company_filing'
+          ? STAGING_ANNOTATIONS
+          : READ_ONLY_ANNOTATIONS,
       },
       async (argumentsValue) => toolResponse(registry, definition.name, argumentsValue),
     );
@@ -162,7 +229,10 @@ export async function createConfiguredTijoriMcpServer(
     && authentication.authenticated
   ) {
     try {
-      effectiveRegistry = providerRegistryFactory({ browserRunner });
+      effectiveRegistry = providerRegistryFactory({
+        browserRunner,
+        filingStagingDirectory: configuredFilingStagingDirectory(environment),
+      });
     } catch {
       // Provider composition failures expose no details and no callable tools.
     }
@@ -235,6 +305,15 @@ function normalizeAuthenticationProbe(candidate) {
     });
   }
   return Object.freeze({ authenticated: false, status: 'unavailable' });
+}
+
+function configuredFilingStagingDirectory(environment) {
+  const value = environment[FILING_STAGING_DIRECTORY_ENV];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value === '' || value.trim() !== value) {
+    throw new TypeError('Tijori filing staging boundary is invalid');
+  }
+  return value;
 }
 
 function isDirectExecution() {

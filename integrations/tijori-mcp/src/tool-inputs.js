@@ -18,6 +18,7 @@ const FINANCIAL_STATEMENTS = new Set([
 ]);
 const PERIOD_TYPES = new Set(['annual', 'quarterly', 'monthly', 'ytd', 'ltm']);
 const FINANCIAL_DOCUMENT_TYPES = new Set([
+  'financial_package',
   'growth_table',
   'balance_sheet',
   'profit_and_loss',
@@ -40,6 +41,15 @@ const COMPANY_OVERVIEW_DOCUMENT_TYPES = new Set([
   'peer_comparison',
   'benchmarking_financials',
 ]);
+const FILING_CATEGORIES = new Set([
+  'earnings_release',
+  'conference_call',
+]);
+const FILING_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
+const FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/;
+const SENSITIVE_URL_PARAMETER_PATTERN = (
+  /(?:authorization|cookie|csrf|password|passwd|secret|session|token)/i
+);
 
 export function validateToolArguments(toolName, candidate) {
   if (!APPROVED_TOOLS.has(toolName)) {
@@ -53,8 +63,20 @@ export function validateToolArguments(toolName, candidate) {
     get_company_overview: validateCompanyOverview,
     get_financials: validateFinancials,
     get_shareholding: validateShareholding,
+    list_company_filings: validateListCompanyFilings,
+    download_company_filing: validateDownloadCompanyFiling,
   };
   return deepFreeze(validators[toolName](candidate));
+}
+
+export function validateListCompanyFilingsArguments(candidate) {
+  requirePlainObject(candidate, 'Tool arguments');
+  return deepFreeze(validateListCompanyFilings(candidate));
+}
+
+export function validateDownloadCompanyFilingArguments(candidate) {
+  requirePlainObject(candidate, 'Tool arguments');
+  return deepFreeze(validateDownloadCompanyFiling(candidate));
 }
 
 function validateSearchCompany(value) {
@@ -148,12 +170,14 @@ function validateFinancials(value) {
       'reporting_basis',
       FINANCIAL_REPORTING_BASES,
     );
-    if (
-      (documentType === 'growth_table')
-      !== (reportingBasis === 'not_applicable')
-    ) {
+    const basisIndependentDocument = (
+      documentType === 'financial_package'
+      || documentType === 'growth_table'
+    );
+    if (basisIndependentDocument !== (reportingBasis === 'not_applicable')) {
       throw new TypeError(
-        'Growth Table requires the not_applicable reporting basis exclusively',
+        'The selected Financial Package or Growth Table requires the not_applicable '
+        + 'reporting basis exclusively',
       );
     }
     return {
@@ -199,6 +223,138 @@ function validateShareholding(value) {
     ...evidenceArguments(value),
     quarters: boundedInteger(value.quarters ?? 8, 'quarters', 1, 40),
     include_promoter_pledge: includePromoterPledge,
+  };
+}
+
+function validateListCompanyFilings(value) {
+  requireExactKeys(
+    value,
+    ['issuer'],
+    [
+      'categories',
+      'from_fiscal_year',
+      'through_date',
+      'max_documents',
+    ],
+  );
+  return {
+    issuer: validateResolvedIssuer(value.issuer),
+    categories: enumArray(
+      value.categories ?? [...FILING_CATEGORIES],
+      'categories',
+      FILING_CATEGORIES,
+    ),
+    from_fiscal_year: nullableInteger(
+      value.from_fiscal_year ?? null,
+      'from_fiscal_year',
+      1900,
+      2200,
+    ),
+    through_date: nullableDate(value.through_date ?? null, 'through_date'),
+    max_documents: boundedInteger(
+      value.max_documents ?? 100,
+      'max_documents',
+      1,
+      200,
+    ),
+  };
+}
+
+function validateDownloadCompanyFiling(value) {
+  requireExactKeys(value, [
+    'issuer',
+    'filing_reference',
+    'expected_source_url',
+    'expected_provider_company_id',
+  ], []);
+  const issuer = validateResolvedIssuer(value.issuer);
+  const filingReference = validateFilingReference(value.filing_reference);
+  const expectedSourceUrl = credentialFreeHttpsUrl(
+    value.expected_source_url,
+    'expected_source_url',
+  );
+  const expectedProviderCompanyId = boundedIdentifier(
+    value.expected_provider_company_id,
+    'expected_provider_company_id',
+    128,
+  );
+  if (
+    issuer.provider_company_id !== expectedProviderCompanyId
+    || filingReference.provider_company_id !== expectedProviderCompanyId
+  ) {
+    throw new TypeError(
+      'Download company identity must match the verified issuer and reference',
+    );
+  }
+  if (issuer.provider_slug !== filingReference.provider_slug) {
+    throw new TypeError(
+      'Download provider slug must match the verified issuer',
+    );
+  }
+  if (filingReference.artifact_url !== expectedSourceUrl) {
+    throw new TypeError(
+      'Download source URL must exactly match the discovered filing reference',
+    );
+  }
+  return {
+    issuer,
+    filing_reference: filingReference,
+    expected_source_url: expectedSourceUrl,
+    expected_provider_company_id: expectedProviderCompanyId,
+  };
+}
+
+function validateFilingReference(value) {
+  requirePlainObject(value, 'filing_reference');
+  requireExactKeys(value, [
+    'filing_reference_id',
+    'category',
+    'provider_company_id',
+    'provider_slug',
+    'source_page_url',
+    'artifact_url',
+    'discovery_fingerprint',
+  ], []);
+  const fingerprint = boundedString(
+    value.discovery_fingerprint,
+    'filing_reference.discovery_fingerprint',
+    64,
+  );
+  if (!FINGERPRINT_PATTERN.test(fingerprint)) {
+    throw new TypeError(
+      'filing_reference.discovery_fingerprint must be a SHA-256 value',
+    );
+  }
+  return {
+    filing_reference_id: boundedIdentifier(
+      value.filing_reference_id,
+      'filing_reference.filing_reference_id',
+      180,
+    ),
+    category: enumScalar(
+      value.category,
+      'filing_reference.category',
+      FILING_CATEGORIES,
+    ),
+    provider_company_id: boundedIdentifier(
+      value.provider_company_id,
+      'filing_reference.provider_company_id',
+      128,
+    ),
+    provider_slug: boundedIdentifier(
+      value.provider_slug,
+      'filing_reference.provider_slug',
+      240,
+    ),
+    source_page_url: credentialFreeHttpsUrl(
+      value.source_page_url,
+      'filing_reference.source_page_url',
+    ),
+    artifact_url: credentialFreeHttpsUrl(
+      value.artifact_url,
+      'filing_reference.artifact_url',
+    ),
+    discovery_fingerprint: fingerprint,
   };
 }
 
@@ -254,6 +410,19 @@ function validateIssuer(value) {
     ),
     provider_slug: optionalString(value.provider_slug, 'issuer.provider_slug', 240),
   };
+}
+
+function validateResolvedIssuer(value) {
+  const issuer = validateIssuer(value);
+  if (
+    issuer.provider_company_id === null
+    || issuer.provider_slug === null
+  ) {
+    throw new TypeError(
+      'Filing operations require a resolved provider company identity',
+    );
+  }
+  return issuer;
 }
 
 function optionalIdentityFields(value) {
@@ -330,6 +499,45 @@ function boundedInteger(value, field, minimum, maximum) {
     throw new TypeError(`${field} must be an integer from ${minimum} to ${maximum}`);
   }
   return value;
+}
+
+function nullableInteger(value, field, minimum, maximum) {
+  return value === null
+    ? null
+    : boundedInteger(value, field, minimum, maximum);
+}
+
+function boundedIdentifier(value, field, maxLength) {
+  const normalized = boundedString(value, field, maxLength);
+  if (!FILING_ID_PATTERN.test(normalized)) {
+    throw new TypeError(`${field} must be a bounded identifier`);
+  }
+  return normalized;
+}
+
+function credentialFreeHttpsUrl(value, field) {
+  const normalized = boundedString(value, field, 2_000);
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new TypeError(`${field} must be a valid HTTPS URL`);
+  }
+  if (
+    parsed.protocol !== 'https:'
+    || !parsed.hostname
+    || parsed.username
+    || parsed.password
+    || parsed.hash
+  ) {
+    throw new TypeError(`${field} must be a credential-free HTTPS URL`);
+  }
+  for (const parameter of parsed.searchParams.keys()) {
+    if (SENSITIVE_URL_PARAMETER_PATTERN.test(parameter)) {
+      throw new TypeError(`${field} cannot contain sensitive URL parameters`);
+    }
+  }
+  return normalized;
 }
 
 function nullableDate(value, field) {

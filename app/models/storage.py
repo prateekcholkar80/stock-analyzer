@@ -324,6 +324,51 @@ class EndToEndSwingAnalysisResult(StorageModel):
         return self.stored.dataset_id
 
 
+class MultiTimeframeResearchDivisionResult(StorageModel):
+    """Deterministic market, Daily, and Weekly result completed before debate."""
+
+    use_case_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    market_dataset_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=_IDENTIFIER_PATTERN,
+    )
+    fetch: RollingFetchReceipt
+    latest_quote: MarketQuote | None = None
+    technical_review: MultiTimeframeEvidenceReview
+
+    @model_validator(mode="after")
+    def validate_research_chain(self) -> Self:
+        if self.market_dataset_id != self.fetch.dataset_id:
+            raise ValueError(
+                "Research Division result must reference its fetched dataset"
+            )
+        series = self.fetch.stored.series
+        if self.latest_quote is not None and (
+            self.latest_quote.exchange != series.exchange
+            or self.latest_quote.symbol_token != series.symbol_token
+            or self.latest_quote.symbol != series.symbol
+        ):
+            raise ValueError(
+                "Research Division quote must match its fetched instrument"
+            )
+        package = self.technical_review.released_evidence
+        if package is None:
+            raise ValueError(
+                "Research Division result requires released technical evidence"
+            )
+        if package.technical_analysis.timeframes.hourly != series:
+            raise ValueError(
+                "Research Division technical evidence must use the fetched "
+                "hourly series"
+            )
+        return self
+
+
 class MultiTimeframeEndToEndSwingAnalysisResult(StorageModel):
     """Full hourly pull -> daily/weekly evidence -> debate trail."""
 
@@ -415,8 +460,30 @@ class MultiTimeframeEndToEndSwingAnalysisResult(StorageModel):
             )
         decision = trade.trade_decision
         interpretation = self.interpretation
+        hierarchy_assessment = trade.hierarchy_assessment
+        if (
+            interpretation is not None
+            and hierarchy_assessment is not None
+            and interpretation.hierarchy_assessment != hierarchy_assessment
+        ):
+            raise ValueError(
+                "multi-timeframe interpretation must preserve the "
+                "trade-plan hierarchy assessment"
+            )
+        if (
+            interpretation is not None
+            and hierarchy_assessment is None
+            and interpretation.hierarchy_assessment is not None
+        ):
+            raise ValueError(
+                "legacy trade plan cannot be paired with a hierarchical "
+                "interpretation"
+            )
         if decision is not None:
-            if interpretation is None:
+            if hierarchy_assessment is not None:
+                expected_condition = hierarchy_assessment.primary_condition
+                condition_source = "preserved hierarchy assessment"
+            elif interpretation is None:
                 expected_condition = {
                     SignalDirection.BULLISH: MarketCondition.BULLISH,
                     SignalDirection.BEARISH: MarketCondition.BEARISH,

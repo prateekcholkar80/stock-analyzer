@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Annotations, Config, Data, Layout, Shape } from "plotly.js";
+import type { CandlestickData } from "plotly.js/lib/candlestick";
 
 import type {
   DashboardQuote,
@@ -16,6 +17,9 @@ import {
 import { marketRangeBreaks } from "@/lib/chart-axis";
 
 type OverlayOption = { id: string; label: string; count: number };
+
+// Plotly supports candle fill colors; the installed typings omit this field.
+type CandleDirectionStyle = CandlestickData["increasing"] & { fillcolor: string };
 
 type RuntimeTimeframePanel = Omit<TimeframePanel, "chart"> & {
   chart?: Partial<TechnicalChartData>;
@@ -127,6 +131,14 @@ function indicatorColour(id: string) {
 }
 
 function candlestickTrace(panel: TimeframePanel): Data {
+  const increasing: CandleDirectionStyle = {
+    line: { color: COLORS.green, width: 1 },
+    fillcolor: COLORS.green,
+  };
+  const decreasing: CandleDirectionStyle = {
+    line: { color: COLORS.red, width: 1 },
+    fillcolor: COLORS.red,
+  };
   return {
     type: "candlestick",
     name: `${panel.timeframe} OHLC`,
@@ -135,8 +147,8 @@ function candlestickTrace(panel: TimeframePanel): Data {
     high: panel.candles.map((item) => item.high),
     low: panel.candles.map((item) => item.low),
     close: panel.candles.map((item) => item.close),
-    increasing: { line: { color: COLORS.green, width: 1 }, fillcolor: COLORS.green },
-    decreasing: { line: { color: COLORS.red, width: 1 }, fillcolor: COLORS.red },
+    increasing,
+    decreasing,
     xaxis: "x",
     yaxis: "y",
     hoverlabel: { bgcolor: "#07151d", bordercolor: COLORS.cyan },
@@ -212,22 +224,31 @@ function structureTraces(panel: TimeframePanel): Data[] {
     xaxis: "x",
     yaxis: "y",
   };
-  const pointTrace: Data = {
-    type: "scatter",
-    mode: "text",
-    name: "HH / HL / LH / LL",
-    x: panel.chart.structure_points.map((item) => item.pivot_at),
-    y: panel.chart.structure_points.map((item) => item.price),
-    text: panel.chart.structure_points.map((item) => STRUCTURE_LABELS[item.classification] ?? item.classification),
-    textposition: panel.chart.structure_points.map((item) => item.pivot_type === "high" ? "top center" : "bottom center"),
-    textfont: { color: COLORS.cyanSoft, size: 10, family: "ui-monospace, monospace" },
-    hovertemplate: "%{text}<br>%{x|%d %b %Y}<br>%{y:.2f}<extra></extra>",
-    xaxis: "x",
-    yaxis: "y",
-  };
+  // Scalar positions keep the installed Plotly types accurate for each group.
+  const pointTraces = (["high", "low"] as const)
+    .map((pivotType) => ({
+      pivotType,
+      points: panel.chart.structure_points.filter((item) => item.pivot_type === pivotType),
+    }))
+    .filter(({ points }) => points.length > 0)
+    .map(({ pivotType, points }, index): Data => ({
+      type: "scatter",
+      mode: "text",
+      name: "HH / HL / LH / LL",
+      legendgroup: "structure-labels",
+      showlegend: index === 0,
+      x: points.map((item) => item.pivot_at),
+      y: points.map((item) => item.price),
+      text: points.map((item) => STRUCTURE_LABELS[item.classification] ?? item.classification),
+      textposition: pivotType === "high" ? "top center" : "bottom center",
+      textfont: { color: COLORS.cyanSoft, size: 10, family: "ui-monospace, monospace" },
+      hovertemplate: "%{text}<br>%{x|%d %b %Y}<br>%{y:.2f}<extra></extra>",
+      xaxis: "x",
+      yaxis: "y",
+    }));
   const breakTrace: Data = {
     type: "scatter",
-    mode: "markers+text",
+    mode: "text+markers",
     name: "BOS / CHOCH",
     x: panel.chart.structure_breaks.map((item) => item.occurred_at),
     y: panel.chart.structure_breaks.map((item) => item.close_price),
@@ -244,7 +265,7 @@ function structureTraces(panel: TimeframePanel): Data[] {
     xaxis: "x",
     yaxis: "y",
   };
-  return [pivotTrace, pointTrace, breakTrace];
+  return [pivotTrace, ...pointTraces, breakTrace];
 }
 
 function liquiditySweepTrace(panel: TimeframePanel): Data | null {

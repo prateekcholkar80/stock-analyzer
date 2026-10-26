@@ -1,5 +1,6 @@
 import unittest
 from datetime import UTC, datetime, timedelta
+from threading import Event, Lock, Thread
 from zoneinfo import ZoneInfo
 
 from app.models.market import Candle, HistoricalCandleSeries
@@ -99,6 +100,23 @@ class MismatchedGateway(SequenceGateway):
         return result.model_copy(update={"symbol": "WRONG-EQ"})
 
 
+class BlockingGateway(FakeGateway):
+    def __init__(self):
+        super().__init__()
+        self.entered = Event()
+        self.release = Event()
+        self._started_lock = Lock()
+        self.started_count = 0
+
+    def get_historical_series(self, **kwargs):
+        with self._started_lock:
+            self.started_count += 1
+        self.entered.set()
+        if not self.release.wait(timeout=2):
+            raise RuntimeError("test did not release market pull")
+        return super().get_historical_series(**kwargs)
+
+
 def _candle(timestamp, close=100.0):
     return Candle(
         timestamp=timestamp,
@@ -123,6 +141,123 @@ class PullRollingMarketSeriesTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     RollingFetchConfig(correction_overlap_days=value)
+
+    def test_defaults_to_at_least_ten_years_for_first_pull(self):
+        gateway = FakeGateway()
+        use_case = PullRollingMarketSeries(
+            gateway,
+            self._new_archive(),
+            sleep_fn=FakeSleep(),
+        )
+        to_date = datetime(2026, 9, 10, tzinfo=IST)
+
+        receipt = use_case.execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+            to_date=to_date,
+        )
+
+        self.assertGreaterEqual(
+            receipt.requested_to - receipt.requested_from,
+            timedelta(days=3_652),
+        )
+        self.assertEqual(receipt.chunk_request_count, 10)
+        for from_date, to_date_text in gateway.calls:
+            start = datetime.strptime(from_date, "%Y-%m-%d %H:%M")
+            end = datetime.strptime(to_date_text, "%Y-%m-%d %H:%M")
+            self.assertLessEqual(end - start, timedelta(days=400))
+
+    def test_never_exceeds_broker_interval_range_cap(self):
+        gateway = FakeGateway()
+        use_case = PullRollingMarketSeries(
+            gateway,
+            self._new_archive(),
+            config=RollingFetchConfig(
+                max_days_per_chunk=1_000,
+                inter_request_delay_seconds=0,
+                default_lookback_days=401,
+            ),
+            sleep_fn=FakeSleep(),
+        )
+
+        receipt = use_case.execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+            to_date=datetime(2026, 9, 10, tzinfo=IST),
+        )
+
+        self.assertEqual(receipt.chunk_request_count, 2)
+        first_start = datetime.strptime(gateway.calls[0][0], "%Y-%m-%d %H:%M")
+        first_end = datetime.strptime(gateway.calls[0][1], "%Y-%m-%d %H:%M")
+        self.assertEqual(first_end - first_start, timedelta(days=400))
+
+    def test_rejects_interval_without_broker_range_policy(self):
+        use_case = PullRollingMarketSeries(
+            FakeGateway(),
+            self._new_archive(),
+            sleep_fn=FakeSleep(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "broker range policy"):
+            use_case.execute(
+                "NSE",
+                "2885",
+                "RELIANCE-EQ",
+                "TWO_HOUR",
+                to_date=datetime(2026, 9, 10, tzinfo=IST),
+            )
+
+    def test_simultaneous_duplicate_pulls_share_one_broker_request(self):
+        gateway = BlockingGateway()
+        use_case = PullRollingMarketSeries(
+            gateway,
+            self._new_archive(),
+            config=RollingFetchConfig(
+                default_lookback_days=1,
+                inter_request_delay_seconds=0,
+            ),
+            sleep_fn=FakeSleep(),
+        )
+        to_date = datetime(2026, 9, 10, tzinfo=IST)
+        results = []
+        errors = []
+
+        def execute_pull():
+            try:
+                results.append(
+                    use_case.execute(
+                        "NSE",
+                        "2885",
+                        "RELIANCE-EQ",
+                        "ONE_HOUR",
+                        to_date=to_date,
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - assertion captures it
+                errors.append(exc)
+
+        first = Thread(target=execute_pull)
+        second = Thread(target=execute_pull)
+        first.start()
+        self.assertTrue(gateway.entered.wait(timeout=1))
+        second.start()
+        second.join(timeout=0.05)
+
+        self.assertTrue(second.is_alive())
+        self.assertEqual(gateway.started_count, 1)
+        gateway.release.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        self.assertFalse(errors)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(gateway.started_count, 1)
+        self.assertEqual(results[0].dataset_id, results[1].dataset_id)
+        self.assertIsNot(results[0], results[1])
 
     def test_fresh_pull_uses_default_lookback_and_chunks_requests(self):
         gateway = FakeGateway()
@@ -210,6 +345,116 @@ class PullRollingMarketSeriesTests(unittest.TestCase):
             first_receipt.stored.series.candles[-1].close,
         )
         self.assertEqual(second_receipt.corrected_candle_count, 1)
+
+    def test_legacy_archive_is_backfilled_once_then_remains_incremental(self):
+        to_date = datetime(2026, 9, 10, tzinfo=IST)
+        legacy_candles = [
+            _candle(to_date - timedelta(days=2)),
+            _candle(to_date),
+        ]
+        legacy_series = HistoricalCandleSeries(
+            exchange="NSE",
+            symbol_token="2885",
+            symbol="RELIANCE-EQ",
+            interval="ONE_HOUR",
+            candles=legacy_candles,
+            retrieved_at=to_date - timedelta(days=1),
+        )
+        archive = self._new_archive()
+        archive.archive_market_series(legacy_series)
+        gateway = FakeGateway()
+        use_case = PullRollingMarketSeries(
+            gateway,
+            archive,
+            config=RollingFetchConfig(
+                max_days_per_chunk=30,
+                inter_request_delay_seconds=0,
+                default_lookback_days=10,
+                correction_overlap_days=1,
+            ),
+            sleep_fn=FakeSleep(),
+        )
+
+        backfilled = use_case.execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+            to_date=to_date,
+        )
+
+        expected_start = to_date - timedelta(days=10)
+        self.assertEqual(backfilled.chunk_request_count, 2)
+        self.assertEqual(backfilled.requested_from, expected_start)
+        self.assertEqual(
+            backfilled.stored.series.history_requested_from,
+            expected_start,
+        )
+        self.assertEqual(
+            backfilled.stored.series.history_requested_to,
+            to_date,
+        )
+
+        next_to_date = to_date + timedelta(days=1)
+        incremental = use_case.execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+            to_date=next_to_date,
+        )
+
+        self.assertEqual(incremental.chunk_request_count, 1)
+        self.assertGreater(
+            incremental.requested_from,
+            next_to_date - timedelta(days=10),
+        )
+        self.assertEqual(
+            incremental.stored.series.history_requested_from,
+            expected_start,
+        )
+
+    def test_empty_initial_history_does_not_repeat_full_backfill(self):
+        to_date = datetime(2026, 9, 10, tzinfo=IST)
+        gateway = SequenceGateway(
+            [
+                [],
+                [_candle(to_date + timedelta(hours=1))],
+            ]
+        )
+        use_case = PullRollingMarketSeries(
+            gateway,
+            self._new_archive(),
+            config=RollingFetchConfig(
+                max_days_per_chunk=30,
+                inter_request_delay_seconds=0,
+                default_lookback_days=10,
+                correction_overlap_days=2,
+            ),
+            sleep_fn=FakeSleep(),
+        )
+
+        initial = use_case.execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+            to_date=to_date,
+        )
+        follow_up = use_case.execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+            to_date=to_date + timedelta(days=1),
+        )
+
+        self.assertEqual(initial.chunk_request_count, 1)
+        self.assertEqual(follow_up.chunk_request_count, 1)
+        follow_up_start = datetime.strptime(
+            gateway.calls[-1][0], "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=IST)
+        self.assertEqual(follow_up_start, to_date - timedelta(days=2))
 
     def test_refresh_uses_configured_correction_overlap(self):
         gateway = FakeGateway()

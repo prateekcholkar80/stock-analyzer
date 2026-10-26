@@ -1,11 +1,335 @@
 # Jarvis Implementation Continuation Handoff
 
-Last updated: **2026-09-05 (Asia/Kolkata)**
+Last updated: **2026-10-26 (Asia/Kolkata)**
 
 Use this file to resume implementation without relying on chat history. The
 authoritative architectural detail remains in `docs/current-baseline.md`; this
 document captures the current decisions, exact executable path, validation
 evidence, local artifacts, known gaps, and recommended next work.
+
+## PR #3 merge preparation — 2026-10-26
+
+The user authorized committing and pushing the accumulated fixes, updating
+PR #3 for review, and merging it into `main` with a merge commit. The original
+checkpoint `28dab46` and its branch are to be retained for revisiting this
+state. The fetched `origin/main` remains `ff8050f`; no integration changes or
+repeat regression run are needed before publishing the tested fixes.
+
+Final evidence: **2,865 Python tests**, **75 frontend tests** and the production
+build passed; TypeScript and changed-TypeScript-file lint passed; package/
+analyst split and normal wake-button clicks passed deterministic browser
+verification. Whitespace checks pass across the complete PR diff. A limited
+credential-pattern and artifact-path scan of the 233-file PR inventory found
+no matches. It is not a comprehensive security or independent code review.
+Ignored local screenshots, test logs, downloaded PDFs, databases and sessions
+remain outside Git. Live provider/LLM validation was not run for this merge.
+
+This handoff is included in the fix commit before publication; the merge SHA
+is recorded by the GitHub PR and the completion report. Earlier sections below
+describe the historical unstaged state. After publication and merge, resume
+from a clean local `main`. No deployment is included. Single recommended next
+step after merge: prepare the provider-neutral forecasting experiment contract
+before installing Kronos or downloading model weights.
+
+## PR #3 wake-button remediation and final validation — 2026-10-26
+
+The decorative `.communication-link` rule in `frontend/app/globals.css` now
+sets `pointer-events:none`. Links and their inherited decorative descendants
+remain visible while pointer hit-testing reaches the underlying controls.
+This resolves the desktop reactor wake-button interception discovered below
+without changing conversation, workflow or backend logic.
+
+The actual frontend was exercised against the loopback-only fixture API with
+normal animations enabled at 1600px, 1280px and 390px viewport widths. At each
+width, browser hit-testing reached the wake button, a normal unforced click
+returned HTTP 200 with conversation outcome `activated`, and the UI changed to
+`listening` with the analysis input enabled. All link pointer styles were
+`none`; no browser JavaScript errors or external requests were observed.
+Desktop/mobile screenshots were inspected and are ignored under
+`logs/visual-qa/wake-button-2026-10-26/`, with a JSON report. The temporary
+harness is `/private/tmp/jarvis_wake_verify.mjs`. No live provider or LLM was
+called, and temporary servers were stopped after verification.
+
+Validation evidence for the accumulated fixes:
+
+- The full Python regression, run during the preceding readiness review,
+  passed **2,865/2,865 tests** in 105.794 seconds. No Python code or tests
+  changed afterward, so this CSS-only fix does not require repeating it.
+- After the CSS change, frontend production build and **75/75 tests passed**.
+  The existing non-fatal Plotly chunk-size advisory remains.
+- Latest TypeScript and changed-TypeScript-file lint checks passed during
+  the frontend type-remediation step; no TypeScript changed afterward.
+- `git diff --check` passed.
+
+The recorded Python failures, frontend type errors, package/analyst visual
+verification and wake-button interception have been addressed. All accumulated
+fixes remain unstaged, uncommitted and unpushed; draft PR #3 still contains the
+original checkpoint. Single recommended next step: stage and commit the
+reviewed fixes on the checkpoint branch, then push them to PR #3 before
+considering its merge into `main`.
+
+## PR #3 deterministic visual verification — 2026-10-26
+
+The real frontend was exercised through its normal text wake, conversation,
+operation/SSE and authenticated audit flow against a temporary, loopback-only
+fixture API. It returned a synthetic committed-package reference and an
+intentionally unavailable Fundamental Analyst alongside deterministic research
+output. This verifies presentation of the package/analyst split; it does not
+exercise live provider retrieval or a real 16-dataset persistence transaction.
+The fixture uses its historical September test clock. No live provider,
+authentication flow or LLM was called; browser requests outside the two local
+fixture servers were blocked by the harness.
+
+Desktop (1600px viewport) and narrow-screen (390px) screenshots were inspected:
+
+- The green `Complete package committed · 16 datasets` row and red
+  `Fundamental Analyst explanation failed` row are separately visible.
+- The Fundamental Analyst card is in its failed state and displays `FAILED`.
+- The completed-document inventory remains visible independently of failure.
+- Text wraps within the panel; narrow-screen document width equals the 390px
+  viewport. No browser JavaScript errors were observed.
+
+Ignored local screenshots and the machine-readable report are under
+`logs/visual-qa/package-analyst-2026-10-26/`. The temporary fixture harness is
+under `/private/tmp/jarvis_visual_fixture.py` and
+`/private/tmp/jarvis_visual_verify.mjs`. No product code was changed for this
+visual check, and full regression suites were not repeated.
+
+A separate existing interaction issue was discovered: at the desktop viewport,
+the decorative `communication-link link-judge` span intercepts pointer events
+over the reactor's `Wake Jarvis` button. The check continued successfully using
+the supported text wake flow, without forced clicks. This issue remains open.
+
+All accumulated fixes and this handoff remain unstaged, uncommitted and
+unpushed to draft PR #3. Complete Python regression is still required before
+staging. Single recommended next step: make decorative communication links
+ignore pointer events, then verify normal reactor wake-button clicks.
+
+## PR #3 frontend type remediation — 2026-10-26
+
+All four recorded frontend type errors are resolved locally in
+`TechnicalChart.tsx` and `agent-visuals.ts`, without dependency changes or
+disabling type checks. A narrow candle-direction style extends the installed
+Plotly typing with its supported `fillcolor` field, preserving candle colors.
+Structure labels use grouped high/low traces with typed scalar above/below
+positions and one shared legend item. Break markers use the equivalent typed
+`text+markers` mode. The agent status map explicitly maps every
+`ProgressStatus` to an `AgentVisualState` instead of widening values to strings.
+
+Validation: frontend TypeScript **passed with zero errors**; **7/7 focused
+agent/chart tests passed**; ESLint passed for both changed files; the frontend
+production build and **75/75 frontend tests passed**; `git diff --check` passed.
+The existing non-fatal Plotly chunk-size advisory remains. No Python regression
+or live provider validation was rerun for this frontend step.
+
+The accumulated Python test fixes and these frontend fixes remain unstaged,
+uncommitted and unpushed to draft PR #3. The previously recorded Python
+failure/error cases pass in their affected modules, but complete Python
+regression is still required before staging. Deterministic UI verification
+also remains outstanding. Single recommended next step: visually verify a
+committed fundamental package alongside an intentionally unavailable
+Fundamental Analyst using a deterministic fixture.
+
+## PR #3 presentation-fixture remediation — 2026-10-26
+
+The missing trade result in
+`test_multi_timeframe_briefing_exposes_exact_long_two_r_plan` was an outdated
+fixture assumption. The monotonically rising candle fixture has no confirmed
+daily or weekly pivots: its market-structure family is neutral, so current
+hierarchy policy correctly returns `NO_TRADE` before daily planning. The
+presenter already handles that state safely; the test dereferenced the absent
+planning result afterward.
+
+The actionable presentation test now uses an explicitly named synthetic
+eligible fixture with a narrowly scoped bullish market-structure finding stub,
+following the existing actionable workflow test pattern. Actual stop/target
+planning and hierarchy validation still run; the test asserts an approved,
+release-eligible plan before checking exact presented prices and the 2R target.
+This fixture isolates presentation behavior and does not establish that the
+original candle sequence has confirmed bullish structure.
+
+A separate unpatched regression retains that original sequence and proves
+that a bullish Judge cannot override neutral primary structure: planning is
+absent, the explanation reports `NO_TRADE` with
+`timeframe_setup_not_aligned`, and entry, stop, risk and target prices remain
+absent. Production calculations, eligibility gates and presentation code are
+unchanged. No live provider, broker or LLM was called.
+
+Validation: **9/9 presentation tests passed**; combined presentation and
+end-to-end multi-timeframe swing workflow modules passed **24/24 tests**.
+`git diff --check` passed. Full Python regression and frontend checks were not
+rerun for this test-only step; the earlier checkpoint counts are historical.
+
+All schema, HTTP-clock and presentation fixes remain unstaged, uncommitted and
+unpushed to draft PR #3. All nine original Python failure/error cases now pass
+in their affected modules, but a new complete regression result is still
+required before staging. The remaining recorded blockers are four frontend
+type errors and deterministic UI verification. Single recommended next step:
+diagnose and fix the frontend type errors in `TechnicalChart.tsx` and
+`agent-visuals.ts`.
+
+## PR #3 HTTP reference-clock remediation — 2026-10-26
+
+The two expired-reference HTTP failures are resolved locally in
+`tests/unit/test_http_api.py`. Both document fixtures are built before one
+mutable clock is chosen after their storage times and before either expires.
+That clock is injected into both repositories, the API, the background runner
+and the fake operation handler. Previously, the API used wall-clock time and
+the benchmarking repository discarded its already-expired historical fixture
+during initialization. The financial-document fixture clock alone also
+preceded the benchmarking record's storage time. The shared clock preserves
+the session chronology required by conversation follow-up tests.
+
+One new parameterized HTTP test checks both document endpoints one microsecond
+before expiry (200), at expiry (410) and one microsecond afterward (410).
+Existing authentication, operation ownership, scope and deleted-document
+checks remain. Production expiry, authorization and storage code are unchanged;
+no live provider, broker or LLM was called.
+
+Validation: **3/3 focused tests passed**; after aligning the runner and fake
+handler clocks, the complete HTTP module passed **40/40 tests**, including all
+six expiry-boundary cases. `git diff --check` passed. Full Python regression
+and frontend validation were not rerun for this test-only step; earlier full
+counts remain historical.
+
+These changes and the schema-test fixes below remain unstaged and uncommitted;
+they have not been pushed to draft PR #3. The remaining recorded blockers are
+the presentation-fixture error, four frontend type errors and deterministic UI
+verification. Single recommended next step: diagnose
+`test_multi_timeframe_briefing_exposes_exact_long_two_r_plan` before changing
+its expected trade outcome.
+
+## PR #3 schema-test remediation — 2026-10-26
+
+The six checkpoint schema failures are resolved locally. Four repository test
+modules still asserted historical DuckDB versions 5/6 even though the shared
+adapter and central storage contract use version 9. Their initialization
+assertions now explicitly expect 9 and compare persisted metadata with the
+adapter's reported version. Existing protocol, table and index checks remain.
+No production adapter, schema version or migration behavior was changed.
+
+The v3/v4 migration tests now create representative legacy market-envelope
+tables and populate them directly with synthetic records, rather than testing
+only an old metadata row. They verify exact record preservation through the
+upgrade and a second reopen, successful writes/reads in the newly created
+fundamental/financial-document repositories, and persistent version-9
+metadata. These are focused fixtures, not exhaustive historical-schema dumps.
+Only temporary test databases are used; no local research database or live
+provider was accessed.
+
+Validation executed:
+
+- Benchmarking and peer-comparison pair: **12/12 tests passed**.
+- Financial-document and fundamental pair: **26/26 tests passed**.
+- Combined four repository modules plus central DuckDB storage suite:
+  **78/78 tests passed**, including all six previously failing tests and the
+  existing central version/migration safeguards.
+- `git diff --check` passed.
+- Full Python and frontend suites were not rerun for this test-only step.
+  The 2,863-test checkpoint result below remains historical; it is not a
+  post-fix full-regression result.
+
+Changes are unstaged and uncommitted. Draft PR #3 was previously pushed at
+checkpoint `28dab46`; these local fixes have not been published to it.
+The remaining recorded blockers are two HTTP expired-reference failures, one
+presentation-fixture error, four frontend type errors and pending deterministic
+UI verification. Single recommended next step: diagnose the two HTTP
+expired-reference failures using an explicit test clock.
+
+## Local checkpoint and draft PR plan — 2026-10-26
+
+Checkpoint branch: `checkpoint/fundamental-intelligence-2026-10-26`, created
+from the working state on `feature/hierarchical-evidence-policy` at base commit
+`ff8050f`. The checkpoint preserves the accumulated technical evidence-policy,
+market-history resilience, fundamental package/scorecard/analyst, corporate
+filings, runtime skill, API and dashboard implementation together with its
+tests and engineering skills. It is a work-in-progress snapshot, not a
+merge-ready release or approval to promote runtime policies.
+
+Downloaded `data/fundamental-artifacts/` PDFs are now ignored. Local databases,
+credentials, sessions and other ignored runtime state are outside this
+checkpoint; the commit reproduces tracked code, not the complete local data
+environment. No live provider, broker, authentication or LLM validation was
+requested or deliberately run.
+
+Validation executed for this exact implementation:
+
+- Full Python regression: **2,863 tests run; 8 failures and 1 error**.
+  Six failures assert older DuckDB schema versions (5/6 versus current 9),
+  across benchmarking, financial-document, fundamental and peer repositories.
+  Two HTTP reference tests expect 200 but receive expired-reference 410.
+  The presentation test
+  `test_multi_timeframe_briefing_exposes_exact_long_two_r_plan` errors because
+  its trade result is `None` before accessing `approved_trade_intent`.
+  These are observed failure categories, not confirmed root-cause diagnoses.
+- Frontend production build and **75/75 tests passed**.
+- Tijori bridge **255/255 tests passed**, using installed Node 24 after the
+  default Node binary failed to load a Homebrew library. Fixture-browser tests
+  required execution outside the sandbox; no provider session was used.
+- Frontend type-check fails with the four previously documented errors:
+  three Plotly type errors in `TechnicalChart.tsx` and one state-type error in
+  `agent-visuals.ts`.
+- Python compilation, `pip check`, and `git diff --check` passed.
+- A limited credential-pattern scan across 228 candidate files found no
+  private-key or supported token-prefix matches; it is not a comprehensive
+  security review.
+
+Draft PR plan (not pushed or opened):
+
+1. Push this checkpoint branch only when explicitly requested, then open a
+   **draft** PR against `main`, titled
+   `WIP: checkpoint fundamental intelligence and evidence workflow`.
+2. Describe the preserved implementation scope, evidence/source safeguards,
+   artifact exclusions and exact validation failures above. Keep the PR draft
+   while those failures and frontend type errors remain unresolved.
+3. Diagnose the Python failures in small, validated steps; then address the
+   frontend type errors and visually verify package-publication success with
+   an intentionally unavailable Fundamental Analyst using a deterministic
+   fixture. Refresh required regression evidence after implementation changes.
+
+Resume from this checkpoint branch, or create a new branch at its checkpoint
+commit SHA. Preserve any newer working-tree changes before switching. Earlier
+sections below are historical records and may contain superseded next steps
+or validation counts.
+
+Single recommended next step: diagnose the nine Python regression failures/
+errors before preparing the draft PR for review. No staging, push or PR creation
+is implied for subsequent implementation work.
+
+## Current Historical Market-Data Resilience
+
+First-time hourly market-history pulls now target at least ten years (3,653
+days) wherever the broker has data. Existing instruments preserve the rolling
+behavior: they resume from the latest archived candle and re-fetch only the
+seven-day correction overlap. Request ranges are capped by Angel One's current
+published interval limits; `ONE_HOUR` uses at most 400 days per call, reducing
+a ten-year first load to roughly ten calls.
+
+Existing archives created under the former one-year default are not stranded.
+The first refresh requests only their missing older segment plus the normal
+recent correction segment, then stores a fingerprinted attempted-coverage
+watermark. This watermark records the requested range even when a company was
+listed more recently and the provider returns no older candles, preventing the
+same pre-listing range from being requested after every restart.
+
+The Angel adapter enforces the broker's published historical limits of 3
+requests/second, 180/minute and 5,000/hour with a thread-safe sliding window.
+Angel's plain-text rate-limit denial is retried with bounded 2, 5 and 10 second
+backoff. Exhaustion raises the existing safe market-data failure; partial data
+is never presented as a completed analysis.
+
+Concurrent identical pulls are single-flight within the running backend. One
+request performs the broker work while waiters receive defensive copies of its
+result. Failures are propagated to all waiters and are not retained as a
+successful flight. This protects one Jarvis process; a future multi-process
+deployment still needs a distributed client-code lease because Angel applies
+limits across the account.
+
+Targeted validation on 2026-09-10 passed all 16 Angel-client tests, all 16
+market-model tests, all 18 rolling-fetch tests, and the focused DuckDB coverage
+round-trip. The affected market-data, operation-logging, browser-runner,
+end-to-end and persistence run passed all 99 tests. No live provider regression
+was run after the code change.
 
 ## Current CPR Release Candidate
 
@@ -1130,8 +1454,10 @@ the established composition without an explicit design-revision request:
   bridge, authenticated provider sessions, browser cache orchestration, and
   scoped cached-document resolution now exist. User-owned interactive login
   and selected provider reads have been manually exercised; automated live
-  provider regression remains intentionally opt-in. The deterministic
-  fundamental metric engine and Fundamental Analyst are pending.
+  provider regression remains intentionally opt-in. Deterministic normalized
+  metrics, mandatory checks, and framework applicability are implemented;
+  framework scorecards and released Fundamental Analyst synthesis remain
+  pending.
 - The frontend exposes Tijori connection status, explicit headed-login connect,
   refresh/status, expiry/reconnect, and secure revoke controls. Credentials and
   provider session material are never accepted or rendered by the frontend.
@@ -1183,9 +1509,12 @@ the established composition without an explicit design-revision request:
    Judge, and the Fundamental Analyst. Enforce allowed evidence, required
    citations, output schemas, abstention, skill version/hash audit, and
    provider-neutral LLM composition.
-4. Build the deterministic normalized fundamental metric engine and preliminary
-   scorecard from the cached structured JSON, explicitly excluding annual
-   reports and qualitative management/moat conclusions.
+4. Continue the deterministic fundamental pipeline at Phase F4.1 by adding
+   versioned scoring-policy contracts. Phases F0-F3 now provide the atomic
+   package boundary, normalized metrics, derived calculations, mandatory
+   health/earnings-quality/forensic assessments, and deterministic framework
+   applicability and selection. Annual reports and qualitative
+   management/moat conclusions remain excluded.
 5. Add database-agnostic repository models/ports for the complete
    `MultiTimeframeEndToEndSwingAnalysisResult`, then implement in-memory and
    DuckDB adapters with normalized daily/weekly evidence, verdict, trade plan,
@@ -1211,3 +1540,737 @@ For a live actionable-plan check, wait for a naturally bullish qualifying
 instrument/dataset and observe it without changing thresholds or forcing the
 Judge. That check is useful, but durable multi-timeframe persistence is the more
 important next implementation dependency for the planned dashboard.
+
+## 13. Controlled Learning and Fundamental Intelligence Plan
+
+The current authoritative execution plan for the Hermes-inspired,
+human-governed procedural-learning lifecycle and the deterministic fundamental
+analysis pipeline is:
+
+- [Execution plan](controlled-learning-and-fundamental-intelligence-plan.md)
+
+It preserves these decisions:
+
+- normal equity analysis will use cache-first fundamentals by default, while
+  full refresh remains explicit or is triggered by package absence/expiry;
+- the atomic 16-dataset package is the only eligible normalization input;
+- deterministic code owns metrics, mandatory checks, framework applicability,
+  scores, and bounded debate evidence;
+- the Fundamental Analyst and framework skills explain released evidence but
+  cannot calculate or change it;
+- Bull, Bear, and Senior Judge will receive the same immutable bounded
+  fundamental-assessment fingerprint;
+- new scores begin in shadow mode and cannot become a trade gate without a
+  separately evaluated and approved policy; and
+- learning observations and candidates cannot silently rewrite or promote an
+  active skill.
+
+### Fundamental implementation status
+
+Phases **F0 through F4 are complete at the deterministic domain layer**:
+
+- F0 preserves the immutable, committed 16-dataset package as the only
+  eligible normalization boundary. Partial provider refreshes cannot become
+  active evidence.
+- F1 defines provider-neutral normalized financial evidence with explicit
+  period, reporting basis, unit, availability, calculation version, package
+  lineage, fingerprints, and exact JSON citations. Versioned derived metrics
+  cover growth, margins, leverage, cash conversion, working capital, and
+  preliminary valuation calculations.
+- F2 defines immutable assessment contracts and versioned deterministic
+  policies for financial health, earnings quality, and forensic risk.
+- F3 defines immutable applicability contracts and a versioned deterministic
+  policy that evaluates Buffett, Lynch, Jhunjhunwala-style, 100-Bagger,
+  CAN SLIM, and Valuation lenses, records evidence coverage and exclusions,
+  ranks them reproducibly, and selects no more than three eligible primary
+  frameworks.
+- F4 defines immutable metric, evidence-family, framework, and aggregate
+  score results plus six versioned scoring policies. The released policy
+  bundle applies mandatory financial-health, earnings-quality, and forensic
+  constraints after framework scoring so a favourable framework cannot offset
+  a mandatory failure.
+- Financial-health checks cover liquidity, leverage, coverage, capital
+  efficiency, working capital, balance-sheet expansion, and reporting-basis
+  conflict.
+- Earnings-quality checks cover PAT/OCF alignment, cumulative cash conversion,
+  FCF consistency, EBITDA/PAT/OCF divergence, working-capital absorption,
+  annual/quarterly consistency, dilution, and exceptional-item dependence.
+- Forensic-risk checks cover persistent positive-profit/negative-OCF mismatch,
+  receivables growth versus revenue, debt growth with weak coverage, promoter
+  pledge, promoter-holding erosion, consolidated/standalone growth divergence,
+  duplicate conflicts, and asset/liability-total inconsistencies.
+
+All mandatory checks are deterministic, point-in-time bounded, unit- and
+currency-aware, cited, and reproducible. Missing, conflicting, non-consecutive,
+or unsupported sector evidence returns explicit `NA`; it never becomes a
+silent pass. Industrial cash-flow, receivables, and leverage rules are withheld
+for BFSI and unknown-sector issuers until an approved sector policy exists.
+Forensic outputs are review flags only and must not be presented as findings of
+fraud, governance failure, auditor concern, or related-party misconduct.
+Framework applicability is evidence coverage, not a score or recommendation.
+The selector requires the exact active normalized-evidence and mandatory-check
+fingerprints, rejects future or not-yet-published observations, does not
+interpolate missing periods, and preserves source citations for conflicting
+evidence. BFSI and unknown-sector issuers fail closed until approved
+sector-specific framework policies exist. CAN SLIM and peer-relative Valuation
+remain partial where their sponsorship, leadership, market, catalyst, or peer
+families have not yet entered the normalized evidence boundary.
+
+Latest completed validation for this milestone:
+
+- **23 framework applicability contract and selector tests passed** across
+  `tests.unit.test_fundamental_frameworks` and
+  `tests.unit.test_fundamental_applicability`;
+- **90 fundamental domain tests passed** across normalized metrics,
+  mandatory-assessment contracts and checks, framework contracts, and
+  deterministic framework selection;
+- changed Python modules compile successfully, line-length checks pass, and
+  `git diff --check` is clean.
+
+The score bundle is now connected to the Fundamental Analyst through a
+deterministic package-intelligence workflow. It accepts only one active,
+committed 16-dataset package, preserves every package source binding,
+normalizes reviewed financial rows, derives versioned metrics, runs mandatory
+checks, evaluates framework applicability, and only then runs the six-policy
+scorecard. The browser uses the same committed package for refresh and cached
+analysis paths. The Fundamental Analyst receives a bounded immutable
+projection and returns the package, assessment, applicability, policy, and
+scorecard fingerprints in a browser-safe trace reference.
+
+This integration remains strictly **shadow-only**. The orchestration rejects
+advisory or gate-enabled bundles, the analyst cannot recalculate or alter a
+score, and no fundamental score affects Bull, Bear, Judge, entry, stop, target,
+or trade release.
+
+The deterministic sector-profile boundary is now implemented. The existing
+NSE sector catalog exposes exact-symbol observations with the source location,
+real cache/download time, payload fingerprint, and per-record fingerprint.
+The neutral resolver converts these to bounded-freshness citations, and the
+versioned classifier uses reviewed exact taxonomy labels only. It selects
+`non_financial` or `bfsi` only from current agreeing evidence; missing,
+expired, unsupported, cross-issuer, or conflicting evidence remains
+`unknown`. No name, description, peer-set, substring, LLM, or provider guess
+is allowed. The classification is bound to the same active 16-dataset package,
+is mandatory for the intelligence builder, and is projected with its matches
+and citations into the Fundamental Analyst context. BFSI classification
+continues to withhold industrial-company rules until separately approved BFSI
+policies exist. Provider-standardized fundamentals remain secondary research
+evidence.
+
+Latest validation for the score-bundle integration:
+
+- **189 fundamental, composition, normalization, applicability, scoring, and
+  analyst tests passed**;
+- **2 focused browser workflow tests passed** for successful shadow wiring and
+  safe analyst validation failure;
+- changed modules compile and `git diff --check` passes; and
+- no live provider or LLM validation was run.
+
+Latest validation for the sector-profile milestone:
+
+- **142 affected sector, mandatory-check, applicability, scoring, composition,
+  and Fundamental Analyst tests passed**;
+- **2 focused browser workflow tests passed** for cited non-financial routing
+  and safe validation failure;
+- changed modules compile and `git diff --check` passes; and
+- no live NSE, Tijori, broker, or LLM call was run.
+
+One unrelated existing browser-runner test remains defective: its second
+request uses operation ID `operation-2` while its fixed research response still
+contains `operation-1`, so the operation-binding guard fails before the
+assertion intended by that test. This was not changed as part of F4 wiring.
+
+Phase F5.1 is complete. Version `1.0.0` Buffett and Lynch explanatory framework
+skills now mirror their released deterministic policy families and limitations.
+Both require exact current-package citations, surface mandatory constraints
+before favourable observations, preserve shadow-only scores unchanged, and
+prohibit provider access, hidden arithmetic, unsupported qualitative claims,
+persona impersonation and trade decisions. Both skill folders pass the
+skill-package validator. They are not registered or runtime-loadable yet;
+those controls remain deliberately assigned to F5.4-F5.6.
+
+These changes remain unstaged in the existing working tree. The next bounded
+step is Phase F5.2: create the versioned Jhunjhunwala-style and 100-Bagger
+explanatory framework skills under the same fail-closed boundary.
+
+## 14. Company Filings and Jhunjhunwala-Style Evidence Handoff
+
+Planning status as of 2026-09-14:
+
+- the supplied Tijori company-overview HTML exposes direct Company Filings
+  links for Earnings Releases and Conference Calls under the verified provider
+  company identity;
+- the current Tijori MCP public schema and handlers do not yet expose filing
+  discovery or PDF download;
+- sample five-page Earnings Release and 24-page Conference Call documents were
+  inspected locally for architectural planning only; no live Tijori request
+  was made and no source document was added to the repository;
+- the documents provide material evidence for opportunity/runway,
+  concentration, operating leverage, adjusted earnings, cash conversion,
+  acquisition execution, guidance, and longitudinal thesis monitoring;
+- company statements remain management claims until realized or independently
+  corroborated, and the provider-generated Conference Call Summary remains
+  secondary derived material;
+- physical PDFs will be retained as immutable, content-addressed, owner-only
+  artifacts. The 10-day interval means freshness recheck, not deletion;
+- DuckDB will store metadata, hashes, citations, extraction lineage, and active
+  package pointers, not PDF blobs;
+- the existing quantitative 16-dataset package remains unchanged. Filings will
+  publish through a separate atomic `FundamentalFilingPackage`, and incomplete
+  refreshes will preserve its prior active version; and
+- one dedicated Corporate Filings Analyst is now planned. It initiates
+  provider-neutral filing acquisition, waits for deterministic extraction and
+  citation validation, and strictly uses the exact verified Jhunjhunwala-style
+  runtime skill for its LLM interpretation. It does not impersonate a person,
+  calculate scores, access credentials, invent evidence, or make a trade
+  decision;
+- the agent runs concurrently with independent technical and quantitative-
+  fundamental work after issuer resolution. Its dependent synthesis waits for
+  a complete filing package, and its outcome is recorded independently;
+- completed quarterly-bundle and longitudinal analyses are retained as
+  immutable structured results. An exact cache key binds the issuer, filing
+  package, PDF hashes, extraction/citation policies, skill and doctrine hashes,
+  score policy, prompt/output contracts, and model configuration; and
+- matching cached results prohibit a repeat LLM call. A normal refresh only
+  rechecks provider documents; unchanged hashes reuse prior analysis. New or
+  revised documents, approved policy/skill changes, missing results, or an
+  explicit filing-reanalysis instruction trigger new analysis.
+
+The authoritative two-workstream execution backlog is now section 16 of
+[the controlled-learning and fundamental-intelligence plan](controlled-learning-and-fundamental-intelligence-plan.md).
+It provides one-at-a-time substeps, each scoped to at most two files, for:
+
+1. Tijori filing discovery and bounded authenticated PDF download;
+2. owner-only artifact retention and complete metadata;
+3. deterministic page/table/speaker extraction and citation validation;
+4. atomic filing-package refresh and operation outcomes;
+5. a grounded, Jhunjhunwala-style Corporate Filings Analyst with immutable
+   quarterly and longitudinal analysis caching;
+6. document-derived guidance, concentration, scalability, capital-allocation,
+   and execution-consistency evidence;
+7. a separately versioned shadow Jhunjhunwala-style score candidate; and
+8. exact-hash skill approval, Fundamental Analyst synthesis, and bounded
+   Bull/Bear/Judge evidence.
+
+No implementation, live-provider access, staging, commit, or push was
+performed for this planning step. Existing working-tree changes remain
+unstaged and were not modified outside these two documentation files.
+
+### Filing acquisition implementation status
+
+PDF-A0.1 through PDF-A3.2 are now implemented. In particular, the Tijori MCP
+now exposes six read-only research tools plus one non-destructive, idempotent
+staging tool for strict issuer-bound filing download. The PDF downloader is
+composed only inside the provider registry created after a positive
+authentication probe. Its non-secret staging
+boundary is supplied through `JARVIS_TIJORI_FILING_STAGING_DIRECTORY`; when the
+boundary is absent or invalid, download fails closed without disabling the
+existing research handlers. Downloads remain restricted to exact discovered
+Tijori PDF URLs, an owner-only directory, bounded PDF content, atomic
+content-addressed finalization, and sanitized envelopes that contain neither
+paths nor credentials.
+
+Validation for PDF-A3.2:
+
+- focused result, input, tool-registry, provider-registry, and MCP composition
+  tests passed;
+- the complete deterministic Tijori MCP suite passed **254/254** tests using
+  the pinned Node 24 runtime; and
+- `git diff --check` passed. No live provider call or authentication was run.
+
+PDF-A4.1 is now complete. The Python Tijori boundary accepts the same seven
+approved tools as the JavaScript MCP and has immutable provider-specific
+contracts for a complete Company Filings discovery snapshot and a validated
+staged-PDF manifest. The contracts enforce bounded collections and bytes,
+timezone-aware timestamps, exact issuer/category/source binding, matching
+discovery fingerprints and completeness counts, content-addressed artifact
+keys, explicit unclassified periods, and rejection of extra secret or path
+fields. Provider-neutral translation is intentionally not part of this step.
+
+Validation for PDF-A4.1:
+
+- **7/7** focused filing payload contract tests passed;
+- **121/121** Tijori Python contract, adapter, and stdio transport tests passed;
+- changed Python files compiled and `git diff --check` passed; and
+- no live provider call, authentication, PDF download, or filesystem staging
+  was run.
+
+PDF-A4.2 and PDF-A4.3 are now complete. The provider-neutral fundamental
+gateway has explicit filing-discovery and filing-acquisition capabilities,
+immutable request/result bindings, and all-or-nothing payload release. A
+neutral filing reference preserves both its Jarvis discovery-snapshot
+fingerprint and the opaque source-discovery fingerprint required to acquire
+the exact provider reference; neither value is reconstructed or guessed.
+
+`TijoriMcpAdapter` now translates a complete Company Filings payload into the
+neutral discovery model and implements exact-reference acquisition. Its
+injected artifact importer requires distinct, pre-existing owner-only staging
+and durable roots. It reopens staged content without following symlinks,
+revalidates ownership, permissions, byte length, SHA-256, PDF header, EOF,
+page bound and PDF version, creates hashed tenant/connection and verified-
+issuer storage partitions, publishes without overwriting an existing hash,
+and removes staging content only after successful durable publication.
+Provider failures remain sanitized, and acquisition is unavailable before any
+provider call when the secure importer is not configured.
+
+Validation for PDF-A4.2 and PDF-A4.3:
+
+- **128/128** deterministic Tijori Python contract, adapter, and stdio tests
+  passed;
+- **21/21** provider-neutral filing-domain and gateway tests passed;
+- changed Python files compiled and `git diff --check` passed; and
+- no live provider call, authentication, PDF download, or production artifact
+  mutation was run.
+
+The filing live-wiring prerequisite for PDF-A5.1 is complete. The stdio
+settings now accept an optional absolute filing-staging directory, validate it
+as a pre-existing owner-only real directory, include it in the transport
+configuration fingerprint, and forward it to the Node MCP process through the
+otherwise allowlisted non-secret subprocess environment. No parent backend
+environment is inherited.
+
+The fundamental composition root loads the staging and durable artifact paths
+independently, requires them as an all-or-nothing pair, constructs the secure
+`TijoriFilingArtifactImporter`, and injects it into `TijoriMcpAdapter`. The
+executable browser bootstrap supplies the durable root to this composition.
+The local ignored environment now points at distinct pre-existing mode-0700
+staging and durable directories, and its non-secret MCP entrypoint SHA-256 pin
+was synchronized after the filing server changes. No credential, cookie,
+session content, PDF, or provider payload was added to configuration or logs.
+
+Validation for the live-wiring prerequisite:
+
+- **23/23** targeted stdio transport tests passed;
+- **18/18** fundamental composition tests passed;
+- **5/5** executable browser provider-composition tests passed;
+- the combined affected transport, adapter, composition, and browser-bootstrap
+  suite passed **94/94** tests;
+- changed Python files compiled and `git diff --check` passed; and
+- an offline composition-only check validated the pinned runtime/entrypoint,
+  both owner-only roots, and an enabled filing importer without starting MCP,
+  logging in, downloading a PDF, or calling Tijori.
+
+PDF-A5.1 is complete. `InMemoryFundamentalFilingRepository` implements the
+complete database-neutral port with immutable artifact saves, scoped content-
+hash and version reads, full-package storage, compare-and-swap active
+publication, explicit audited artifact/package deletion, and defensive copies.
+All reads are isolated by tenant, provider connection, and verified issuer.
+
+Package commit validates its complete aggregate and artifact relationships
+before mutating state. A failed or losing concurrent CAS leaves the previous
+active package unchanged and does not expose the candidate package or its
+artifacts. Exact retries are idempotent. Duplicate and supersession links must
+resolve inside the same scope; duplicate hashes must match, while superseded
+versions must retain the filing reference and change the content hash.
+
+`recheck_after` remains a non-destructive freshness boundary. Due artifacts and
+packages remain retained and readable. Artifact deletion is rejected while any
+retained package references it; exact authorization can delete a package and
+atomically clear its active pointer, after which artifact cleanup still
+requires its own exact authorization.
+
+Validation for PDF-A5.1:
+
+- **14/14** targeted in-memory filing repository tests passed;
+- the filing domain, repository, gateway, Tijori payload and adapter subsystem
+  suite passed **96/96** tests;
+- changed Python files compiled and `git diff --check` passed; and
+- no live provider request, PDF mutation, database write, staging, commit, or
+  push was performed.
+
+PDF-A5.2 is complete. `DuckDBJarvisStorage` now implements the database-neutral
+filing repository with schema version 7 and dedicated tables for immutable
+artifact metadata, complete package JSON, package-to-artifact relations,
+scoped active pointers, and deletion audit receipts. The schema stores the
+validated content-addressed `safe_relative_path` but has no PDF-byte or BLOB
+column; physical PDFs remain exclusively in the owner-only durable filesystem.
+
+Artifact saves and full-package commits are transactional. Package publication
+uses an exact compare-and-swap precondition, and any conflict, invalid lineage,
+or storage failure rolls back the candidate package and its artifacts before
+the active pointer can change. Successful refreshes atomically move the pointer
+while retaining prior packages. Reads, hash queries, version history, and
+active pointers are isolated by tenant, provider connection, and verified
+issuer. Recheck timestamps remain freshness metadata and never auto-delete
+retained filings.
+
+Exact package and artifact deletion authorizations are handled transactionally.
+Artifact deletion remains blocked while any retained package references it;
+package deletion removes its relation rows and active pointer but keeps artifact
+metadata for separately authorized cleanup. Every deletion request receives a
+durable, idempotent audit receipt without touching physical PDF bytes.
+
+Validation for PDF-A5.2:
+
+- **33/33** targeted DuckDB storage tests passed;
+- the filing model, repository contract, in-memory adapter, and DuckDB adapter
+  subsystem passed **67/67** tests;
+- the changed adapter compiled and `git diff --check` passed; and
+- no live provider request, authentication, PDF download, production database
+  write, filesystem artifact mutation, staging, commit, or push was performed.
+
+PDF-A6.1 is complete. The new immutable
+`jarvis.fundamental_filing_evidence.v1` aggregate preserves every physical PDF
+page and models ordered text blocks/headings, table cells and mixed source
+units, page geometry, explicit or unresolved speaker turns, exact page-span
+citations, observed facts, adjusted metrics, management claims, guidance,
+risks, warnings, limitations, extraction policy and deterministic coverage.
+
+Citation lineage binds each released excerpt to the artifact ID, PDF SHA-256,
+page number, source element, coordinates, and optional character offsets.
+Evidence records cannot reference citations or speaker turns outside that
+aggregate. Page numbers must exactly match the retained PDF page count in
+physical order; unreadable pages remain represented and require page warnings
+and material limitations. OCR-derived pages require an explicitly enabled,
+versioned OCR engine. Canonical ordering and complete lineage participate in a
+stable extraction fingerprint.
+
+Validation for PDF-A6.1:
+
+- **11/11** targeted filing-evidence contract tests passed;
+- the complete filing model, persistence and extraction-contract subsystem
+  passed **78/78** tests;
+- both changed Python files compiled and `git diff --check` passed; and
+- no parser, OCR process, LLM call, live provider request, PDF/database/filesystem
+  mutation, staging, commit, or push was performed.
+
+PDF-A6.2 is complete. `pdfplumber==0.11.10` and its exact transitive PDF
+dependencies are now declared in the runtime and lock requirements.
+`DeterministicFundamentalFilingExtractor` reads only the content-addressed PDF
+identified by a validated artifact manifest under the configured owner-only
+root. Before parsing it rechecks directory/file containment, type, ownership,
+permissions, byte length, SHA-256, and PDF page count.
+
+The parser deterministically preserves native PDF pages, ordered text blocks,
+heading classification, source coordinates, printed page labels, ruled table
+geometry, source-observed units and numeric values, and explicitly labelled
+speaker turns. Exact text-block, table-cell, and speaker-turn citations are
+bound to the immutable artifact. Empty, unreadable, image-only, or table-
+degraded pages are preserved through attributable warnings and limitations.
+Unlabelled speakers are not inferred.
+
+OCR remains disabled in this adapter and an OCR-enabled policy fails closed
+until a separately versioned OCR implementation exists. The parser does not
+create semantic facts, management claims, guidance, risk judgements, framework
+scores, or LLM interpretations; those contract collections remain empty.
+
+Validation for PDF-A6.2:
+
+- dependency declaration matched the installed deterministic PDF stack and
+  `pip check` reported no broken requirements;
+- **10/10** targeted native/synthetic extractor tests passed, including a real
+  two-page generated PDF with native text, a ruled table and speaker content;
+- the complete filing model, persistence, contracts and parser subsystem
+  passed **88/88** tests;
+- changed Python files compiled and `git diff --check` passed; and
+- no OCR, LLM, live provider request, PDF download, production database or
+  artifact mutation, staging, commit, or push was performed.
+
+PDF-A6.3 is complete. The versioned
+`DeterministicFundamentalFilingEvidenceValidator` now requires the verified
+operation issuer, fiscal period, and expected filing source class. It returns
+an immutable, reproducibly fingerprinted release result with independent
+findings for issuer identity, period identity, physical page spans, unit
+integrity, duplicate semantic content, source classification, and citation
+completeness. Any failed finding makes the extraction non-releaseable without
+mutating the retained artifact or extracted aggregate.
+
+Citation validation now requires complete coverage of every text block, table
+cell, and speaker turn, exact excerpt/offset presence in the named source, and
+geometry contained by that source. Semantic evidence must cite available
+released citations. Source-observed numeric values must retain compatible
+units and deterministic multipliers, while reported values must occur in
+their cited source. Cross-page evidence receives canonical physical page
+spans; speaker lineage must remain monotonic and contiguous. Duplicate
+semantic content under different evidence IDs is rejected, as are source-
+class mismatches and issuer-attributed transcript statements without a
+management-speaker citation. The validator does not repair or infer missing
+identity, period, unit, attribution, or evidence.
+
+Validation for PDF-A6.3:
+
+- **10/10** targeted validator tests passed against the native PDF extraction
+  fixture, including deterministic fingerprints and fail-closed identity,
+  period, page-lineage, unit, duplicate, source-class, and citation cases;
+- the complete filing model, persistence, contracts, parser, validator, and
+  DuckDB subsystem passed **98/98** tests;
+- changed Python files compiled and `git diff --check` passed; and
+- no OCR, LLM, live provider request, PDF download, production database or
+  artifact mutation, staging, commit, or push was performed.
+
+PDF-A6.4 is complete. Validation-result contracts now reside in the provider-
+neutral filing-evidence model layer and enforce complete canonical findings,
+consistent release decisions, valid page spans, and immutable fingerprints at
+construction. Existing validator imports remain backward-compatible.
+
+`StoredFundamentalFilingEvidence` binds the complete extraction and validation
+result to the exact artifact ID/fingerprint, extraction-policy fingerprint,
+validation-policy fingerprint, extraction fingerprint, and validation
+fingerprint. Its content-derived record ID supports immutable idempotency, and
+its explicit strict JSON boundary reconstructs standard frozen validation
+dataclasses without accepting computed or extra fields.
+
+The database-neutral `FundamentalFilingEvidenceRepository` provides scoped
+immutable save, exact read, artifact-version listing, and policy-key lookup.
+All reads require an aware point-in-time boundary and exact tenant, provider
+connection, and verified issuer scope. Retained evidence has no implicit cache
+expiry or broad deletion escape hatch. The in-memory reference adapter adds
+thread safety, defensive copies, conflict rejection, deterministic ordering,
+future-write rejection, and point-in-time visibility. Failed validation
+records remain auditable while preserving `releaseable=False`.
+
+Validation for PDF-A6.4:
+
+- **22/22** targeted validation-contract, repository-contract, and in-memory
+  adapter tests passed;
+- the complete filing model, artifact/package persistence, parser, validator,
+  evidence persistence, and DuckDB regression subsystem passed **110/110**
+  tests;
+- changed Python files compiled and `git diff --check` passed; and
+- no OCR, LLM, live provider request, PDF download, production database or
+  artifact mutation, staging, commit, or push was performed.
+
+All changes remain unstaged. The single recommended next step is PDF-A6.5:
+implement the transactional DuckDB adapter for complete extraction and
+validation JSON, indexed only by scoped immutable fingerprint metadata.
+
+### Grounded Corporate Filings Analyst composition status
+
+CFA-A2.1 and CFA-A2.2 are complete. The provider-neutral
+`CorporateFilingsAnalystAgent` accepts only the immutable released quarterly
+filing bundle, binds every invocation to the exact request, skill, doctrine,
+prompt and model-configuration fingerprints, and returns only the strict
+corporate-filings analysis schema. It confirms the complete document and
+chunk set, enforces citation-to-chunk and speaker-to-citation lineage, reviews
+supporting and adverse evidence independently, and fails closed on unsupported
+evidence, malformed output, skill tampering, model failure or call-budget
+exhaustion. It cannot calculate or alter metrics or scores, access providers,
+impersonate an investor, or issue a trade decision.
+
+The LLM configuration now has a dedicated
+`corporate_filings_analyst` role with independent model, temperature and
+output-token settings plus shared-model fallback. The fundamental composition
+root loads a repository-owned exact-hash framework manifest, verifies the
+approved Jhunjhunwala-style `SKILL.md`, shared grounding policy and doctrine,
+selects that exact framework, then binds the dedicated gateway. Verification
+completes before gateway construction and performs no provider or LLM I/O.
+
+Validation for CFA-A2.1 and CFA-A2.2:
+
+- **14/14** targeted Corporate Filings Analyst grounding scenarios passed;
+- **76/76** combined LLM configuration/factory, framework loader, agent and
+  fundamental composition tests passed;
+- changed Python files compiled and whitespace checks passed; and
+- no live provider call, LLM request, authentication, PDF/database/filesystem
+  mutation, staging, commit or push was performed.
+
+All changes remain unstaged. The single recommended next step is CFA-A3.1:
+introduce a provider-neutral Corporate Filings Analysis coordinator that
+reuses an exact cached result, invokes the composed agent only on a cache miss
+or explicitly authorised refresh, and atomically preserves the last successful
+analysis when a new LLM attempt fails.
+
+CFA-A3.1 is complete. The new provider-neutral
+`CorporateFilingsAnalysisCoordinator` queries the immutable reuse-key index
+before invoking the analyst, bypasses that exact cache only when refresh is
+explicitly requested, and publishes a releaseable result through the
+repository's compare-and-swap active pointer. An identical refreshed result
+reuses its existing immutable stored aggregate while still passing through
+the active-pointer CAS; a changed result under the same immutable reuse key is
+treated as a publication conflict rather than overwriting history.
+
+The immutable coordination result separates `analysis_result`—the exact cached
+or newly attempted result—from `selected_analysis`, the usable committed
+record. A failed LLM result is retained for operation diagnostics but never
+stored or presented as usable evidence. The coordinator re-reads the active
+pointer after an analysis failure or CAS conflict and returns the latest
+tenant/issuer/quarter-scoped successful result when one exists. If no active
+fallback exists, the outcome explicitly carries no selected analysis.
+
+Validation for CFA-A3.1:
+
+- **13/13** targeted coordinator tests passed, including exact cache reuse,
+  explicit refresh, idempotent refresh, failed-attempt preservation, tenant
+  isolation, same-key conflicts, concurrent publication and no-fallback cases;
+- **96/96** combined analysis contract, grounded agent, repository, in-memory,
+  coordinator and DuckDB regression tests passed;
+- changed Python files compiled and `git diff --check` passed; and
+- no live LLM/provider call, authentication, PDF/database production mutation,
+  staging, commit or push was performed.
+
+All changes remain unstaged. The single recommended next step is CFA-A3.2:
+compose `CorporateFilingsAnalysisCoordinator` with the verified Corporate
+Filings Analyst and the already-open `DuckDBJarvisStorage` repository, without
+performing LLM or provider I/O during application bootstrap.
+
+CFA-A3.2 is complete. The fundamental composition root now accepts a
+caller-owned `CorporateFilingsAnalysisRepository`, validates that boundary
+before constructing any LLM gateway, loads the exact-hash approved
+Jhunjhunwala-style filing-analysis skill, binds the dedicated Corporate
+Filings Analyst role, and returns a `CorporateFilingsAnalysisCoordinator`.
+The browser bootstrap can pass its existing open `DuckDBJarvisStorage`
+instance directly because that adapter implements the provider-neutral
+repository protocol; composition neither imports the concrete adapter nor
+opens a second database connection.
+
+Validation for CFA-A3.2:
+
+- **22/22** focused fundamental-composition tests passed, including existing
+  DuckDB instance reuse and rejection before gateway construction;
+- **108/108** combined composition, coordinator, grounded-agent, repository,
+  in-memory and DuckDB storage tests passed;
+- changed Python files compiled and `git diff --check` passed; and
+- no live LLM/provider call, authentication, production database mutation,
+  staging, commit or push was performed.
+
+All changes remain unstaged. The single recommended next step is CFA-A4.1:
+introduce a deterministic quarterly filing-analysis request assembler that
+loads only the active filing package and its releaseable extracted evidence,
+then constructs the bounded, citation-preserving input required by the
+composed coordinator.
+
+CFA-A4.1 is complete. The provider-neutral
+`CorporateFilingsAnalysisRequestAssembler` reads only the scoped active filing
+package, refuses a package that did not exist at the logical assembly time,
+and selects the exact resolved fiscal quarter without relying on provider
+labels. It requires one unambiguous effective artifact for every document
+category required by conference-call, earnings-release or combined quarterly
+analysis, excluding explicit duplicates and superseded versions.
+
+For each selected artifact, the assembler reads only extraction versions
+visible at assembly time, chooses the latest releaseable result by immutable
+extraction/storage identity, and preserves the last valid extraction when a
+newer validation failed. The output retains package, artifact, extraction,
+validation, citation, speaker, reporting-period and analysis-policy lineage.
+Citations are packed into deterministic size-, page- and count-bounded chunks
+without truncation; an oversized citation or document fails closed. The
+assembler performs no provider, filesystem, LLM or write operation.
+
+Validation for CFA-A4.1:
+
+- **9/9** targeted assembly scenarios passed, including single and combined
+  quarterly packages, point-in-time visibility, latest-valid selection,
+  failed-validation fallback, missing package/evidence/category/quarter,
+  speaker/citation lineage and invalid repository boundaries;
+- **106/106** combined filing contracts, evidence validation/persistence,
+  grounded agent, coordinator and assembly tests passed;
+- **71/71** combined assembly, composition and DuckDB storage tests passed;
+- changed Python files compiled and `git diff --check` passed; and
+- no live LLM/provider call, authentication, production data mutation,
+  staging, commit or push was performed.
+
+All changes remain unstaged. The single recommended next step is CFA-A4.2:
+expose an immutable analysis-policy factory from the verified Corporate
+Filings Analyst so request assembly receives the exact approved skill, prompt,
+model-configuration and call-budget fingerprints instead of caller-authored
+policy values.
+
+CFA-A4.2 is complete. The verified `CorporateFilingsAnalystAgent` now owns and
+returns one immutable `CorporateFilingsAnalysisPolicy` containing the exact
+approved skill, system-prompt and model-configuration fingerprints plus its
+bounded input, output and model-call ceilings. Request preflight requires exact
+policy equality, including the grounding, citation, metric, scoring and
+trade-decision prohibitions; operation callers cannot weaken a flag or replace
+a fingerprint or budget.
+
+`CorporateFilingsAnalysisRequestAssembler` no longer accepts an analysis
+policy in caller input. It obtains the policy through the provider-neutral
+`CorporateFilingsAnalysisPolicyProvider` boundary after all filing and
+extraction evidence passes deterministic validation. Production composition
+binds the policy's output ceiling to the dedicated Corporate Filings Analyst
+LLM-role setting, while the versioned agent retains the fixed input and
+model-call ceilings. Policy construction and assembly perform no LLM,
+provider, storage-write or filesystem operation.
+
+Validation for CFA-A4.2:
+
+- **49/49** combined agent, request-assembly and fundamental-composition tests
+  passed;
+- **131/131** affected filing-analysis, repository, coordinator, composition
+  and DuckDB storage tests passed;
+- changed Python files compiled and `git diff --check` passed; and
+- no live LLM/provider call, authentication, production data mutation,
+  staging, commit or push was performed.
+
+All changes remain unstaged. The single recommended next step is CFA-A4.3:
+compose the deterministic request assembler and analysis coordinator around
+the same verified Corporate Filings Analyst and the existing
+`DuckDBJarvisStorage` instance, then expose one application workflow entry
+point without duplicating the analyst, database connection or policy source.
+
+CFA-A4.3 is complete. The new provider-neutral
+`CorporateFilingsAnalysisWorkflow` exposes one `execute()` entry point that
+first assembles a released, quarterly filing request and then delegates that
+exact immutable request to the cache-aware analysis coordinator. Its immutable
+result preserves both the assembled request and the coordination outcome and
+validates their request-fingerprint binding for operation auditability.
+
+The workflow constructor accepts one dual-capability verified analyst and uses
+that same object as the assembler's policy provider and the coordinator's
+grounded analysis generator. Callers therefore cannot inject one policy source
+while invoking a different analyst. The fundamental composition root verifies
+that one caller-owned storage object implements the filing-package, extracted-
+evidence and filing-analysis repository ports before constructing any gateway.
+It creates the verified Corporate Filings Analyst exactly once and passes the
+same existing `DuckDBJarvisStorage` object to all three persistence boundaries;
+no second database connection or duplicate LLM gateway is created.
+
+Validation for CFA-A4.3:
+
+- **5/5** targeted workflow scenarios passed, covering immutable request/result
+  binding, exact cache reuse, explicit refresh and invalid analyst rejection;
+- **29/29** combined workflow and fundamental-composition tests passed;
+- **138/138** affected filing-analysis, repository, coordinator, composition
+  and DuckDB storage tests passed;
+- changed Python files compiled and `git diff --check` passed; and
+- no live LLM/provider call, authentication, production data mutation,
+  staging, commit or push was performed.
+
+All changes remain unstaged. The single recommended next step is CFA-A4.4:
+connect the composed Corporate Filings Analysis workflow to the browser
+operation orchestration after filing acquisition, extraction and validation,
+while preserving per-agent atomic outcomes and ensuring cached analysis is
+reused unless an explicit company-wide fundamentals refresh is requested.
+
+## Fundamental Analyst failure isolation (2026-09-16)
+
+The browser fundamentals worker now returns committed refresh artifacts even
+when Fundamental Analyst normalization or LLM synthesis fails. It reports a
+safe, separate `fundamentals.analyst_unavailable` outcome and emits a failed
+Fundamental Analyst event; the 16-dataset package remains the active immutable
+package, with its references available independently of debate and briefing.
+The operation does not invent an analyst conclusion. A targeted regression
+proves simultaneous analyst and debate LLM failures retain the complete
+package and all 11 structured-document references.
+
+Validation: 25/25 browser-runner tests and 45/45 affected workflow/ledger/model
+tests passed; changed Python files compiled and `git diff --check` passed. The
+broader HTTP-inclusive run had two unrelated cached-reference fixture failures
+(expected 200, actual expired-reference 410). No live provider or LLM call was
+made. Changes remain unstaged.
+
+Next step: make the operation audit explicitly distinguish package-publication
+success from Fundamental Analyst explanation failure, then verify that split in
+the UI with a deterministic fixture.
+
+## Package publication and analyst failure in audit/UI (2026-09-16)
+
+The authenticated operation audit now emits a validated
+`fundamental_package_publication` outcome when an explicit company refresh
+commits a complete package. It must match the retained package reference and
+cannot be reported for an operation without explicit fundamental refresh.
+Fundamental Analyst failure remains in the independent agent-outcome ledger.
+The Research Division UI presents a committed 16-dataset package row and a
+separate failure row; neither implies that an analyst explanation or trade
+conclusion exists.
+
+Validation: 19/19 audit-model tests, the focused authenticated HTTP test,
+48/48 affected backend tests, 75/75 frontend tests, frontend production build,
+and `git diff --check` passed. Frontend type-check still reports four existing
+errors in `TechnicalChart.tsx` and `agent-visuals.ts`, none in the files changed
+for this step. No live provider, LLM, or broker operation was run. Changes are
+unstaged.
+
+Next step: visually verify a completed operation with a committed package and
+an intentionally failing Fundamental Analyst, confirming both rows and the
+failed agent card in the running UI.

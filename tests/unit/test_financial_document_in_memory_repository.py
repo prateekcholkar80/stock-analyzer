@@ -6,6 +6,10 @@ from app.models.financial_document_storage import (
     StructuredDocumentRepositoryScope,
     stored_structured_financial_document,
 )
+from app.models.financial_documents import (
+    FinancialDocumentType,
+    FinancialReportingBasis,
+)
 from app.storage.adapters.financial_document_in_memory import (
     InMemoryStructuredFinancialDocumentRepository,
 )
@@ -46,6 +50,51 @@ def build_entry(
         stored_at=source_result.completed_at + timedelta(seconds=1),
         retention=retention,
     )
+
+
+def build_package(*, offset: timedelta = timedelta(0)):
+    scenarios = (
+        (
+            FinancialDocumentType.GROWTH_TABLE,
+            FinancialReportingBasis.NOT_APPLICABLE,
+        ),
+        *(
+            (document_type, reporting_basis)
+            for document_type in (
+                FinancialDocumentType.BALANCE_SHEET,
+                FinancialDocumentType.PROFIT_AND_LOSS,
+                FinancialDocumentType.CASH_FLOW,
+                FinancialDocumentType.RATIOS,
+                FinancialDocumentType.QUARTERLY_RESULTS,
+            )
+            for reporting_basis in (
+                FinancialReportingBasis.CONSOLIDATED,
+                FinancialReportingBasis.STANDALONE,
+            )
+        ),
+    )
+    requested_at = REQUESTED_AT + offset
+    stored_at = requested_at + timedelta(seconds=3)
+    entries = []
+    for document_type, reporting_basis in scenarios:
+        source_request = request(
+            request_id=(
+                f"request.coforge.{document_type.value}."
+                f"{reporting_basis.value}.{int(requested_at.timestamp())}"
+            ),
+            operation_id=f"operation.coforge.{int(requested_at.timestamp())}",
+            requested_at=requested_at,
+            document_type=document_type,
+            reporting_basis=reporting_basis,
+        )
+        entries.append(
+            stored_structured_financial_document(
+                source_request,
+                result(source_request),
+                stored_at=stored_at,
+            )
+        )
+    return tuple(entries)
 
 
 class InMemoryStructuredFinancialDocumentRepositoryTests(unittest.TestCase):
@@ -127,6 +176,58 @@ class InMemoryStructuredFinancialDocumentRepositoryTests(unittest.TestCase):
             ),
             refreshed,
         )
+
+    def test_atomic_package_replacement_commits_all_eleven_documents(self):
+        package = build_package()
+        self.clock.now = package[0].stored_at
+
+        persisted = self.repository.replace_structured_financial_document_package(
+            package,
+            scope=self.scope,
+        )
+
+        self.assertEqual(persisted, package)
+        for item in package:
+            self.assertEqual(
+                self.repository.get_structured_financial_document(
+                    item.cache_key,
+                    scope=self.scope,
+                    as_of=self.clock.now,
+                ),
+                item,
+            )
+
+    def test_failed_package_replacement_rolls_back_every_document(self):
+        original = build_package()
+        self.clock.now = original[0].stored_at
+        self.repository.replace_structured_financial_document_package(
+            original,
+            scope=self.scope,
+        )
+        advanced = build_package(offset=timedelta(hours=3))
+        self.clock.now = advanced[-1].stored_at
+        self.repository.replace_structured_financial_document(
+            advanced[-1],
+            scope=self.scope,
+        )
+        before_attempt = (*original[:-1], advanced[-1])
+        refreshed = build_package(offset=timedelta(hours=2))
+
+        with self.assertRaises(StorageConflictError):
+            self.repository.replace_structured_financial_document_package(
+                refreshed,
+                scope=self.scope,
+            )
+
+        for item in before_attempt:
+            self.assertEqual(
+                self.repository.get_structured_financial_document(
+                    item.cache_key,
+                    scope=self.scope,
+                    as_of=self.clock.now,
+                ),
+                item,
+            )
 
     def test_failed_scoped_replacement_preserves_active_document(self):
         stored = build_entry()

@@ -2,7 +2,10 @@ from datetime import datetime
 
 from app.exceptions import AgentSubmissionRejectedError
 from app.models.llm import LLMPreflightResult
-from app.models.storage import MultiTimeframeEndToEndSwingAnalysisResult
+from app.models.storage import (
+    MultiTimeframeEndToEndSwingAnalysisResult,
+    MultiTimeframeResearchDivisionResult,
+)
 from app.models.workflow import WorkflowEventState, WorkflowStage
 from app.orchestration.agent_orchestrator import AgentOrchestrator
 from app.orchestration.debate_orchestrator import DebateOrchestrator
@@ -21,6 +24,7 @@ class RunEndToEndMultiTimeframeSwingAnalysis:
     """Run hourly pull, parallel daily/weekly analysis, and full debate."""
 
     use_case_id = "jarvis.run_end_to_end_multi_timeframe_swing_analysis.v1"
+    research_use_case_id = "jarvis.research_division.v1"
 
     def __init__(
         self,
@@ -74,6 +78,29 @@ class RunEndToEndMultiTimeframeSwingAnalysis:
         to_date: datetime | None = None,
         event_emitter: WorkflowEventEmitter | None = None,
     ) -> MultiTimeframeEndToEndSwingAnalysisResult:
+        research = self.prepare_research_division(
+            exchange,
+            symbol_token,
+            symbol,
+            interval,
+            to_date=to_date,
+            event_emitter=event_emitter,
+        )
+        return self.complete_research_division(
+            research,
+            event_emitter=event_emitter,
+        )
+
+    def prepare_research_division(
+        self,
+        exchange: str,
+        symbol_token: str,
+        symbol: str,
+        interval: str = "ONE_HOUR",
+        *,
+        to_date: datetime | None = None,
+        event_emitter: WorkflowEventEmitter | None = None,
+    ) -> MultiTimeframeResearchDivisionResult:
         if event_emitter is not None and not isinstance(
             event_emitter,
             WorkflowEventEmitter,
@@ -173,6 +200,34 @@ class RunEndToEndMultiTimeframeSwingAnalysis:
             symbol,
         )
 
+        return MultiTimeframeResearchDivisionResult(
+            use_case_id=self.research_use_case_id,
+            market_dataset_id=fetch_receipt.dataset_id,
+            fetch=fetch_receipt,
+            latest_quote=latest_quote,
+            technical_review=technical_review,
+        )
+
+    def complete_research_division(
+        self,
+        research: MultiTimeframeResearchDivisionResult,
+        *,
+        event_emitter: WorkflowEventEmitter | None = None,
+    ) -> MultiTimeframeEndToEndSwingAnalysisResult:
+        if not isinstance(research, MultiTimeframeResearchDivisionResult):
+            raise ValueError(
+                "analysis completion requires a Research Division result"
+            )
+        if event_emitter is not None and not isinstance(
+            event_emitter,
+            WorkflowEventEmitter,
+        ):
+            raise ValueError("analysis requires a workflow event emitter")
+        series = research.fetch.stored.series
+        exchange = series.exchange
+        symbol = series.symbol
+        technical_review = research.technical_review
+
         debate_result = self.debate_orchestrator.run_multi_timeframe_debate(
             technical_review,
             event_emitter=event_emitter,
@@ -216,9 +271,9 @@ class RunEndToEndMultiTimeframeSwingAnalysis:
         )
         return MultiTimeframeEndToEndSwingAnalysisResult(
             use_case_id=self.use_case_id,
-            market_dataset_id=fetch_receipt.dataset_id,
-            fetch=fetch_receipt,
-            latest_quote=latest_quote,
+            market_dataset_id=research.market_dataset_id,
+            fetch=research.fetch,
+            latest_quote=research.latest_quote,
             technical_review=technical_review,
             debate_result=debate_result,
             trade_plan_result=trade_plan_result,

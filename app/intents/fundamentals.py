@@ -14,7 +14,7 @@ _REFRESH_PATTERNS = tuple(
     for pattern in (
         r"\bi\s+need\s+(?:a\s+)?refresh\s+(?:on|of)\s+"
         r"(?:the\s+)?fundamentals\b",
-        r"\b(?:please\s+)?refresh\s+(?:the\s+)?fundamentals"
+        r"\b(?:please\s+)?refresh\s+(?:all\s+)?(?:the\s+)?fundamentals"
         r"(?:\s+data)?\b",
         r"\b(?:please\s+)?update\s+(?:the\s+)?"
         r"(?:fundamentals|fundamental\s+data)\b",

@@ -7,7 +7,7 @@ from enum import StrEnum
 from hashlib import sha256
 from math import isfinite
 from typing import Any, Literal, Protocol, Self, runtime_checkable
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from pydantic import Field, computed_field, field_validator, model_validator
 
@@ -31,6 +31,8 @@ TIJORI_APPROVED_TOOLS = (
     "get_company_overview",
     "get_financials",
     "get_shareholding",
+    "list_company_filings",
+    "download_company_filing",
 )
 TijoriToolName = Literal[
     "search_company",
@@ -38,6 +40,8 @@ TijoriToolName = Literal[
     "get_company_overview",
     "get_financials",
     "get_shareholding",
+    "list_company_filings",
+    "download_company_filing",
 ]
 
 # Fully expanded statements are bounded at 500 rows by 40 periods. Their
@@ -457,12 +461,464 @@ class TijoriEvidencePayload(FundamentalModel):
         return self
 
 
+_FILING_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+_FILING_FINGERPRINT_PATTERN = r"^[a-f0-9]{64}$"
+_FILING_CATEGORY_PATHS = {
+    "earnings_release": "Earnings Release",
+    "conference_call": "Conference Call",
+}
+_FILING_SOURCE_CLASSES = {
+    "earnings_release": "company_authored_earnings_release",
+    "conference_call": "earnings_call_transcript",
+}
+_FILING_CATEGORY_TITLES = {
+    "earnings_release": "Earnings Release",
+    "conference_call": "Conference Call",
+}
+_FILING_MONTHS = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
+}
+
+
+class TijoriCompanyFilingIssuer(FundamentalModel):
+    """Resolved provider identity attached to filing payloads."""
+
+    exchange: str = Field(min_length=1, max_length=32)
+    symbol: str = Field(min_length=1, max_length=100)
+    legal_name: str = Field(min_length=1, max_length=300)
+    isin: str | None = Field(
+        default=None,
+        pattern=r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$",
+    )
+    provider_company_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_FILING_ID_PATTERN,
+    )
+    provider_slug: str = Field(
+        min_length=1,
+        max_length=240,
+        pattern=r"^[a-z0-9][a-z0-9-]*$",
+    )
+
+    @field_validator("exchange", "symbol", "isin", mode="before")
+    @classmethod
+    def normalize_market_identity(cls, value: str | None) -> str | None:
+        return value.upper() if value is not None else None
+
+
+class TijoriCompanyFilingSource(FundamentalModel):
+    provider: Literal["tijori"] = "tijori"
+    location: str = Field(min_length=1, max_length=2_000)
+    discovered_at: datetime
+
+    @field_validator("discovered_at")
+    @classmethod
+    def require_discovered_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Tijori filing discovery time requires timezone")
+        return value
+
+    @field_validator("location")
+    @classmethod
+    def require_safe_company_location(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or (parsed.hostname or "").lower() != "www.tijorifinance.com"
+            or parsed.port not in (None, 443)
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Tijori filing source location is unsafe")
+        return value
+
+
+class TijoriCompanyFilingPeriod(FundamentalModel):
+    """Discovery-time period that explicitly forbids fiscal inference."""
+
+    state: Literal["unclassified"]
+    period_type: Literal["unclassified"]
+    source_label: str = Field(min_length=1, max_length=120)
+    fiscal_year: Literal[None] = None
+    fiscal_quarter: Literal[None] = None
+    period_start: Literal[None] = None
+    period_end: Literal[None] = None
+
+
+class TijoriCompanyFilingReference(FundamentalModel):
+    filing_reference_id: str = Field(
+        min_length=1,
+        max_length=180,
+        pattern=_FILING_ID_PATTERN,
+    )
+    category: Literal["earnings_release", "conference_call"]
+    provider_company_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_FILING_ID_PATTERN,
+    )
+    provider_slug: str = Field(
+        min_length=1,
+        max_length=240,
+        pattern=r"^[a-z0-9][a-z0-9-]*$",
+    )
+    source_page_url: str = Field(min_length=1, max_length=2_000)
+    artifact_url: str = Field(min_length=1, max_length=2_000)
+    discovery_fingerprint: str = Field(pattern=_FILING_FINGERPRINT_PATTERN)
+    source_class: Literal[
+        "company_authored_earnings_release",
+        "earnings_call_transcript",
+    ]
+    period: TijoriCompanyFilingPeriod
+    title: str = Field(min_length=1, max_length=500)
+    provider_label: str = Field(min_length=1, max_length=80)
+    provider_year: int = Field(ge=1900, le=2200)
+    provider_month: int = Field(ge=1, le=12)
+    original_filename: str = Field(min_length=1, max_length=300)
+    provider_published_at: Literal[None] = None
+    available_at: Literal[None] = None
+    discovered_at: datetime
+
+    @field_validator("discovered_at")
+    @classmethod
+    def require_discovered_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Tijori filing reference time requires timezone")
+        return value
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> Self:
+        expected_month = _FILING_MONTHS.get(self.provider_label)
+        if expected_month != self.provider_month:
+            raise ValueError("Tijori filing provider month is inconsistent")
+        expected_label = f"{self.provider_label} {self.provider_year}"
+        if self.period.source_label != expected_label:
+            raise ValueError("Tijori filing period label is inconsistent")
+        if self.source_class != _FILING_SOURCE_CLASSES[self.category]:
+            raise ValueError("Tijori filing source class is inconsistent")
+        if self.title != (
+            f"{_FILING_CATEGORY_TITLES[self.category]} — {expected_label}"
+        ):
+            raise ValueError("Tijori filing title is inconsistent")
+
+        expected_source = (
+            "https://www.tijorifinance.com/company/"
+            f"{self.provider_slug}/"
+        )
+        if self.source_page_url != expected_source:
+            raise ValueError("Tijori filing source page is not issuer bound")
+        filename = _validate_tijori_filing_artifact_url(
+            self.artifact_url,
+            provider_company_id=self.provider_company_id,
+            category=self.category,
+        )
+        if self.original_filename != filename:
+            raise ValueError("Tijori filing filename is inconsistent")
+        digest = sha256(
+            f"{self.category}\n{self.artifact_url}".encode("utf-8")
+        ).hexdigest()
+        reference_parts = self.filing_reference_id.split(".")
+        if (
+            len(reference_parts) != 3
+            or reference_parts[0] != "filing"
+            or reference_parts[2] != digest[:32]
+        ):
+            raise ValueError("Tijori filing reference identifier is invalid")
+        return self
+
+
+class TijoriCompanyFilingRequestedFilters(FundamentalModel):
+    categories: tuple[
+        Literal["earnings_release", "conference_call"], ...
+    ] = Field(min_length=1, max_length=2)
+    from_fiscal_year: int | None = Field(default=None, ge=1900, le=2200)
+    through_date: date | None = None
+    max_documents: int = Field(ge=1, le=200)
+
+    @field_validator("categories")
+    @classmethod
+    def require_unique_categories(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("Tijori filing categories must be unique")
+        return values
+
+
+class TijoriCompanyFilingCoverage(FundamentalModel):
+    category: Literal["earnings_release", "conference_call"]
+    provider_year: int = Field(ge=1900, le=2200)
+    status: Literal["available", "unavailable"]
+    document_count: int = Field(ge=0, le=40)
+    unavailable_labels: tuple[str, ...] = Field(max_length=40)
+
+    @field_validator("unavailable_labels")
+    @classmethod
+    def validate_unavailable_labels(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if len(values) != len(set(values)) or any(
+            not value or len(value) > 80 for value in values
+        ):
+            raise ValueError("Tijori unavailable labels must be unique and bounded")
+        return values
+
+    @model_validator(mode="after")
+    def validate_status(self) -> Self:
+        if (self.status == "available") != (self.document_count > 0):
+            raise ValueError("Tijori filing coverage status contradicts count")
+        return self
+
+
+class TijoriCompanyFilingsExtraction(FundamentalModel):
+    filing_count: int = Field(ge=0, le=200)
+    available_candidate_count: int = Field(ge=0, le=4_000)
+    coverage_cell_count: int = Field(ge=1, le=200)
+    truncated: bool
+    status: Literal["complete"] = "complete"
+
+
+class TijoriCompanyFilingsPayload(FundamentalModel):
+    """Successful list_company_filings payload from one provider snapshot."""
+
+    schema_version: Literal["tijori.company_filings.v1"]
+    issuer: TijoriCompanyFilingIssuer
+    source: TijoriCompanyFilingSource
+    requested_filters: TijoriCompanyFilingRequestedFilters
+    discovery_fingerprint: str = Field(pattern=_FILING_FINGERPRINT_PATTERN)
+    filings: tuple[TijoriCompanyFilingReference, ...] = Field(max_length=200)
+    coverage: tuple[TijoriCompanyFilingCoverage, ...] = Field(
+        min_length=1,
+        max_length=200,
+    )
+    unavailable_period_labels: tuple[str, ...] = Field(max_length=4_000)
+    validation_status: Literal["validated"]
+    limitations: tuple[str, ...] = Field(max_length=20)
+    extraction: TijoriCompanyFilingsExtraction
+
+    @field_validator("unavailable_period_labels", "limitations")
+    @classmethod
+    def require_unique_bounded_text(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if len(values) != len(set(values)) or any(
+            not value or len(value) > 500 for value in values
+        ):
+            raise ValueError("Tijori filing text collections must be bounded")
+        return values
+
+    @model_validator(mode="after")
+    def validate_complete_discovery(self) -> Self:
+        expected_source = (
+            "https://www.tijorifinance.com/company/"
+            f"{self.issuer.provider_slug}/"
+        )
+        if self.source.location != expected_source:
+            raise ValueError("Tijori filing source does not match issuer")
+        if any(
+            filing.provider_company_id != self.issuer.provider_company_id
+            or filing.provider_slug != self.issuer.provider_slug
+            or filing.source_page_url != self.source.location
+            or filing.discovery_fingerprint != self.discovery_fingerprint
+            or filing.discovered_at != self.source.discovered_at
+            or filing.category not in self.requested_filters.categories
+            or filing.filing_reference_id.split(".")[1]
+            != self.issuer.symbol.lower()
+            for filing in self.filings
+        ):
+            raise ValueError("Tijori filing discovery mixes identity or snapshots")
+        reference_ids = tuple(
+            filing.filing_reference_id for filing in self.filings
+        )
+        artifact_urls = tuple(filing.artifact_url for filing in self.filings)
+        if (
+            len(reference_ids) != len(set(reference_ids))
+            or len(artifact_urls) != len(set(artifact_urls))
+        ):
+            raise ValueError("Tijori filing references must be unique")
+        coverage_keys = tuple(
+            (item.category, item.provider_year) for item in self.coverage
+        )
+        if len(coverage_keys) != len(set(coverage_keys)) or any(
+            item.category not in self.requested_filters.categories
+            for item in self.coverage
+        ):
+            raise ValueError("Tijori filing coverage is inconsistent")
+        expected_unavailable_labels = tuple(
+            label
+            for item in self.coverage
+            if item.status == "unavailable"
+            for label in (
+                tuple(
+                    f"{item.category}:{source_label} {item.provider_year}"
+                    for source_label in item.unavailable_labels
+                )
+                or (f"{item.category}:{item.provider_year}",)
+            )
+        )
+        if self.unavailable_period_labels != expected_unavailable_labels:
+            raise ValueError("Tijori filing unavailable coverage does not match")
+        if (
+            self.extraction.filing_count != len(self.filings)
+            or self.extraction.coverage_cell_count != len(self.coverage)
+            or self.extraction.available_candidate_count < len(self.filings)
+            or (
+                not self.extraction.truncated
+                and self.extraction.available_candidate_count != len(self.filings)
+            )
+            or (
+                self.extraction.truncated
+                and self.extraction.available_candidate_count <= len(self.filings)
+            )
+        ):
+            raise ValueError("Tijori filing extraction counts do not match")
+        return self
+
+
+class TijoriCompanyFilingDownloadPayload(FundamentalModel):
+    """Validated staged-artifact manifest with no filesystem path or secret."""
+
+    schema_version: Literal["tijori.company_filing_download.v1"]
+    filing_reference_id: str = Field(
+        min_length=1,
+        max_length=180,
+        pattern=_FILING_ID_PATTERN,
+    )
+    category: Literal["earnings_release", "conference_call"]
+    provider_company_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=_FILING_ID_PATTERN,
+    )
+    provider_slug: str = Field(
+        min_length=1,
+        max_length=240,
+        pattern=r"^[a-z0-9][a-z0-9-]*$",
+    )
+    source_page_url: str = Field(min_length=1, max_length=2_000)
+    artifact_url: str = Field(min_length=1, max_length=2_000)
+    discovery_fingerprint: str = Field(pattern=_FILING_FINGERPRINT_PATTERN)
+    content_sha256: str = Field(pattern=_FILING_FINGERPRINT_PATTERN)
+    byte_length: int = Field(ge=5, le=100_000_000)
+    content_type: Literal["application/pdf"]
+    staged_artifact_key: str = Field(
+        pattern=r"^[a-f0-9]{64}\.pdf$",
+    )
+    downloaded_at: datetime
+    validation_status: Literal["validated"]
+
+    @field_validator("downloaded_at")
+    @classmethod
+    def require_download_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Tijori filing download time requires timezone")
+        return value
+
+    @model_validator(mode="after")
+    def validate_staged_artifact(self) -> Self:
+        expected_source = (
+            "https://www.tijorifinance.com/company/"
+            f"{self.provider_slug}/"
+        )
+        if self.source_page_url != expected_source:
+            raise ValueError("Tijori filing download source is not issuer bound")
+        _validate_tijori_filing_artifact_url(
+            self.artifact_url,
+            provider_company_id=self.provider_company_id,
+            category=self.category,
+        )
+        digest = sha256(
+            f"{self.category}\n{self.artifact_url}".encode("utf-8")
+        ).hexdigest()
+        reference_parts = self.filing_reference_id.split(".")
+        if (
+            len(reference_parts) != 3
+            or reference_parts[0] != "filing"
+            or reference_parts[2] != digest[:32]
+        ):
+            raise ValueError("Tijori filing download reference is invalid")
+        if self.staged_artifact_key != f"{self.content_sha256}.pdf":
+            raise ValueError("Tijori staged artifact key does not match content")
+        return self
+
+
+def _validate_tijori_filing_artifact_url(
+    value: str,
+    *,
+    provider_company_id: str,
+    category: str,
+) -> str:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").lower() != "files.tijorifinance.com"
+        or parsed.port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Tijori filing artifact URL is unsafe")
+    try:
+        if any(
+            character == "%"
+            and (
+                index + 2 >= len(parsed.path)
+                or any(
+                    digit not in "0123456789abcdefABCDEF"
+                    for digit in parsed.path[index + 1:index + 3]
+                )
+            )
+            for index, character in enumerate(parsed.path)
+        ):
+            raise ValueError("Tijori filing artifact URL encoding is invalid")
+        decoded_path = unquote(parsed.path, errors="strict")
+    except UnicodeError as exc:
+        raise ValueError("Tijori filing artifact URL encoding is invalid") from exc
+    prefix = (
+        f"/insight/india/{provider_company_id}/"
+        f"{_FILING_CATEGORY_PATHS[category]}/"
+    )
+    filename = decoded_path.removeprefix(prefix)
+    if (
+        not decoded_path.startswith(prefix)
+        or not filename
+        or len(filename) > 300
+        or "/" in filename
+        or not filename.casefold().endswith(".pdf")
+        or any(ord(character) < 32 for character in filename)
+    ):
+        raise ValueError("Tijori filing artifact is not issuer/category bound")
+    return filename
+
+
 class TijoriFinancialDocumentIssuer(FundamentalModel):
     """Provider identity embedded in one structured financial document."""
 
     exchange: str = Field(min_length=1, max_length=32)
     symbol: str = Field(min_length=1, max_length=100)
     legal_name: str = Field(min_length=1, max_length=300)
+    isin: str | None = Field(
+        default=None,
+        pattern=r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$",
+    )
     provider_company_id: str | None = Field(
         default=None,
         min_length=1,
@@ -474,10 +930,10 @@ class TijoriFinancialDocumentIssuer(FundamentalModel):
         pattern=r"^[a-z0-9][a-z0-9-]*$",
     )
 
-    @field_validator("exchange", "symbol", mode="before")
+    @field_validator("exchange", "symbol", "isin", mode="before")
     @classmethod
-    def normalize_market_identity(cls, value: str) -> str:
-        return value.upper()
+    def normalize_market_identity(cls, value: str | None) -> str | None:
+        return value.upper() if value is not None else None
 
 
 class TijoriFinancialDocumentSource(FundamentalModel):
@@ -1032,6 +1488,87 @@ class TijoriQuarterlyResultsPayload(FundamentalModel):
     """Successful get_financials payload for complete Quarterly Results."""
 
     document: TijoriQuarterlyResultsDocument
+
+
+TijoriFinancialPackageDocument = (
+    TijoriGrowthTableDocument
+    | TijoriBalanceSheetDocument
+    | TijoriProfitAndLossDocument
+    | TijoriCashFlowDocument
+    | TijoriRatiosDocument
+    | TijoriQuarterlyResultsDocument
+)
+
+
+class TijoriFinancialDocumentPackageExtraction(FundamentalModel):
+    """Completeness declaration emitted by the package extractor."""
+
+    document_count: Literal[11]
+    status: Literal["complete"] = "complete"
+
+
+class TijoriFinancialDocumentPackage(FundamentalModel):
+    """All required financial documents from one immutable provider snapshot."""
+
+    schema_version: Literal["tijori.financial_document_package.v1"]
+    issuer: TijoriFinancialDocumentIssuer
+    source: TijoriFinancialDocumentSource
+    documents: tuple[TijoriFinancialPackageDocument, ...] = Field(
+        min_length=11,
+        max_length=11,
+    )
+    extraction: TijoriFinancialDocumentPackageExtraction
+
+    @model_validator(mode="after")
+    def validate_complete_package(self) -> Self:
+        expected_location = (
+            "https://www.tijorifinance.com/company/"
+            f"{self.issuer.provider_slug}/financials/"
+        )
+        if self.source.location != expected_location:
+            raise ValueError("Tijori financial package location does not match issuer")
+
+        expected_scenarios = {
+            ("growth_table", "not_applicable"),
+            *(
+                (document_type, reporting_basis)
+                for document_type in (
+                    "balance_sheet",
+                    "profit_and_loss",
+                    "cash_flow",
+                    "ratios",
+                    "quarterly_results",
+                )
+                for reporting_basis in ("consolidated", "standalone")
+            ),
+        }
+        scenarios = tuple(
+            (document.document_type, document.reporting_basis)
+            for document in self.documents
+        )
+        if len(scenarios) != len(set(scenarios)):
+            raise ValueError("Tijori financial package scenarios must be unique")
+        if set(scenarios) != expected_scenarios:
+            raise ValueError("Tijori financial package is incomplete")
+        if self.extraction.document_count != len(self.documents):
+            raise ValueError("Tijori financial package count does not match")
+        if any(document.issuer != self.issuer for document in self.documents):
+            raise ValueError("Tijori financial package mixes issuer identities")
+        if any(document.source != self.source for document in self.documents):
+            raise ValueError("Tijori financial package mixes provider snapshots")
+        return self
+
+    @computed_field
+    @property
+    def package_fingerprint(self) -> str:
+        payload = self.model_dump_json(exclude={"package_fingerprint"})
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+
+class TijoriFinancialDocumentPackagePayload(FundamentalModel):
+    """Successful get_financials payload for one complete financial package."""
+
+    package: TijoriFinancialDocumentPackage
 
 
 class TijoriPeerComparisonMetric(FundamentalModel):

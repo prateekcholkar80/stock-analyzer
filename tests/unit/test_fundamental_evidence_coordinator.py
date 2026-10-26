@@ -7,6 +7,9 @@ from app.gateways.fundamentals import (
     FundamentalCapability,
     FundamentalCompanyOverviewRequest,
     FundamentalEvidenceRetrieval,
+    FundamentalFinancialDocumentPackage,
+    FundamentalFinancialDocumentPackageRequest,
+    FundamentalFinancialDocumentPackageResult,
     FundamentalFinancialsRequest,
     FundamentalIssuerCandidate,
     FundamentalIssuerLocator,
@@ -42,6 +45,15 @@ from app.storage.adapters.financial_document_in_memory import (
 from app.storage.adapters.peer_comparison_in_memory import (
     InMemoryPeerComparisonRepository,
 )
+from app.storage.adapters.fundamental_package_in_memory import (
+    InMemoryFundamentalPackageRepository,
+)
+from app.storage.adapters.fundamental_filing_evidence_in_memory import (
+    InMemoryFundamentalFilingEvidenceRepository,
+)
+from app.storage.fundamental_package_repositories import (
+    FundamentalPackageRepositoryScope,
+)
 from tests.unit.test_fundamental_gateway import (
     ADAPTER_HASH,
     REQUESTED_AT,
@@ -53,7 +65,10 @@ from tests.unit.test_fundamental_in_memory_repository import (
     MutableClock,
     build_entry,
 )
-from tests.unit.test_fundamental_storage_contracts import build_retrieval
+from tests.unit.test_fundamental_storage_contracts import (
+    build_financial_request,
+    build_retrieval,
+)
 from tests.unit.test_structured_financial_gateway import document
 from tests.unit.test_peer_comparison_gateway import (
     document as peer_document,
@@ -176,6 +191,75 @@ class FakeFundamentalGateway:
             reporting_basis=request.reporting_basis,
             status=FundamentalRetrievalStatus.COMPLETED,
             document=result_document,
+        )
+
+    def retrieve_financial_document_package(self, *, request):
+        self.calls.append("financial_package")
+        common = {
+            "request_id": request.request_id,
+            "request_fingerprint": request.request_fingerprint,
+            "connection": request.connection,
+            "requested_at": request.requested_at,
+            "started_at": request.requested_at,
+            "completed_at": request.requested_at + timedelta(seconds=2),
+            "provider_contract_version": "provider.contract.v1",
+            "adapter_fingerprint": ADAPTER_HASH,
+            "issuer": request.issuer,
+        }
+        if self.failure:
+            return FundamentalFinancialDocumentPackageResult(
+                **common,
+                status=FundamentalRetrievalStatus.PROVIDER_UNAVAILABLE,
+                limitations=("Provider unavailable.",),
+            )
+        retrieved_at = request.requested_at + timedelta(seconds=1)
+        scenarios = (
+            (
+                FinancialDocumentType.GROWTH_TABLE,
+                FinancialReportingBasis.NOT_APPLICABLE,
+            ),
+            *(
+                (document_type, reporting_basis)
+                for document_type in (
+                    FinancialDocumentType.BALANCE_SHEET,
+                    FinancialDocumentType.PROFIT_AND_LOSS,
+                    FinancialDocumentType.CASH_FLOW,
+                    FinancialDocumentType.RATIOS,
+                    FinancialDocumentType.QUARTERLY_RESULTS,
+                )
+                for reporting_basis in (
+                    FinancialReportingBasis.CONSOLIDATED,
+                    FinancialReportingBasis.STANDALONE,
+                )
+            ),
+        )
+        documents = tuple(
+            document(
+                document_id=(
+                    "provider.NSE.TCS."
+                    f"{document_type.value}.{reporting_basis.value}"
+                ),
+                connection=request.connection,
+                issuer=request.issuer,
+                document_type=document_type,
+                reporting_basis=reporting_basis,
+                retrieved_at=retrieved_at,
+                expires_at=retrieved_at + timedelta(days=10),
+            )
+            for document_type, reporting_basis in scenarios
+        )
+        package = FundamentalFinancialDocumentPackage(
+            connection=request.connection,
+            issuer=request.issuer,
+            source_location=documents[0].source_location,
+            retrieved_at=retrieved_at,
+            expires_at=retrieved_at + timedelta(days=10),
+            documents=documents,
+        )
+        return FundamentalFinancialDocumentPackageResult(
+            **common,
+            status=FundamentalRetrievalStatus.COMPLETED,
+            package=package,
         )
 
     def retrieve_peer_comparison(self, *, request):
@@ -327,6 +411,12 @@ class FundamentalEvidenceCoordinatorTests(unittest.TestCase):
         self.benchmarking_repository = (
             InMemoryBenchmarkingFinancialsRepository(clock=self.clock)
         )
+        self.package_repository = InMemoryFundamentalPackageRepository(
+            clock=self.clock
+        )
+        self.filing_evidence_repository = (
+            InMemoryFundamentalFilingEvidenceRepository(clock=self.clock)
+        )
 
     def coordinator(self, gateway):
         return FundamentalEvidenceCoordinator(
@@ -335,7 +425,274 @@ class FundamentalEvidenceCoordinatorTests(unittest.TestCase):
             structured_document_repository=self.document_repository,
             peer_comparison_repository=self.peer_repository,
             benchmarking_financials_repository=self.benchmarking_repository,
+            package_repository=self.package_repository,
+            filing_evidence_repository=self.filing_evidence_repository,
             clock=self.clock,
+        )
+
+    def complete_refresh(
+        self,
+        coordinator,
+        *,
+        sequence=1,
+        refresh_requested=False,
+    ):
+        requested_at = REQUESTED_AT + timedelta(minutes=sequence)
+        self.clock.now = requested_at + timedelta(seconds=3)
+        operation_id = f"operation.package.{sequence}"
+        issuer = build_issuer(
+            symbol="COFORGE",
+            legal_name="Coforge Ltd.",
+            provider_company_id="4502",
+            provider_slug="niit-technologies-limited",
+        )
+        common = {
+            "operation_id": operation_id,
+            "connection": build_connection(),
+            "requested_at": requested_at,
+            "issuer": issuer,
+            "as_of_date": requested_at.date(),
+        }
+        evidence_requests = (
+            FundamentalCompanyOverviewRequest(
+                request_id=f"request.overview.{sequence}",
+                **common,
+            ),
+            build_financial_request(
+                request_id=f"request.financials.{sequence}",
+                **common,
+            ),
+            FundamentalShareholdingRequest(
+                request_id=f"request.shareholding.{sequence}",
+                quarters=8,
+                include_promoter_pledge=True,
+                **common,
+            ),
+        )
+        evidence_loads = tuple(
+            coordinator.load(
+                request,
+                refresh_requested=refresh_requested,
+            )
+            for request in evidence_requests
+        )
+        scenarios = (
+            (
+                FinancialDocumentType.GROWTH_TABLE,
+                FinancialReportingBasis.NOT_APPLICABLE,
+            ),
+            *(
+                (document_type, reporting_basis)
+                for document_type in (
+                    FinancialDocumentType.BALANCE_SHEET,
+                    FinancialDocumentType.PROFIT_AND_LOSS,
+                    FinancialDocumentType.CASH_FLOW,
+                    FinancialDocumentType.RATIOS,
+                    FinancialDocumentType.QUARTERLY_RESULTS,
+                )
+                for reporting_basis in (
+                    FinancialReportingBasis.CONSOLIDATED,
+                    FinancialReportingBasis.STANDALONE,
+                )
+            ),
+        )
+        structured_loads = tuple(
+            coordinator.load_structured_document(
+                FundamentalStructuredDocumentRequest(
+                    request_id=f"request.document.{sequence}.{index}",
+                    document_type=document_type,
+                    reporting_basis=reporting_basis,
+                    **common,
+                ),
+                refresh_requested=refresh_requested,
+            )
+            for index, (document_type, reporting_basis) in enumerate(scenarios)
+        )
+        peer_load = coordinator.load_peer_comparison(
+            FundamentalCompanyOverviewRequest(
+                request_id=f"request.peers.{sequence}",
+                **common,
+            ),
+            refresh_requested=refresh_requested,
+        )
+        benchmarking_load = coordinator.load_benchmarking_financials(
+            FundamentalCompanyOverviewRequest(
+                request_id=f"request.benchmarking.{sequence}",
+                **common,
+            ),
+            refresh_requested=refresh_requested,
+        )
+        return (
+            operation_id,
+            evidence_loads,
+            structured_loads,
+            peer_load,
+            benchmarking_load,
+        )
+
+    def publish_refresh(self, coordinator, refresh):
+        operation_id, evidence, structured, peers, benchmarking = refresh
+        return coordinator.publish_complete_package(
+            operation_id=operation_id,
+            evidence_loads=evidence,
+            structured_document_loads=structured,
+            peer_comparison_load=peers,
+            benchmarking_financials_load=benchmarking,
+        )
+
+    def test_complete_refresh_is_assembled_and_atomically_published(self):
+        coordinator = self.coordinator(FakeFundamentalGateway())
+        package = self.publish_refresh(
+            coordinator,
+            self.complete_refresh(coordinator),
+        )
+        scope = FundamentalPackageRepositoryScope.from_package(package)
+
+        self.assertEqual(len(package.manifest.items), 16)
+        self.assertEqual(
+            self.package_repository.get_active_fundamental_package(
+                scope=scope,
+                as_of=self.clock.now,
+            ),
+            package,
+        )
+
+    def test_loads_only_the_scoped_active_complete_package(self):
+        coordinator = self.coordinator(FakeFundamentalGateway())
+        package = self.publish_refresh(
+            coordinator,
+            self.complete_refresh(coordinator),
+        )
+
+        loaded = coordinator.load_active_package(
+            connection=package.manifest.connection,
+            issuer=package.manifest.issuer,
+        )
+        missing = coordinator.load_active_package(
+            connection=package.manifest.connection,
+            issuer=package.manifest.issuer.model_copy(
+                update={"symbol": "RELIANCE"}
+            ),
+        )
+
+        self.assertEqual(loaded, package)
+        self.assertIsNone(missing)
+
+    def test_active_package_read_requires_configured_repository(self):
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=FakeFundamentalGateway(),
+            repository=self.repository,
+            clock=self.clock,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "not configured"):
+            coordinator.load_active_package(
+                connection=build_connection(),
+                issuer=build_issuer(),
+            )
+
+    def test_validated_partial_snapshot_can_publish_complete_package(self):
+        coordinator = self.coordinator(FakeFundamentalGateway())
+        refresh = self.complete_refresh(coordinator)
+        operation_id, evidence, structured, peers, benchmarking = refresh
+        partial_retrieval = evidence[0].retrieval.model_copy(
+            update={"status": FundamentalRetrievalStatus.PARTIAL}
+        )
+        partial_snapshot = evidence[0].stored_snapshot.model_copy(
+            update={"retrieval": partial_retrieval}
+        )
+        partial_load = evidence[0].model_copy(
+            update={
+                "retrieval": partial_retrieval,
+                "stored_snapshot": partial_snapshot,
+            }
+        )
+
+        package = coordinator.publish_complete_package(
+            operation_id=operation_id,
+            evidence_loads=(partial_load, *evidence[1:]),
+            structured_document_loads=structured,
+            peer_comparison_load=peers,
+            benchmarking_financials_load=benchmarking,
+        )
+
+        self.assertEqual(
+            package.snapshots[0].retrieval.status,
+            FundamentalRetrievalStatus.PARTIAL,
+        )
+
+    def test_incomplete_refresh_preserves_previous_active_package(self):
+        coordinator = self.coordinator(FakeFundamentalGateway())
+        first = self.publish_refresh(
+            coordinator,
+            self.complete_refresh(coordinator),
+        )
+        second = self.complete_refresh(
+            coordinator,
+            sequence=2,
+            refresh_requested=True,
+        )
+        operation_id, evidence, structured, peers, benchmarking = second
+
+        with self.assertRaisesRegex(ValueError, "all sixteen datasets"):
+            coordinator.publish_complete_package(
+                operation_id=operation_id,
+                evidence_loads=evidence,
+                structured_document_loads=structured[:-1],
+                peer_comparison_load=peers,
+                benchmarking_financials_load=benchmarking,
+            )
+
+        scope = FundamentalPackageRepositoryScope.from_package(first)
+        self.assertEqual(
+            self.package_repository.get_active_fundamental_package(
+                scope=scope,
+                as_of=self.clock.now,
+            ),
+            first,
+        )
+
+    def test_cache_fallback_or_mixed_operation_cannot_publish(self):
+        coordinator = self.coordinator(FakeFundamentalGateway())
+        refresh = self.complete_refresh(coordinator)
+        operation_id, evidence, structured, peers, benchmarking = refresh
+        cached_document = structured[0].model_copy(
+            update={"source": FundamentalEvidenceSource.CACHE}
+        )
+        with self.assertRaisesRegex(ValueError, "did not complete"):
+            coordinator.publish_complete_package(
+                operation_id=operation_id,
+                evidence_loads=evidence,
+                structured_document_loads=(
+                    cached_document,
+                    *structured[1:],
+                ),
+                peer_comparison_load=peers,
+                benchmarking_financials_load=benchmarking,
+            )
+        with self.assertRaisesRegex(ValueError, "refresh operation"):
+            coordinator.publish_complete_package(
+                operation_id="operation.wrong",
+                evidence_loads=evidence,
+                structured_document_loads=structured,
+                peer_comparison_load=peers,
+                benchmarking_financials_load=benchmarking,
+            )
+
+        scope = FundamentalPackageRepositoryScope(
+            connection=build_connection(),
+            issuer=build_issuer(
+                symbol="COFORGE",
+                legal_name="Coforge Ltd.",
+                provider_company_id="4502",
+                provider_slug="niit-technologies-limited",
+            ),
+        )
+        self.assertIsNone(
+            self.package_repository.get_active_fundamental_package(
+                scope=scope,
+                as_of=self.clock.now,
+            )
         )
 
     def test_benchmarking_financials_reuses_fresh_cached_json(self):
@@ -639,6 +996,62 @@ class FundamentalEvidenceCoordinatorTests(unittest.TestCase):
         self.assertIs(loaded.source, FundamentalEvidenceSource.PROVIDER)
         self.assertIsNotNone(loaded.stored_document)
 
+    def test_refreshes_all_structured_documents_through_one_package_call(self):
+        gateway = FakeFundamentalGateway()
+        request = FundamentalFinancialDocumentPackageRequest(
+            request_id="request.financial-package.tcs",
+            operation_id="operation.financial-package.tcs",
+            connection=build_connection(),
+            requested_at=REQUESTED_AT,
+            issuer=build_issuer(),
+            as_of_date=REQUESTED_AT.date(),
+        )
+
+        loaded = self.coordinator(gateway).refresh_structured_document_package(
+            request
+        )
+
+        self.assertEqual(gateway.calls, ["financial_package"])
+        self.assertEqual(len(loaded), 11)
+        self.assertTrue(all(item.refresh_requested for item in loaded))
+        self.assertTrue(all(item.stored_document is not None for item in loaded))
+        self.assertEqual(
+            len({item.stored_document.retrieved_at for item in loaded}),
+            1,
+        )
+
+    def test_failed_package_refresh_preserves_all_active_documents(self):
+        gateway = FakeFundamentalGateway()
+        coordinator = self.coordinator(gateway)
+        first_request = FundamentalFinancialDocumentPackageRequest(
+            request_id="request.financial-package.first",
+            operation_id="operation.financial-package.first",
+            connection=build_connection(),
+            requested_at=REQUESTED_AT,
+            issuer=build_issuer(),
+        )
+        active = coordinator.refresh_structured_document_package(first_request)
+        gateway.failure = True
+        later_request = first_request.model_copy(
+            update={
+                "request_id": "request.financial-package.failed",
+                "operation_id": "operation.financial-package.failed",
+                "requested_at": REQUESTED_AT + timedelta(hours=2),
+            }
+        )
+        self.clock.now = later_request.requested_at + timedelta(seconds=3)
+
+        with self.assertRaises(ValueError):
+            coordinator.refresh_structured_document_package(later_request)
+
+        for item in active:
+            preserved = self.document_repository.get_structured_financial_document(
+                item.stored_document.cache_key,
+                scope=item.stored_document.cache_key.repository_scope,
+                as_of=self.clock.now,
+            )
+            self.assertEqual(preserved, item.stored_document)
+
     def test_structured_load_reuses_fresh_cache_without_provider_call(self):
         gateway = FakeFundamentalGateway()
         request = FundamentalStructuredDocumentRequest(
@@ -940,6 +1353,20 @@ class FundamentalEvidenceCoordinatorTests(unittest.TestCase):
                 repository=self.repository,
                 structured_document_repository="invalid",
             )
+        with self.assertRaisesRegex(TypeError, "filing evidence"):
+            FundamentalEvidenceCoordinator(
+                gateway=gateway,
+                repository=self.repository,
+                filing_evidence_repository="invalid",
+            )
+
+    def test_accepts_provider_neutral_filing_evidence_repository(self):
+        coordinator = self.coordinator(FakeFundamentalGateway())
+
+        self.assertIs(
+            coordinator._filing_evidence_repository,
+            self.filing_evidence_repository,
+        )
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import unittest
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 from tests.unit._debate_fixtures import build_approved_technical_result
 
@@ -9,14 +10,22 @@ from app.agents.jarvis_presentation_agent import (
     JarvisPresentationAgent,
 )
 from app.audit.prompt_audit import InMemoryPromptAuditSink
+from app.analytics.evidence_hierarchy import (
+    build_multi_timeframe_technical_findings,
+)
 from app.exceptions import LLMResponseValidationError
 from app.llm.audited_gateway import PromptAuditedLLMGateway
 from app.llm.config import LLMRole
 from app.llm.gateway import StructuredGeneration
 from app.models.debate import BullBearArgument, DebateSide, DebateVerdict
+from app.models.evidence_hierarchy import EvidenceFamily, EvidenceFamilyState
 from app.models.signals import SignalDirection
-from app.models.multi_timeframe_trade import MultiTimeframeTradeDisposition
+from app.models.multi_timeframe_trade import (
+    MultiTimeframeTradeDisposition,
+    MultiTimeframeTradeReason,
+)
 from app.models.storage import EndToEndSwingAnalysisResult
+from app.models.trade_decision import MarketCondition
 from app.orchestration.debate_orchestrator import (
     DebateOrchestrator,
     DebateOrchestratorConfig,
@@ -215,6 +224,27 @@ def _valid_multi_payload(result):
     }
 
 
+def _actionable_multi_result():
+    """Stub primary eligibility for presentation; keep real 2R planning."""
+
+    def bullish_structure(package):
+        return tuple(
+            finding.model_copy(update={"state": EvidenceFamilyState.BULLISH})
+            if finding.family is EvidenceFamily.MARKET_STRUCTURE
+            else finding
+            for finding in build_multi_timeframe_technical_findings(package)
+        )
+
+    with patch(
+        "app.use_cases.build_multi_timeframe_long_trade_plan."
+        "build_multi_timeframe_technical_findings",
+        side_effect=bullish_structure,
+    ):
+        return _multi_use_case(timeframes=_trending_timeframes()).execute(
+            "NSE", "2885", "RELIANCE-EQ", "ONE_HOUR"
+        )
+
+
 class JarvisPresentationAgentTests(unittest.TestCase):
     def test_persona_requires_beginner_friendly_structured_briefing(self):
         for prompt in (
@@ -311,9 +341,18 @@ class JarvisPresentationAgentTests(unittest.TestCase):
         )
 
     def test_multi_timeframe_briefing_exposes_exact_long_two_r_plan(self):
-        result = _multi_use_case(
-            timeframes=_trending_timeframes()
-        ).execute("NSE", "2885", "RELIANCE-EQ", "ONE_HOUR")
+        result = _actionable_multi_result()
+        self.assertIs(
+            result.trade_plan_result.disposition,
+            MultiTimeframeTradeDisposition.ACTIONABLE,
+        )
+        self.assertTrue(
+            result.trade_plan_result.hierarchy_assessment.release_eligible
+        )
+        self.assertIsNotNone(result.trade_plan_result.daily_planning_result)
+        self.assertIsNotNone(
+            result.trade_plan_result.daily_planning_result.approved_trade_intent
+        )
         gateway = _FakeGateway([_valid_multi_payload(result)])
 
         explanation = JarvisPresentationAgent(gateway).explain(
@@ -369,6 +408,55 @@ class JarvisPresentationAgentTests(unittest.TestCase):
                 item.name == "Central Pivot Range lifecycle"
                 for item in cpr_findings
             )
+        )
+
+    def test_bullish_judge_without_confirmed_structure_is_presented_as_no_trade(self):
+        result = _multi_use_case(timeframes=_trending_timeframes()).execute(
+            "NSE", "2885", "RELIANCE-EQ", "ONE_HOUR"
+        )
+        self.assertIs(
+            result.debate_result.submission.verdict.winner,
+            SignalDirection.BULLISH,
+        )
+        outcome = result.trade_plan_result
+        self.assertIsNone(outcome.daily_planning_result)
+        self.assertIs(
+            outcome.hierarchy_assessment.primary_condition,
+            MarketCondition.NEUTRAL,
+        )
+        self.assertFalse(outcome.hierarchy_assessment.release_eligible)
+        self.assertIn(
+            EvidenceFamily.MARKET_STRUCTURE,
+            outcome.hierarchy_assessment.blocking_families,
+        )
+        package = result.technical_review.evidence_package
+        self.assertEqual(package.daily.recent_confirmed_pivots, ())
+        self.assertEqual(package.weekly.recent_confirmed_pivots, ())
+
+        explanation = JarvisPresentationAgent(
+            _FakeGateway([_valid_multi_payload(result)])
+        ).explain(result, user_name="Prateek")
+
+        self.assertIs(
+            explanation.trade_plan.disposition,
+            MultiTimeframeTradeDisposition.NO_TRADE,
+        )
+        self.assertIs(
+            explanation.trade_plan.reason,
+            MultiTimeframeTradeReason.TIMEFRAME_SETUP_NOT_ALIGNED,
+        )
+        for field in (
+            "reference_entry_price",
+            "stop_loss_price",
+            "risk_per_unit",
+            "minimum_target_price",
+            "preferred_target_price",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNone(getattr(explanation.trade_plan, field))
+        self.assertIn("Trade plan: NO TRADE", explanation.executive_briefing)
+        self.assertIn(
+            "No executable long trade", explanation.trade_plan.execution_note
         )
 
     def test_multi_timeframe_bearish_verdict_is_presented_as_no_trade(self):

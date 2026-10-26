@@ -17,11 +17,15 @@ node_modules/
 # Mac
 .DS_Store
 
+# Imported skill-bundle packaging artifacts
+stock-analyzer-skills-bundle.zip
+
 # Logs
 logs/
 
 # Downloaded external reference data
 data/cache/
+data/fundamental-artifacts/
 
 data/*.duckdb
 data/*.duckdb.wal

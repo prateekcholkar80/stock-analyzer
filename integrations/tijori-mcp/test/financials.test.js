@@ -271,6 +271,25 @@ test('routes a structured Growth Table request to its scenario extractor', async
   assert.equal(Object.hasOwn(result.payload, 'facts'), false);
 });
 
+test('routes a Financial Package request through one immutable page snapshot', async () => {
+  const provider = fixture({ embeddedFinancialTables: structuredTables() });
+
+  const result = await handler(provider)({
+    issuer: ISSUER,
+    document_type: 'financial_package',
+    reporting_basis: 'not_applicable',
+  });
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.payload.package.schema_version, 'tijori.financial_document_package.v1');
+  assert.equal(result.payload.package.extraction.status, 'complete');
+  assert.equal(result.payload.package.documents.length, 11);
+  assert.equal(provider.observed.calls, 1);
+  assert.equal(provider.observed.gotoOptions.waitUntil, 'domcontentloaded');
+  assert.equal(Object.hasOwn(result.payload, 'document'), false);
+  assert.equal(Object.hasOwn(result.payload, 'facts'), false);
+});
+
 test('fails closed when the structured Growth Table extraction is incomplete', async () => {
   const incomplete = structuredTables();
   incomplete.growth.data[0].value.pop();

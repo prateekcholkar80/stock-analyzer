@@ -11,9 +11,15 @@ from app.exceptions import (
     BrowserSessionNotFoundError,
 )
 from app.models.browser_operations import (
+    BrowserAgentExecutionOutcome,
+    BrowserAgentExecutionStatus,
     BrowserBenchmarkingFinancialsReference,
+    BrowserFundamentalPackagePublicationOutcome,
+    BrowserFundamentalPackageReference,
+    BrowserOperationAuditLog,
     BrowserOperationFailure,
     BrowserOperationKind,
+    BrowserOperationOutput,
     BrowserOperationRequest,
     BrowserOperationSnapshot,
     BrowserOperationStatus,
@@ -22,13 +28,16 @@ from app.models.browser_operations import (
     WorkflowEventReplayCursor,
 )
 from app.models.conversation import InputChannel
+from app.models.interaction import JarvisSwingAnalysisResponse
+from app.models.llm import JarvisLLMFailureResponse, LLMFailureCode
 from app.models.workflow import (
     JarvisWorkflowEvent,
     WorkflowEventState,
+    WorkflowParticipantKind,
     WorkflowStage,
 )
 from app.services.fundamental_evidence import FundamentalEvidenceSource
-from app.workflow.events import WorkflowEventEmitter
+from app.workflow.events import InMemoryWorkflowEventSink, WorkflowEventEmitter
 from app.workflow.operations import InMemoryBrowserOperationRegistry
 
 
@@ -64,6 +73,159 @@ def _request(
 
 
 class BrowserOperationModelTests(unittest.TestCase):
+    def test_agent_execution_outcome_is_immutable_and_terminal(self):
+        completed = BrowserAgentExecutionOutcome(
+            invocation_id="technical.daily_analyst",
+            operation_id="operation-1",
+            activity_id="technical.daily.evaluate",
+            participant_id="technical.daily_analyst",
+            participant_kind=WorkflowParticipantKind.ANALYST,
+            participant_label="Daily Analyst",
+            stage=WorkflowStage.ANALYSIS,
+            status=BrowserAgentExecutionStatus.COMPLETED,
+            started_at=T0,
+            completed_at=T0 + timedelta(seconds=1),
+            recorded_at=T0 + timedelta(seconds=2),
+            result_reference="technical:daily:evidence",
+        )
+
+        self.assertEqual(completed.status, BrowserAgentExecutionStatus.COMPLETED)
+        with self.assertRaises(ValidationError):
+            completed.status = BrowserAgentExecutionStatus.FAILED
+        invalid = completed.model_dump(exclude={"schema_version"})
+        for changes, message in (
+            (
+                {
+                    "participant_kind": WorkflowParticipantKind.SERVICE,
+                },
+                "agent participant",
+            ),
+            (
+                {
+                    "status": BrowserAgentExecutionStatus.FAILED,
+                    "failure": None,
+                    "result_reference": None,
+                },
+                "safe failure",
+            ),
+            (
+                {
+                    "status": BrowserAgentExecutionStatus.SKIPPED_DEPENDENCY,
+                    "started_at": None,
+                    "depends_on": (),
+                    "result_reference": None,
+                },
+                "requires time and dependency",
+            ),
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ValidationError, message):
+                    BrowserAgentExecutionOutcome(**(invalid | changes))
+
+    def test_operation_audit_validates_agent_ledger_against_atomic_events(self):
+        event_times = iter(
+            (T0 + timedelta(seconds=1), T0 + timedelta(seconds=2))
+        )
+        sink = InMemoryWorkflowEventSink()
+        emitter = WorkflowEventEmitter(
+            "operation-1",
+            sink,
+            clock=lambda: next(event_times),
+        )
+        started = emitter.emit(
+            WorkflowStage.BULL_DEBATING,
+            WorkflowEventState.STARTED,
+            round_number=1,
+        )
+        failed = emitter.emit(
+            WorkflowStage.BULL_DEBATING,
+            WorkflowEventState.FAILED,
+            round_number=1,
+        )
+        failure = BrowserOperationFailure(
+            code="llm.authentication",
+            message="The debate credential was rejected.",
+            retryable=False,
+        )
+        bull = BrowserAgentExecutionOutcome(
+            invocation_id="debate.bull:round:1",
+            operation_id="operation-1",
+            activity_id=failed.activity.activity_id,
+            participant_id=failed.activity.participant_id,
+            participant_kind=failed.activity.participant_kind,
+            participant_label=failed.activity.participant_label,
+            stage=failed.stage,
+            status=BrowserAgentExecutionStatus.FAILED,
+            recorded_at=T0 + timedelta(seconds=3),
+            started_at=started.occurred_at,
+            completed_at=failed.occurred_at,
+            round_number=1,
+            failure=failure,
+        )
+        bear = BrowserAgentExecutionOutcome(
+            invocation_id="debate.bear:round:1",
+            operation_id="operation-1",
+            activity_id="debate.bear.argue",
+            participant_id="debate.bear",
+            participant_kind=WorkflowParticipantKind.ADVOCATE,
+            participant_label="Bear",
+            stage=WorkflowStage.BEAR_DEBATING,
+            status=BrowserAgentExecutionStatus.SKIPPED_DEPENDENCY,
+            recorded_at=T0 + timedelta(seconds=3),
+            completed_at=failed.occurred_at,
+            round_number=1,
+            depends_on=(bull.invocation_id,),
+        )
+        response = JarvisSwingAnalysisResponse.llm_failure(
+            operation_id="operation-1",
+            failure=JarvisLLMFailureResponse(
+                code=LLMFailureCode.AUTHENTICATION,
+                title="The debate could not start",
+                display_message=failure.message,
+                spoken_message="The debate could not start.",
+                recovery_action="Update the configured credential.",
+                retryable=False,
+                operation_id="operation-1",
+            ),
+        )
+        output = BrowserOperationOutput(
+            operation_id="operation-1",
+            session_id="session-1",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            completed_at=T0 + timedelta(seconds=3),
+            research_response=response,
+            decision_failure=failure,
+        )
+        operation = BrowserOperationSnapshot(
+            request=_request(),
+            status=BrowserOperationStatus.COMPLETED,
+            updated_at=T0 + timedelta(seconds=3),
+            last_event_sequence=2,
+            result_available=True,
+        )
+
+        audit = BrowserOperationAuditLog(
+            operation=operation,
+            events=sink.events,
+            agent_outcomes=(bull, bear),
+            result=output,
+        )
+        self.assertEqual(audit.agent_outcomes, (bull, bear))
+
+        mismatched_bull = BrowserAgentExecutionOutcome(
+            **(
+                bull.model_dump(exclude={"schema_version", "started_at"})
+                | {"started_at": T0}
+            )
+        )
+        with self.assertRaisesRegex(ValidationError, "atomic workflow events"):
+            BrowserOperationAuditLog(
+                operation=operation,
+                events=sink.events,
+                agent_outcomes=(mismatched_bull, bear),
+                result=output,
+            )
+
     def test_benchmarking_reference_is_bounded_and_browser_safe(self):
         reference = BrowserBenchmarkingFinancialsReference(
             cache_entry_id="benchmarking_financials:" + "a" * 64,
@@ -305,6 +467,153 @@ class InMemoryBrowserOperationRegistryTests(unittest.TestCase):
         )
         self.assertEqual(remainder.events, (second,))
         self.assertFalse(remainder.has_more)
+
+        response = JarvisSwingAnalysisResponse.llm_failure(
+            operation_id="operation-1",
+            failure=JarvisLLMFailureResponse(
+                code=LLMFailureCode.AUTHENTICATION,
+                title="The debate could not start",
+                display_message="The debate credential was rejected.",
+                spoken_message="The debate could not start.",
+                recovery_action="Update the configured credential.",
+                retryable=False,
+                operation_id="operation-1",
+            ),
+        )
+        output = BrowserOperationOutput(
+            operation_id="operation-1",
+            session_id="session-1",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            completed_at=T0 + timedelta(seconds=4),
+            research_response=response,
+            decision_failure=BrowserOperationFailure(
+                code="llm.authentication",
+                message="The debate credential was rejected.",
+                retryable=False,
+            ),
+        )
+        audit = BrowserOperationAuditLog(
+            operation=completed,
+            events=(first, second),
+            result=output,
+        )
+        self.assertEqual(audit.operation.request.operation_id, "operation-1")
+        self.assertEqual(audit.events, (first, second))
+
+        with self.assertRaisesRegex(ValueError, "complete event history"):
+            BrowserOperationAuditLog(
+                operation=completed,
+                events=(first,),
+                result=output,
+            )
+
+    def test_swing_output_retains_independent_fundamental_failure(self):
+        response = JarvisSwingAnalysisResponse.llm_failure(
+            operation_id="operation-1",
+            failure=JarvisLLMFailureResponse(
+                code=LLMFailureCode.AUTHENTICATION,
+                title="The debate could not start",
+                display_message="The debate credential was rejected.",
+                spoken_message="The debate could not start.",
+                recovery_action="Update the configured credential.",
+                retryable=False,
+                operation_id="operation-1",
+            ),
+        )
+        fundamental_failure = BrowserOperationFailure(
+            code="fundamentals.provider_unavailable",
+            message="Fundamental Analyst could not load its evidence.",
+            retryable=True,
+        )
+
+        output = BrowserOperationOutput(
+            operation_id="operation-1",
+            session_id="session-1",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            completed_at=T0,
+            research_response=response,
+            decision_failure=BrowserOperationFailure(
+                code="llm.authentication",
+                message="The debate credential was rejected.",
+                retryable=False,
+            ),
+            fundamental_failure=fundamental_failure,
+        )
+
+        self.assertEqual(output.fundamental_failure, fundamental_failure)
+
+    def test_audit_separates_committed_package_from_analyst_failure(self):
+        response = JarvisSwingAnalysisResponse.llm_failure(
+            operation_id="operation-1",
+            failure=JarvisLLMFailureResponse(
+                code=LLMFailureCode.AUTHENTICATION,
+                title="The debate could not start",
+                display_message="The debate credential was rejected.",
+                spoken_message="The debate could not start.",
+                recovery_action="Update the configured credential.",
+                retryable=False,
+                operation_id="operation-1",
+            ),
+        )
+        reference = BrowserFundamentalPackageReference(
+            package_id="fundamental_package:" + "a" * 64,
+            manifest_fingerprint="a" * 64,
+            expires_at=T0 + timedelta(days=10),
+        )
+        analyst_failure = BrowserOperationFailure(
+            code="fundamentals.analyst_unavailable",
+            message="The explanation could not be produced.",
+            retryable=False,
+        )
+        output = BrowserOperationOutput(
+            operation_id="operation-1",
+            session_id="session-1",
+            kind=BrowserOperationKind.SWING_ANALYSIS,
+            completed_at=T0 + timedelta(seconds=1),
+            research_response=response,
+            decision_failure=BrowserOperationFailure(
+                code="llm.authentication",
+                message="The debate credential was rejected.",
+                retryable=False,
+            ),
+            fundamental_package_reference=reference,
+            fundamental_failure=analyst_failure,
+        )
+        operation = BrowserOperationSnapshot(
+            request=_request().model_copy(
+                update={"fundamentals_requested": True, "refresh_requested": True}
+            ),
+            status=BrowserOperationStatus.COMPLETED,
+            updated_at=T0 + timedelta(seconds=2),
+            result_available=True,
+        )
+        publication = BrowserFundamentalPackagePublicationOutcome(
+            reference=reference
+        )
+        audit = BrowserOperationAuditLog(
+            operation=operation,
+            result=output,
+            fundamental_package_publication=publication,
+        )
+        self.assertEqual(audit.fundamental_package_publication.status, "committed")
+        self.assertEqual(audit.result.fundamental_failure, analyst_failure)
+        with self.assertRaisesRegex(ValidationError, "must match its result"):
+            BrowserOperationAuditLog(operation=operation, result=output)
+        with self.assertRaisesRegex(ValidationError, "changed its reference"):
+            BrowserOperationAuditLog(
+                operation=operation,
+                result=output,
+                fundamental_package_publication=(
+                    BrowserFundamentalPackagePublicationOutcome(
+                        reference=reference.model_copy(
+                            update={
+                                "package_id": "fundamental_package:" + "b" * 64,
+                                "manifest_fingerprint": "b" * 64,
+                            }
+                        )
+                    )
+                ),
+            )
 
     def test_running_cancellation_can_finish_cancelled_or_win_race(self):
         self.registry.submit(_request())

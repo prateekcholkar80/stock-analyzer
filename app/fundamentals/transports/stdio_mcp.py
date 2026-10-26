@@ -41,6 +41,9 @@ _CLIENT_NAME = "jarvis-tijori-transport"
 _CLIENT_VERSION = "1.0.0"
 _SESSION_ENVIRONMENT_KEY = "JARVIS_TIJORI_SESSION_FILE"
 _CONTRACT_ENVIRONMENT_KEY = "JARVIS_TIJORI_PROVIDER_CONTRACT_VERSION"
+_FILING_STAGING_ENVIRONMENT_KEY = (
+    "JARVIS_TIJORI_FILING_STAGING_DIRECTORY"
+)
 # MCP tool schemas can legitimately nest unions, array items, and object
 # properties more deeply than provider evidence payloads. Byte and node caps
 # remain the primary allocation bounds; this ceiling still rejects recursive
@@ -72,6 +75,7 @@ class TijoriStdioMcpSettings(FundamentalModel):
     server_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     server_arguments: tuple[str, ...] = Field(default=(), max_length=20)
     session_root: Path
+    filing_staging_directory: Path | None = None
     protocol_version: str = Field(
         default="2025-06-18",
         min_length=1,
@@ -102,10 +106,11 @@ class TijoriStdioMcpSettings(FundamentalModel):
         "runtime_executable",
         "server_entrypoint",
         "session_root",
+        "filing_staging_directory",
     )
     @classmethod
-    def require_absolute_path(cls, value: Path) -> Path:
-        if not value.is_absolute():
+    def require_absolute_path(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
             raise ValueError("Tijori transport paths must be absolute")
         return value
 
@@ -493,6 +498,10 @@ class TijoriStdioMcpTransport(TijoriMcpTransport):
                 self._settings.provider_contract_version
             ),
         }
+        if self._settings.filing_staging_directory is not None:
+            environment[_FILING_STAGING_ENVIRONMENT_KEY] = str(
+                self._settings.filing_staging_directory
+            )
         try:
             process = subprocess.Popen(
                 command,
@@ -558,6 +567,10 @@ class TijoriStdioMcpTransport(TijoriMcpTransport):
             require_current_owner=True,
         )
         self._validate_owner_only_directory(self._settings.session_root)
+        if self._settings.filing_staging_directory is not None:
+            self._validate_owner_only_directory(
+                self._settings.filing_staging_directory
+            )
 
     @staticmethod
     def _validate_runtime_file(

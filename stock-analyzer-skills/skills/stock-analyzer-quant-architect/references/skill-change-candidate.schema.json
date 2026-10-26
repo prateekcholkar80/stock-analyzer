@@ -1,0 +1,541 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jarvis.local/schemas/skill-change-candidate.schema.json",
+  "title": "Jarvis Skill Change Candidate",
+  "description": "A sanitized, versioned and human-governed proposal to improve one project or runtime skill.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "candidate_id",
+    "status",
+    "created_at",
+    "created_by",
+    "target",
+    "observation",
+    "proposal",
+    "risk",
+    "evaluation_plan",
+    "evaluation_results",
+    "approval",
+    "rollback"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^skill-change-[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "status": {
+      "enum": [
+        "DRAFT",
+        "READY_FOR_EVALUATION",
+        "EVALUATING",
+        "APPROVED",
+        "REJECTED",
+        "PROMOTED",
+        "ROLLED_BACK"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_by": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "target": {
+      "$ref": "#/$defs/target"
+    },
+    "observation": {
+      "$ref": "#/$defs/observation"
+    },
+    "proposal": {
+      "$ref": "#/$defs/proposal"
+    },
+    "risk": {
+      "$ref": "#/$defs/risk"
+    },
+    "evaluation_plan": {
+      "$ref": "#/$defs/evaluationPlan"
+    },
+    "evaluation_results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evaluationResult"
+      }
+    },
+    "approval": {
+      "$ref": "#/$defs/approval"
+    },
+    "promotion": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/promotion"
+        }
+      ],
+      "default": null
+    },
+    "rollback": {
+      "$ref": "#/$defs/rollback"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reference",
+        "fingerprint",
+        "summary"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "TEST_RUN",
+            "FIXTURE",
+            "OPERATION",
+            "DATASET",
+            "BACKTEST",
+            "WALK_FORWARD",
+            "INCIDENT",
+            "REVIEW",
+            "COMMIT"
+          ]
+        },
+        "reference": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "point_in_time_safe": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bundle",
+        "skill_name",
+        "skill_path",
+        "domain",
+        "base_version",
+        "base_content_sha256",
+        "candidate_version",
+        "candidate_content_sha256"
+      ],
+      "properties": {
+        "bundle": {
+          "const": "stock-analyzer-quant-architect"
+        },
+        "skill_name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "skill_path": {
+          "type": "string",
+          "pattern": "^(SKILL\\.md|subskills/[a-z0-9-]+/SKILL\\.md)$"
+        },
+        "domain": {
+          "enum": [
+            "MASTER",
+            "PYTHON_PLATFORM",
+            "QUANT_RESEARCH",
+            "TECHNICAL_ANALYSIS",
+            "PRICE_ACTION",
+            "STRATEGY",
+            "BACKTESTING",
+            "MARKET_DATA",
+            "QUANT_ML",
+            "LOCAL_MLOPS",
+            "ENTERPRISE_ARCHITECTURE",
+            "RISK_AND_EXECUTION",
+            "RUNTIME_AGENT"
+          ]
+        },
+        "base_version": {
+          "$ref": "#/$defs/semver"
+        },
+        "base_content_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "candidate_version": {
+          "$ref": "#/$defs/semver"
+        },
+        "candidate_content_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "category",
+        "summary",
+        "sanitized",
+        "evidence"
+      ],
+      "properties": {
+        "category": {
+          "enum": [
+            "DEFECT",
+            "AMBIGUITY",
+            "REGRESSION",
+            "MISSING_GUARDRAIL",
+            "REDUNDANCY",
+            "PERFORMANCE_EVIDENCE",
+            "USER_CORRECTION",
+            "OPERATIONAL_INCIDENT"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "sanitized": {
+          "const": true
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/reference"
+          }
+        }
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "summary",
+        "rationale",
+        "changed_decisions",
+        "non_goals"
+      ],
+      "properties": {
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3000
+        },
+        "changed_decisions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        },
+        "non_goals": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "level",
+        "leakage_risk",
+        "changes_deterministic_logic",
+        "changes_provider_behavior",
+        "expands_permissions",
+        "mitigations"
+      ],
+      "properties": {
+        "level": {
+          "enum": [
+            "LOW",
+            "MEDIUM",
+            "HIGH",
+            "CRITICAL"
+          ]
+        },
+        "leakage_risk": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1500
+        },
+        "changes_deterministic_logic": {
+          "type": "boolean"
+        },
+        "changes_provider_behavior": {
+          "type": "boolean"
+        },
+        "expands_permissions": {
+          "const": false
+        },
+        "mitigations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        }
+      }
+    },
+    "evaluationPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_suites",
+        "requires_live_validation",
+        "success_criteria",
+        "failure_criteria"
+      ],
+      "properties": {
+        "required_suites": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          }
+        },
+        "requires_live_validation": {
+          "type": "boolean"
+        },
+        "success_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        },
+        "failure_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        }
+      }
+    },
+    "evaluationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "evaluated_at",
+        "evidence",
+        "summary"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "PASSED",
+            "FAILED",
+            "INCONCLUSIVE"
+          ]
+        },
+        "evaluated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "evidence": {
+          "$ref": "#/$defs/reference"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "status",
+        "approved_by",
+        "approved_at",
+        "approved_candidate_sha256"
+      ],
+      "properties": {
+        "required": {
+          "const": true
+        },
+        "status": {
+          "enum": [
+            "PENDING",
+            "APPROVED",
+            "REJECTED"
+          ]
+        },
+        "approved_by": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "approved_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "approved_candidate_sha256": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/sha256"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "APPROVED"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "approved_by": {
+                "type": "string",
+                "minLength": 1
+              },
+              "approved_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "approved_candidate_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "promotion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "promoted_at",
+        "promoted_by",
+        "commit",
+        "previous_bundle_sha256",
+        "promoted_bundle_sha256"
+      ],
+      "properties": {
+        "promoted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "promoted_by": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{7,64}$"
+        },
+        "previous_bundle_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "promoted_bundle_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_version",
+        "trigger",
+        "status"
+      ],
+      "properties": {
+        "target_version": {
+          "$ref": "#/$defs/semver"
+        },
+        "trigger": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1500
+        },
+        "status": {
+          "enum": [
+            "READY",
+            "EXECUTED"
+          ]
+        },
+        "executed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "executed_by": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        }
+      }
+    }
+  }
+}

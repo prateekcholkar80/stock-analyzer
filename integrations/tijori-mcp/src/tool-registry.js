@@ -11,6 +11,8 @@ const TOOL_DESCRIPTIONS = Object.freeze({
   get_company_overview: 'Retrieve a company overview from the authenticated Tijori account.',
   get_financials: 'Retrieve requested company financial-statement evidence.',
   get_shareholding: 'Retrieve requested company shareholding evidence.',
+  list_company_filings: 'Discover bounded issuer-linked earnings releases and conference calls.',
+  download_company_filing: 'Stage one authenticated issuer-bound filing PDF for durable ingestion.',
 });
 
 export const TOOL_DEFINITIONS = Object.freeze(

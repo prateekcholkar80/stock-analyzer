@@ -12,17 +12,45 @@ from app.analytics.walk_forward import (
     run_walk_forward_backtest,
 )
 from app.exceptions import StorageConflictError, StorageError
+from app.gateways.fundamentals import (
+    FundamentalBenchmarkingFinancialsResult,
+    FundamentalCompanyOverviewRequest,
+    FundamentalEvidenceRetrieval,
+    FundamentalPeerComparisonResult,
+    FundamentalRetrievalStatus,
+    FundamentalShareholdingRequest,
+)
+from app.models.benchmarking_financials_storage import (
+    stored_benchmarking_financials_document,
+)
 from app.models.backtest import WalkForwardBacktestConfig
 from app.models.execution import (
     ExecutionSimulationConfig,
     ExecutionTargetPolicy,
 )
 from app.models.market import Candle, HistoricalCandleSeries
+from app.models.financial_document_storage import (
+    stored_structured_financial_document,
+)
+from app.models.financial_documents import (
+    FinancialDocumentType,
+    FinancialReportingBasis,
+)
+from app.models.fundamental_package import (
+    FUNDAMENTAL_PACKAGE_REQUIRED_ITEMS,
+    FundamentalEvidencePackage,
+    FundamentalPackageItem,
+    FundamentalPackageManifest,
+)
+from app.models.fundamental_storage import stored_fundamental_snapshot
+from app.models.fundamentals import FundamentalStatement
+from app.models.peer_comparison_storage import stored_peer_comparison_document
 from app.models.signals import SignalDirection
 from app.models.storage import (
     BacktestRunQuery,
     DebateRunQuery,
     MarketSeriesQuery,
+    MultiTimeframeEndToEndSwingAnalysisResult,
     backtest_run_summary,
     market_series_summary,
     stored_backtest_run,
@@ -31,6 +59,23 @@ from app.models.storage import (
 )
 from app.services.research_archive import ResearchArchiveService
 from app.storage.adapters.duckdb import DuckDBJarvisStorage
+from app.storage.corporate_filings_analysis_repositories import (
+    CorporateFilingsAnalysisDeleteStatus,
+    CorporateFilingsAnalysisRepository,
+)
+from app.storage.fundamental_package_repositories import (
+    FundamentalPackageRepository,
+    FundamentalPackageRepositoryScope,
+)
+from app.storage.fundamental_filing_repositories import (
+    FundamentalFilingDeleteStatus,
+    FundamentalFilingRepository,
+    FundamentalFilingRepositoryScope,
+)
+from app.storage.fundamental_filing_evidence_repositories import (
+    FundamentalFilingEvidencePolicyKey,
+    FundamentalFilingEvidenceRepository,
+)
 from app.storage.repositories import JarvisStorageAdapter
 from app.use_cases.run_and_archive_backtest import (
     RunAndArchiveWalkForwardBacktest,
@@ -41,10 +86,257 @@ from tests.unit.test_storage_adapters import (
     _backtest_result,
     _market_series,
 )
+from tests.unit.test_run_end_to_end_multi_timeframe_swing_analysis import (
+    _use_case as _multi_timeframe_use_case,
+)
 from tests.unit.test_walk_forward import _ScriptedOrchestrator
+from tests.unit.test_benchmarking_financials_gateway import (
+    document as benchmarking_document,
+    result_values as benchmarking_result_values,
+)
+from tests.unit.test_financial_document_storage import (
+    request as financial_document_request,
+    result as financial_document_result,
+)
+from tests.unit.test_fundamental_gateway import (
+    build_connection,
+    build_issuer,
+    build_snapshot,
+    response_values as fundamental_response_values,
+)
+from tests.unit.test_fundamental_storage_contracts import (
+    build_financial_request,
+)
+from tests.unit.test_peer_comparison_gateway import (
+    document as peer_document,
+    result_values as peer_result_values,
+)
+from tests.unit.test_fundamental_filing_in_memory import (
+    authorization_for,
+    revised_package as revised_filing_package,
+)
+from tests.unit.test_fundamental_filing_evidence_in_memory import (
+    revised_record as revised_filing_evidence_record,
+)
+from tests.unit.test_fundamental_filing_evidence_repositories import (
+    stored_evidence as stored_filing_evidence,
+)
+from tests.unit.test_fundamental_filings import (
+    PDF_HASH,
+    RECHECK_AFTER,
+    package as filing_package,
+)
+from tests.unit.test_corporate_filings_analysis_in_memory import (
+    delete_authorization as corporate_analysis_delete_authorization,
+    record as corporate_analysis_record,
+)
 
 
 IST = ZoneInfo("Asia/Kolkata")
+
+
+def _fundamental_package(
+    *,
+    sequence: int = 1,
+    connection=None,
+) -> FundamentalEvidencePackage:
+    requested_at = datetime(2026, 8, 30, 18, sequence, tzinfo=IST)
+    completed_at = requested_at + timedelta(seconds=2)
+    stored_at = requested_at + timedelta(seconds=3)
+    operation_id = f"operation.coforge.package.{sequence}"
+    selected_connection = connection or build_connection()
+    issuer = build_issuer(
+        symbol="COFORGE",
+        legal_name="Coforge Ltd.",
+        provider_company_id="4502",
+        provider_slug="niit-technologies-limited",
+    )
+
+    overview_request = FundamentalCompanyOverviewRequest(
+        request_id=f"request.coforge.overview.{sequence}",
+        operation_id=operation_id,
+        connection=selected_connection,
+        requested_at=requested_at,
+        issuer=issuer,
+        as_of_date=requested_at.date(),
+    )
+    financials_request = build_financial_request(
+        request_id=f"request.coforge.financials.{sequence}",
+        operation_id=operation_id,
+        connection=selected_connection,
+        requested_at=requested_at,
+        issuer=issuer,
+        as_of_date=requested_at.date(),
+    )
+    shareholding_request = FundamentalShareholdingRequest(
+        request_id=f"request.coforge.shareholding.{sequence}",
+        operation_id=operation_id,
+        connection=selected_connection,
+        requested_at=requested_at,
+        issuer=issuer,
+        as_of_date=requested_at.date(),
+        quarters=8,
+        include_promoter_pledge=True,
+    )
+    snapshots = []
+    for request, statement in (
+        (overview_request, FundamentalStatement.COMPANY_PROFILE),
+        (financials_request, FundamentalStatement.INCOME_STATEMENT),
+        (shareholding_request, FundamentalStatement.OWNERSHIP),
+    ):
+        retrieval = FundamentalEvidenceRetrieval(
+            **fundamental_response_values(
+                request,
+                capability=request.capability,
+                issuer=issuer,
+                status=FundamentalRetrievalStatus.COMPLETED,
+                snapshot=build_snapshot(
+                    statement,
+                    connection=selected_connection,
+                    issuer=issuer,
+                    assembled_at=requested_at + timedelta(seconds=1),
+                ),
+                started_at=requested_at,
+                completed_at=completed_at,
+            )
+        )
+        snapshots.append(
+            stored_fundamental_snapshot(
+                request,
+                retrieval,
+                stored_at=stored_at,
+            )
+        )
+
+    document_scenarios = (
+        (FinancialDocumentType.GROWTH_TABLE, FinancialReportingBasis.NOT_APPLICABLE),
+        *(
+            (document_type, reporting_basis)
+            for document_type in (
+                FinancialDocumentType.BALANCE_SHEET,
+                FinancialDocumentType.PROFIT_AND_LOSS,
+                FinancialDocumentType.CASH_FLOW,
+                FinancialDocumentType.RATIOS,
+                FinancialDocumentType.QUARTERLY_RESULTS,
+            )
+            for reporting_basis in (
+                FinancialReportingBasis.CONSOLIDATED,
+                FinancialReportingBasis.STANDALONE,
+            )
+        ),
+    )
+    structured_documents = []
+    for index, (document_type, reporting_basis) in enumerate(document_scenarios):
+        request = financial_document_request(
+            request_id=f"request.coforge.document.{sequence}.{index}",
+            operation_id=operation_id,
+            connection=selected_connection,
+            requested_at=requested_at,
+            issuer=issuer,
+            as_of_date=requested_at.date(),
+            document_type=document_type,
+            reporting_basis=reporting_basis,
+        )
+        result = financial_document_result(request)
+        structured_documents.append(
+            stored_structured_financial_document(
+                request,
+                result,
+                stored_at=stored_at,
+            )
+        )
+
+    peer_request = FundamentalCompanyOverviewRequest(
+        request_id=f"request.coforge.peers.{sequence}",
+        operation_id=operation_id,
+        connection=selected_connection,
+        requested_at=requested_at,
+        issuer=issuer,
+        as_of_date=requested_at.date(),
+    )
+    peer_values = peer_result_values(peer_request)
+    peer_values.update(
+        started_at=requested_at,
+        completed_at=completed_at,
+        document=peer_document(
+            connection=selected_connection,
+            issuer=issuer,
+            observation_date=requested_at.date(),
+            retrieved_at=requested_at + timedelta(seconds=1),
+            expires_at=requested_at + timedelta(days=10),
+        ),
+    )
+    peer_comparison = stored_peer_comparison_document(
+        peer_request,
+        FundamentalPeerComparisonResult(**peer_values),
+        stored_at=stored_at,
+    )
+
+    benchmarking_request = FundamentalCompanyOverviewRequest(
+        request_id=f"request.coforge.benchmarking.{sequence}",
+        operation_id=operation_id,
+        connection=selected_connection,
+        requested_at=requested_at,
+        issuer=issuer,
+        as_of_date=requested_at.date(),
+    )
+    benchmarking_values = benchmarking_result_values(benchmarking_request)
+    benchmarking_values.update(
+        started_at=requested_at,
+        completed_at=completed_at,
+        document=benchmarking_document(
+            connection=selected_connection,
+            issuer=issuer,
+            observation_date=requested_at.date(),
+            retrieved_at=requested_at + timedelta(seconds=1),
+            expires_at=requested_at + timedelta(days=10),
+        ),
+    )
+    benchmarking = stored_benchmarking_financials_document(
+        benchmarking_request,
+        FundamentalBenchmarkingFinancialsResult(**benchmarking_values),
+        stored_at=stored_at,
+    )
+
+    artifacts = (
+        *snapshots,
+        *structured_documents,
+        peer_comparison,
+        benchmarking,
+    )
+    items = tuple(
+        FundamentalPackageItem(
+            key=key,
+            cache_entry_id=artifact.cache_key.cache_entry_id,
+            content_fingerprint=(
+                artifact.snapshot_fingerprint
+                if hasattr(artifact, "snapshot_fingerprint")
+                else artifact.document_fingerprint
+            ),
+            retrieved_at=artifact.retrieved_at,
+            expires_at=artifact.expires_at,
+        )
+        for key, artifact in zip(
+            FUNDAMENTAL_PACKAGE_REQUIRED_ITEMS,
+            artifacts,
+            strict=True,
+        )
+    )
+    manifest = FundamentalPackageManifest(
+        operation_id=operation_id,
+        connection=selected_connection,
+        issuer=issuer,
+        requested_at=requested_at,
+        committed_at=requested_at + timedelta(seconds=4),
+        items=items,
+    )
+    return FundamentalEvidencePackage(
+        manifest=manifest,
+        snapshots=tuple(snapshots),
+        structured_documents=tuple(structured_documents),
+        peer_comparison=peer_comparison,
+        benchmarking_financials=benchmarking,
+    )
 
 
 def _detailed_backtest_result():
@@ -115,7 +407,7 @@ class DuckDBStorageTests(unittest.TestCase):
         with self.storage() as storage:
             self.assertIsInstance(storage, JarvisStorageAdapter)
             self.assertEqual(storage.adapter_name, "duckdb")
-            self.assertEqual(storage.schema_version, 5)
+            self.assertEqual(storage.schema_version, 9)
             self.assertEqual(storage.database, str(self.database))
 
         connection = duckdb.connect(str(self.database), read_only=True)
@@ -131,7 +423,7 @@ class DuckDBStorageTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(version, ("5",))
+        self.assertEqual(version, ("9",))
         self.assertTrue(
             {
                 "jarvis_instruments",
@@ -157,8 +449,780 @@ class DuckDBStorageTests(unittest.TestCase):
                 "jarvis_fundamental_sources",
                 "jarvis_fundamental_facts",
                 "jarvis_fundamental_conflicts",
+                "jarvis_fundamental_packages",
+                "jarvis_active_fundamental_packages",
+                "jarvis_fundamental_filing_artifacts",
+                "jarvis_fundamental_filing_packages",
+                "jarvis_fundamental_filing_package_artifacts",
+                "jarvis_active_fundamental_filing_packages",
+                "jarvis_fundamental_filing_delete_receipts",
+                "jarvis_fundamental_filing_evidence",
+                "jarvis_corporate_filings_analysis",
+                "jarvis_active_corporate_filings_analysis",
+                "jarvis_corporate_filings_analysis_active_history",
+                "jarvis_corporate_filings_analysis_delete_receipts",
             }.issubset(tables)
         )
+
+    def test_fundamental_package_round_trip_and_defensive_copies(self):
+        package = _fundamental_package()
+        now = package.manifest.committed_at + timedelta(minutes=1)
+        scope = FundamentalPackageRepositoryScope.from_package(package)
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            self.assertIsInstance(storage, FundamentalPackageRepository)
+            committed = storage.commit_fundamental_package(
+                package,
+                expected_active_package_id=None,
+            )
+            active = storage.get_active_fundamental_package(
+                scope=scope,
+                as_of=now,
+            )
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as reopened:
+            resolved = reopened.get_fundamental_package(
+                package.package_id,
+                scope=scope,
+                as_of=now,
+            )
+
+        self.assertEqual(committed, package)
+        self.assertEqual(active, package)
+        self.assertEqual(resolved, package)
+        self.assertIsNot(committed, package)
+        self.assertIsNot(active, committed)
+        self.assertIsNot(active.snapshots[0], committed.snapshots[0])
+
+    def test_fundamental_package_cas_conflict_rolls_back_every_write(self):
+        first = _fundamental_package(sequence=1)
+        second = _fundamental_package(sequence=2)
+        now = second.manifest.committed_at + timedelta(minutes=1)
+        scope = FundamentalPackageRepositoryScope.from_package(first)
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            storage.commit_fundamental_package(
+                first,
+                expected_active_package_id=None,
+            )
+            with self.assertRaises(StorageConflictError):
+                storage.commit_fundamental_package(
+                    second,
+                    expected_active_package_id=(
+                        "fundamental_package:" + "0" * 64
+                    ),
+                )
+            active_after_conflict = storage.get_active_fundamental_package(
+                scope=scope,
+                as_of=now,
+            )
+            rejected = storage.get_fundamental_package(
+                second.package_id,
+                scope=scope,
+                as_of=now,
+            )
+            committed = storage.commit_fundamental_package(
+                second,
+                expected_active_package_id=first.package_id,
+            )
+
+        self.assertEqual(active_after_conflict, first)
+        self.assertIsNone(rejected)
+        self.assertEqual(committed, second)
+
+    def test_fundamental_packages_are_scope_isolated(self):
+        first = _fundamental_package(sequence=1)
+        other = _fundamental_package(
+            sequence=2,
+            connection=build_connection(
+                tenant_id="tenant.other",
+                provider_connection_id="provider.tijori.other",
+            ),
+        )
+        now = other.manifest.committed_at + timedelta(minutes=1)
+        first_scope = FundamentalPackageRepositoryScope.from_package(first)
+        other_scope = FundamentalPackageRepositoryScope.from_package(other)
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            storage.commit_fundamental_package(
+                first,
+                expected_active_package_id=None,
+            )
+            storage.commit_fundamental_package(
+                other,
+                expected_active_package_id=None,
+            )
+
+            self.assertEqual(
+                storage.get_active_fundamental_package(
+                    scope=first_scope,
+                    as_of=now,
+                ),
+                first,
+            )
+            self.assertEqual(
+                storage.get_active_fundamental_package(
+                    scope=other_scope,
+                    as_of=now,
+                ),
+                other,
+            )
+            self.assertIsNone(
+                storage.get_fundamental_package(
+                    first.package_id,
+                    scope=other_scope,
+                    as_of=now,
+                )
+            )
+
+    def test_fundamental_package_expiry_removes_payload_and_pointer(self):
+        package = _fundamental_package()
+        scope = FundamentalPackageRepositoryScope.from_package(package)
+        clock_value = [package.manifest.committed_at + timedelta(minutes=1)]
+        with DuckDBJarvisStorage(
+            self.database,
+            clock=lambda: clock_value[0],
+        ) as storage:
+            storage.commit_fundamental_package(
+                package,
+                expected_active_package_id=None,
+            )
+            clock_value[0] = package.manifest.expires_at
+            self.assertEqual(
+                storage.purge_expired_fundamental_packages(
+                    as_of=clock_value[0]
+                ),
+                1,
+            )
+            self.assertIsNone(
+                storage.get_active_fundamental_package(
+                    scope=scope,
+                    as_of=clock_value[0],
+                )
+            )
+            counts = storage._connection.execute(
+                "SELECT "
+                "(SELECT count(*) FROM jarvis_fundamental_packages), "
+                "(SELECT count(*) FROM jarvis_active_fundamental_packages)"
+            ).fetchone()
+
+        self.assertEqual(counts, (0, 0))
+
+    def test_filing_package_round_trip_is_metadata_only_and_defensive(self):
+        package = filing_package()
+        artifact = package.artifacts[0]
+        scope = FundamentalFilingRepositoryScope.from_package(package)
+        now = package.manifest.committed_at + timedelta(hours=3)
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            self.assertIsInstance(storage, FundamentalFilingRepository)
+            committed = storage.commit_filing_package(
+                package,
+                expected_active_package_id=None,
+            )
+            active = storage.get_active_filing_package(scope=scope)
+            by_hash = storage.find_filing_artifacts_by_content_hash(
+                PDF_HASH,
+                scope=scope,
+            )
+            versions = storage.list_filing_artifact_versions(
+                artifact.reference.filing_reference_id,
+                scope=scope,
+            )
+            column_types = {
+                row[1]: row[2]
+                for row in storage._connection.execute(
+                    "PRAGMA table_info('jarvis_fundamental_filing_artifacts')"
+                ).fetchall()
+            }
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as reopened:
+            resolved = reopened.get_filing_package(
+                package.package_id,
+                scope=scope,
+            )
+            resolved_artifact = reopened.get_filing_artifact(
+                artifact.artifact_id,
+                scope=scope,
+            )
+
+        self.assertEqual(committed, package)
+        self.assertEqual(active, package)
+        self.assertEqual(resolved, package)
+        self.assertEqual(resolved_artifact, artifact)
+        self.assertEqual(by_hash, (artifact,))
+        self.assertEqual(versions, (artifact,))
+        self.assertIsNot(committed, package)
+        self.assertIsNot(active, committed)
+        self.assertIsNot(active.artifacts[0], committed.artifacts[0])
+        self.assertNotIn("BLOB", set(column_types.values()))
+        self.assertIn("safe_relative_path", column_types)
+
+    def test_filing_evidence_round_trip_preserves_complete_json_and_indexes(self):
+        record = stored_filing_evidence()
+        now = record.stored_at + timedelta(hours=1)
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            self.assertIsInstance(
+                storage,
+                FundamentalFilingEvidenceRepository,
+            )
+            saved = storage.save_filing_evidence(record)
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as reopened:
+            loaded = reopened.get_filing_evidence(
+                record.record_id,
+                scope=record.scope,
+                as_of=now,
+            )
+            row = reopened._connection.execute(
+                "SELECT tenant_id, scope_fingerprint, artifact_fingerprint, "
+                "extraction_policy_fingerprint, "
+                "validation_policy_fingerprint, extraction_fingerprint, "
+                "validation_fingerprint, payload_json "
+                "FROM jarvis_fundamental_filing_evidence "
+                "WHERE record_id = ?",
+                [record.record_id],
+            ).fetchone()
+            indexes = {
+                row[0]
+                for row in reopened._connection.execute(
+                    "SELECT index_name FROM duckdb_indexes() "
+                    "WHERE table_name = "
+                    "'jarvis_fundamental_filing_evidence'"
+                ).fetchall()
+            }
+
+        decoded_payload = json.loads(row[7])
+        self.assertEqual(saved, record)
+        self.assertEqual(loaded, record)
+        self.assertIsNot(saved, record)
+        self.assertIsNot(loaded, saved)
+        self.assertEqual(row[0], record.scope.connection.tenant_id)
+        self.assertEqual(len(row[1]), 64)
+        self.assertEqual(
+            row[2:7],
+            (
+                record.artifact_fingerprint,
+                record.extraction_policy_fingerprint,
+                record.validation_policy_fingerprint,
+                record.extraction_fingerprint,
+                record.validation_fingerprint,
+            ),
+        )
+        self.assertEqual(
+            set(decoded_payload),
+            {
+                "schema_version",
+                "artifact_id",
+                "artifact_fingerprint",
+                "extraction_policy_fingerprint",
+                "validation_policy_fingerprint",
+                "extraction_fingerprint",
+                "validation_fingerprint",
+                "stored_at",
+                "evidence",
+                "validation",
+            },
+        )
+        self.assertEqual(
+            indexes,
+            {
+                "jarvis_filing_evidence_scope_lookup",
+                "jarvis_filing_evidence_policy_lookup",
+                "jarvis_filing_evidence_lineage_lookup",
+            },
+        )
+
+    def test_filing_evidence_is_idempotent_and_conflict_rolls_back(self):
+        record = stored_filing_evidence()
+        conflicting = record.model_copy(
+            update={"stored_at": record.stored_at + timedelta(seconds=1)}
+        )
+        now = conflicting.stored_at + timedelta(hours=1)
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            first = storage.save_filing_evidence(record)
+            repeated = storage.save_filing_evidence(record)
+            with self.assertRaises(StorageConflictError):
+                storage.save_filing_evidence(conflicting)
+            count = storage._connection.execute(
+                "SELECT count(*) "
+                "FROM jarvis_fundamental_filing_evidence"
+            ).fetchone()[0]
+            retained = storage.get_filing_evidence(
+                record.record_id,
+                scope=record.scope,
+                as_of=now,
+            )
+
+        self.assertEqual(first, repeated)
+        self.assertEqual(count, 1)
+        self.assertEqual(retained, record)
+
+    def test_filing_evidence_policy_reads_are_point_in_time_and_scoped(self):
+        first = stored_filing_evidence()
+        second = revised_filing_evidence_record(minutes=2)
+        key = FundamentalFilingEvidencePolicyKey.from_record(first)
+        now = second.stored_at + timedelta(hours=1)
+        other_scope = FundamentalFilingRepositoryScope(
+            connection=build_connection(
+                tenant_id="tenant.other",
+                provider_connection_id="provider.tijori.other",
+            ),
+            issuer=first.scope.issuer,
+        )
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            storage.save_filing_evidence(first)
+            storage.save_filing_evidence(second)
+            before_second = storage.find_filing_evidence_by_policy(
+                key,
+                scope=first.scope,
+                as_of=second.stored_at - timedelta(microseconds=1),
+            )
+            versions = storage.list_filing_evidence_for_artifact(
+                first.artifact_id,
+                scope=first.scope,
+                as_of=now,
+            )
+            cross_tenant = storage.find_filing_evidence_by_policy(
+                key,
+                scope=other_scope,
+                as_of=now,
+            )
+
+        self.assertEqual(before_second, (first,))
+        self.assertEqual(versions, (first, second))
+        self.assertEqual(cross_tenant, ())
+
+    def test_corporate_analysis_round_trip_and_exact_reuse_index(self):
+        record = corporate_analysis_record()
+        now = record.stored_at + timedelta(hours=1)
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            self.assertIsInstance(
+                storage,
+                CorporateFilingsAnalysisRepository,
+            )
+            saved = storage.save_corporate_filings_analysis(record)
+            repeated = storage.save_corporate_filings_analysis(record)
+            with self.assertRaisesRegex(StorageConflictError, "record ID"):
+                storage.save_corporate_filings_analysis(
+                    record.model_copy(
+                        update={
+                            "stored_at": record.stored_at
+                            + timedelta(seconds=1)
+                        }
+                    )
+                )
+            same_reuse_different_result = record.model_copy(
+                update={
+                    "result": record.result.model_copy(
+                        update={
+                            "analysis_id": "corporate-filing-analysis-revised"
+                        }
+                    )
+                }
+            )
+            with self.assertRaisesRegex(StorageConflictError, "reuse key"):
+                storage.save_corporate_filings_analysis(
+                    same_reuse_different_result
+                )
+            before_storage = (
+                storage.find_corporate_filings_analysis_by_reuse_key(
+                    record.reuse_key,
+                    scope=record.scope,
+                    as_of=record.stored_at - timedelta(microseconds=1),
+                )
+            )
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as reopened:
+            cached = reopened.find_corporate_filings_analysis_by_reuse_key(
+                record.reuse_key,
+                scope=record.scope,
+                as_of=now,
+            )
+            row = reopened._connection.execute(
+                "SELECT scope_fingerprint, period_key_fingerprint, "
+                "reuse_key_fingerprint, filing_package_fingerprint, "
+                "bundle_fingerprint, policy_fingerprint, "
+                "model_configuration_fingerprint, payload_json "
+                "FROM jarvis_corporate_filings_analysis "
+                "WHERE record_id = ?",
+                [record.record_id],
+            ).fetchone()
+            indexes = {
+                item[0]
+                for item in reopened._connection.execute(
+                    "SELECT index_name FROM duckdb_indexes() "
+                    "WHERE table_name = "
+                    "'jarvis_corporate_filings_analysis'"
+                ).fetchall()
+            }
+
+        payload = json.loads(row[7])
+        self.assertEqual(saved, record)
+        self.assertEqual(repeated, record)
+        self.assertEqual(cached, record)
+        self.assertIsNot(saved, record)
+        self.assertIsNot(repeated, saved)
+        self.assertIsNot(cached, saved)
+        self.assertIsNone(before_storage)
+        self.assertEqual(
+            row[:7],
+            (
+                record.scope.scope_fingerprint,
+                record.period_key.period_key_fingerprint,
+                record.reuse_key.reuse_key_fingerprint,
+                record.filing_package_fingerprint,
+                record.bundle_fingerprint,
+                record.policy_fingerprint,
+                record.model_configuration_fingerprint,
+            ),
+        )
+        self.assertNotIn("bundle", payload)
+        self.assertNotIn("prompt", payload)
+        self.assertIn("result", payload)
+        self.assertEqual(
+            indexes,
+            {
+                "jarvis_corporate_analysis_reuse_lookup",
+                "jarvis_corporate_analysis_period_history_lookup",
+                "jarvis_corporate_analysis_lineage_lookup",
+            },
+        )
+
+    def test_corporate_analysis_cas_is_atomic_and_history_is_point_in_time(self):
+        first = corporate_analysis_record()
+        candidate = corporate_analysis_record(
+            prompt="prompt-b",
+            stored_at=first.stored_at + timedelta(minutes=10),
+        )
+        clock_value = [first.stored_at + timedelta(hours=1)]
+        first_activation = clock_value[0]
+
+        with DuckDBJarvisStorage(
+            self.database,
+            clock=lambda: clock_value[0],
+        ) as storage:
+            storage.commit_corporate_filings_analysis(
+                first,
+                expected_active_record_id=None,
+            )
+            with self.assertRaisesRegex(
+                StorageConflictError,
+                "changed before commit",
+            ):
+                storage.commit_corporate_filings_analysis(
+                    candidate,
+                    expected_active_record_id=None,
+                )
+            self.assertIsNone(
+                storage.find_corporate_filings_analysis_by_reuse_key(
+                    candidate.reuse_key,
+                    scope=candidate.scope,
+                    as_of=clock_value[0],
+                )
+            )
+            self.assertEqual(
+                storage.get_active_corporate_filings_analysis(
+                    first.period_key,
+                    scope=first.scope,
+                    as_of=clock_value[0],
+                ),
+                first,
+            )
+
+            clock_value[0] += timedelta(minutes=1)
+            second_activation = clock_value[0]
+            storage.commit_corporate_filings_analysis(
+                candidate,
+                expected_active_record_id=first.record_id,
+            )
+            before_replacement = (
+                storage.get_active_corporate_filings_analysis(
+                    first.period_key,
+                    scope=first.scope,
+                    as_of=first_activation + timedelta(seconds=30),
+                )
+            )
+            after_replacement = (
+                storage.get_active_corporate_filings_analysis(
+                    first.period_key,
+                    scope=first.scope,
+                    as_of=second_activation,
+                )
+            )
+            history = storage.list_corporate_filings_analysis_history(
+                first.period_key,
+                scope=first.scope,
+                as_of=second_activation,
+            )
+            counts = storage._connection.execute(
+                "SELECT "
+                "(SELECT count(*) "
+                "FROM jarvis_corporate_filings_analysis), "
+                "(SELECT count(*) "
+                "FROM jarvis_active_corporate_filings_analysis), "
+                "(SELECT count(*) FROM "
+                "jarvis_corporate_filings_analysis_active_history)"
+            ).fetchone()
+
+        self.assertEqual(before_replacement, first)
+        self.assertEqual(after_replacement, candidate)
+        self.assertEqual(history, (first, candidate))
+        self.assertEqual(counts, (2, 1, 2))
+
+    def test_corporate_analysis_reads_are_tenant_isolated(self):
+        first = corporate_analysis_record()
+        other = corporate_analysis_record(tenant_id="tenant-2")
+        now = first.stored_at + timedelta(hours=1)
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            storage.commit_corporate_filings_analysis(
+                first,
+                expected_active_record_id=None,
+            )
+            self.assertIsNone(
+                storage.find_corporate_filings_analysis_by_reuse_key(
+                    first.reuse_key,
+                    scope=other.scope,
+                    as_of=now,
+                )
+            )
+            self.assertEqual(
+                storage.list_corporate_filings_analysis_history(
+                    first.period_key,
+                    scope=other.scope,
+                    as_of=now,
+                ),
+                (),
+            )
+            self.assertIsNone(
+                storage.get_active_corporate_filings_analysis(
+                    first.period_key,
+                    scope=other.scope,
+                    as_of=now,
+                )
+            )
+
+    def test_corporate_analysis_deletion_is_audited_and_preserves_active(self):
+        first = corporate_analysis_record()
+        candidate = corporate_analysis_record(
+            prompt="prompt-b",
+            stored_at=first.stored_at + timedelta(minutes=10),
+        )
+        clock_value = [first.stored_at + timedelta(hours=1)]
+
+        with DuckDBJarvisStorage(
+            self.database,
+            clock=lambda: clock_value[0],
+        ) as storage:
+            storage.commit_corporate_filings_analysis(
+                first,
+                expected_active_record_id=None,
+            )
+            rejected = storage.delete_corporate_filings_analysis(
+                first.record_id,
+                scope=first.scope,
+                authorization=corporate_analysis_delete_authorization(
+                    first,
+                    audit_id="audit-active",
+                    authorized_at=clock_value[0],
+                ),
+            )
+            clock_value[0] += timedelta(minutes=1)
+            storage.commit_corporate_filings_analysis(
+                candidate,
+                expected_active_record_id=first.record_id,
+            )
+            authorization = corporate_analysis_delete_authorization(
+                first,
+                audit_id="audit-inactive",
+                authorized_at=clock_value[0],
+            )
+            deleted = storage.delete_corporate_filings_analysis(
+                first.record_id,
+                scope=first.scope,
+                authorization=authorization,
+            )
+            repeated = storage.delete_corporate_filings_analysis(
+                first.record_id,
+                scope=first.scope,
+                authorization=authorization,
+            )
+            active = storage.get_active_corporate_filings_analysis(
+                candidate.period_key,
+                scope=candidate.scope,
+                as_of=clock_value[0],
+            )
+            counts = storage._connection.execute(
+                "SELECT "
+                "(SELECT count(*) "
+                "FROM jarvis_corporate_filings_analysis), "
+                "(SELECT count(*) FROM "
+                "jarvis_corporate_filings_analysis_active_history), "
+                "(SELECT count(*) FROM "
+                "jarvis_corporate_filings_analysis_delete_receipts)"
+            ).fetchone()
+
+        self.assertEqual(
+            rejected.status,
+            CorporateFilingsAnalysisDeleteStatus.REJECTED_ACTIVE_RESULT,
+        )
+        self.assertTrue(deleted.deleted)
+        self.assertEqual(repeated, deleted)
+        self.assertEqual(active, candidate)
+        self.assertEqual(counts, (1, 1, 2))
+
+    def test_filing_package_cas_conflict_rolls_back_and_replace_is_atomic(self):
+        first = filing_package()
+        second = revised_filing_package(sequence=2)
+        scope = FundamentalFilingRepositoryScope.from_package(first)
+        now = second.manifest.committed_at + timedelta(hours=3)
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            storage.commit_filing_package(
+                first,
+                expected_active_package_id=None,
+            )
+            with self.assertRaises(StorageConflictError):
+                storage.commit_filing_package(
+                    second,
+                    expected_active_package_id=(
+                        "filing_package:" + "0" * 64
+                    ),
+                )
+            active_after_conflict = storage.get_active_filing_package(
+                scope=scope
+            )
+            rejected_package = storage.get_filing_package(
+                second.package_id,
+                scope=scope,
+            )
+            rejected_artifact = storage.get_filing_artifact(
+                second.artifacts[0].artifact_id,
+                scope=scope,
+            )
+            committed = storage.commit_filing_package(
+                second,
+                expected_active_package_id=first.package_id,
+            )
+            active_after_replace = storage.get_active_filing_package(
+                scope=scope
+            )
+            retained_first = storage.get_filing_package(
+                first.package_id,
+                scope=scope,
+            )
+
+        self.assertEqual(active_after_conflict, first)
+        self.assertIsNone(rejected_package)
+        self.assertIsNone(rejected_artifact)
+        self.assertEqual(committed, second)
+        self.assertEqual(active_after_replace, second)
+        self.assertEqual(retained_first, first)
+
+    def test_filing_reads_are_scope_isolated_and_recheck_does_not_delete(self):
+        first = filing_package()
+        other = revised_filing_package(
+            sequence=2,
+            connection=build_connection(
+                tenant_id="tenant.other",
+                provider_connection_id="provider.tijori.other",
+            ),
+            issuer=build_issuer(
+                symbol="RELIANCE-EQ",
+                legal_name="Reliance Industries Limited",
+                isin="INE002A01018",
+                provider_company_id="999",
+                provider_slug="reliance-industries-limited",
+            ),
+        )
+        first_scope = FundamentalFilingRepositoryScope.from_package(first)
+        other_scope = FundamentalFilingRepositoryScope.from_package(other)
+        now = max(RECHECK_AFTER, other.manifest.committed_at) + timedelta(hours=1)
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            storage.commit_filing_package(
+                first,
+                expected_active_package_id=None,
+            )
+            storage.commit_filing_package(
+                other,
+                expected_active_package_id=None,
+            )
+            active = storage.get_active_filing_package(scope=first_scope)
+            other_active = storage.get_active_filing_package(scope=other_scope)
+            cross_scope = storage.get_filing_package(
+                first.package_id,
+                scope=other_scope,
+            )
+            cross_hash = storage.find_filing_artifacts_by_content_hash(
+                PDF_HASH,
+                scope=other_scope,
+            )
+
+        self.assertEqual(active, first)
+        self.assertTrue(active.manifest.is_recheck_due(as_of=now))
+        self.assertEqual(other_active, other)
+        self.assertIsNone(cross_scope)
+        self.assertEqual(cross_hash, ())
+
+    def test_filing_deletion_is_audited_and_preserves_filesystem_ownership(self):
+        package = filing_package()
+        artifact = package.artifacts[0]
+        scope = FundamentalFilingRepositoryScope.from_package(package)
+        now = package.manifest.committed_at + timedelta(hours=3)
+        artifact_authorization = authorization_for(artifact)
+        package_authorization = authorization_for(package).model_copy(
+            update={"audit_id": "audit.filing.delete.package.1"}
+        )
+
+        with DuckDBJarvisStorage(self.database, clock=lambda: now) as storage:
+            storage.commit_filing_package(
+                package,
+                expected_active_package_id=None,
+            )
+            rejected = storage.delete_filing_artifact(
+                artifact.artifact_id,
+                scope=scope,
+                authorization=artifact_authorization,
+            )
+            deleted_package = storage.delete_filing_package(
+                package.package_id,
+                scope=scope,
+                authorization=package_authorization,
+            )
+            deleted_artifact = storage.delete_filing_artifact(
+                artifact.artifact_id,
+                scope=scope,
+                authorization=artifact_authorization.model_copy(
+                    update={"audit_id": "audit.filing.delete.artifact.2"}
+                ),
+            )
+            repeated = storage.delete_filing_artifact(
+                artifact.artifact_id,
+                scope=scope,
+                authorization=artifact_authorization.model_copy(
+                    update={"audit_id": "audit.filing.delete.artifact.2"}
+                ),
+            )
+            counts = storage._connection.execute(
+                "SELECT "
+                "(SELECT count(*) FROM jarvis_fundamental_filing_artifacts), "
+                "(SELECT count(*) FROM jarvis_fundamental_filing_packages), "
+                "(SELECT count(*) FROM "
+                "jarvis_active_fundamental_filing_packages), "
+                "(SELECT count(*) FROM "
+                "jarvis_fundamental_filing_delete_receipts)"
+            ).fetchone()
+
+        self.assertEqual(
+            rejected.status,
+            FundamentalFilingDeleteStatus.REJECTED_ACTIVE_REFERENCE,
+        )
+        self.assertTrue(deleted_package.deleted)
+        self.assertTrue(deleted_artifact.deleted)
+        self.assertEqual(repeated, deleted_artifact)
+        self.assertEqual(counts, (0, 0, 0, 3))
 
     def test_normalizes_instrument_symbol_and_every_market_candle(self):
         series = _market_series()
@@ -330,6 +1394,32 @@ class DuckDBStorageTests(unittest.TestCase):
         self.assertEqual(loaded, saved)
         self.assertEqual(loaded.stored_at.utcoffset(), timedelta(hours=5.5))
 
+    def test_market_history_request_coverage_survives_reopen(self):
+        requested_from = datetime(
+            2016, 9, 7, 9, 15, tzinfo=ZoneInfo("Asia/Kolkata")
+        )
+        requested_to = datetime(
+            2026, 9, 10, 15, 30, tzinfo=ZoneInfo("Asia/Kolkata")
+        )
+        series = _market_series().model_copy(
+            update={
+                "history_requested_from": requested_from,
+                "history_requested_to": requested_to,
+            }
+        )
+        with self.storage() as storage:
+            saved = ResearchArchiveService(storage).archive_market_series(
+                series,
+                stored_at=self.stored_at,
+            )
+
+        with self.storage() as reopened:
+            loaded = reopened.get_market_series(saved.dataset_id)
+
+        self.assertEqual(loaded.series.history_requested_from, requested_from)
+        self.assertEqual(loaded.series.history_requested_to, requested_to)
+        self.assertEqual(loaded, saved)
+
     def test_backtest_and_market_aggregate_survive_restart(self):
         with self.storage() as storage:
             archive = ResearchArchiveService(storage)
@@ -349,6 +1439,57 @@ class DuckDBStorageTests(unittest.TestCase):
         self.assertEqual(len(backtest_summaries), 1)
         self.assertEqual(backtest_summaries[0].symbol, "RELIANCE-EQ")
         self.assertEqual(backtest_summaries[0].candle_count, 2)
+
+    def test_multi_timeframe_hierarchy_survives_duckdb_json_round_trip(self):
+        result = _multi_timeframe_use_case().execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+        )
+        expected_assessment = result.trade_plan_result.hierarchy_assessment
+        self.assertIsNotNone(expected_assessment)
+        self.assertEqual(
+            result.interpretation.hierarchy_assessment,
+            expected_assessment,
+        )
+
+        connection = duckdb.connect(str(self.database))
+        try:
+            connection.execute(
+                "CREATE TABLE hierarchy_round_trip ("
+                "operation_id VARCHAR PRIMARY KEY, payload_json VARCHAR NOT NULL"
+                ")"
+            )
+            connection.execute(
+                "INSERT INTO hierarchy_round_trip VALUES (?, ?)",
+                ["operation-1", result.model_dump_json()],
+            )
+        finally:
+            connection.close()
+
+        reopened = duckdb.connect(str(self.database), read_only=True)
+        try:
+            payload_json = reopened.execute(
+                "SELECT payload_json FROM hierarchy_round_trip "
+                "WHERE operation_id = ?",
+                ["operation-1"],
+            ).fetchone()[0]
+        finally:
+            reopened.close()
+
+        loaded = MultiTimeframeEndToEndSwingAnalysisResult.model_validate_json(
+            payload_json
+        )
+        self.assertEqual(loaded, result)
+        self.assertEqual(
+            loaded.trade_plan_result.hierarchy_assessment,
+            expected_assessment,
+        )
+        self.assertEqual(
+            loaded.interpretation.hierarchy_assessment,
+            expected_assessment,
+        )
 
     def test_run_and_archive_use_case_persists_to_duckdb(self):
         runner = WalkForwardBacktestEngine(
@@ -644,7 +1785,7 @@ class DuckDBStorageTests(unittest.TestCase):
             ).fetchone()[0]
             loaded = migrated.get_backtest_run("legacy-run")
 
-        self.assertEqual(version, "5")
+        self.assertEqual(version, "9")
         self.assertEqual(candle_count, 2)
         self.assertEqual(equity_count, 2)
         self.assertEqual(loaded.run_id, "legacy-run")

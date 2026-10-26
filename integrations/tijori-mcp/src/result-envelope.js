@@ -4,6 +4,12 @@ const APPROVED_TOOL_NAMES = Object.freeze([
   'get_company_overview',
   'get_financials',
   'get_shareholding',
+  'list_company_filings',
+  'download_company_filing',
+]);
+
+const APPROVED_RESULT_TOOL_NAMES = Object.freeze([
+  ...APPROVED_TOOL_NAMES,
 ]);
 
 const TOOL_STATUSES = Object.freeze([
@@ -16,7 +22,7 @@ const TOOL_STATUSES = Object.freeze([
   'unavailable',
 ]);
 
-const APPROVED_TOOLS = new Set(APPROVED_TOOL_NAMES);
+const APPROVED_TOOLS = new Set(APPROVED_RESULT_TOOL_NAMES);
 const APPROVED_STATUSES = new Set(TOOL_STATUSES);
 const FAILURE_STATUSES = new Set(
   TOOL_STATUSES.filter((status) => status !== 'success'),
@@ -27,11 +33,17 @@ const PROHIBITED_KEYS = new Set([
   'authorization',
   'cookie',
   'csrf',
+  'absolute_path',
+  'file_path',
+  'filesystem_path',
+  'local_path',
   'password',
   'passwd',
+  'safe_relative_path',
   'secret',
   'session',
   'set-cookie',
+  'staging_path',
   'token',
 ]);
 
@@ -45,6 +57,7 @@ const MAX_KEY_LENGTH = 160;
 const MAX_STRING_LENGTH = 10_000;
 
 export {
+  APPROVED_RESULT_TOOL_NAMES,
   APPROVED_TOOL_NAMES,
   MAX_JSON_NODES,
   MAX_PAYLOAD_BYTES,

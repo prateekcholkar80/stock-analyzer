@@ -10,6 +10,7 @@ from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
 from app.models.storage import (
     EndToEndSwingAnalysisResult,
     MultiTimeframeEndToEndSwingAnalysisResult,
+    MultiTimeframeResearchDivisionResult,
 )
 from app.models.technical import TechnicalModel
 
@@ -90,6 +91,9 @@ class JarvisSwingAnalysisResponse(TechnicalModel):
         | None
     ) = None
     failure: JarvisLLMFailureResponse | None = None
+    research_division_result: MultiTimeframeResearchDivisionResult | None = (
+        None
+    )
     multi_timeframe_review: MultiTimeframeEvidenceReview | None = None
     multi_timeframe_debate: AgenticDebateResult | None = None
 
@@ -129,7 +133,11 @@ class JarvisSwingAnalysisResponse(TechnicalModel):
                     "technical review chain"
                 )
         if self.status is JarvisCommandStatus.COMPLETED:
-            if self.result is None or self.failure is not None:
+            if (
+                self.result is None
+                or self.failure is not None
+                or self.research_division_result is not None
+            ):
                 raise ValueError(
                     "completed Jarvis response requires only a result"
                 )
@@ -140,7 +148,9 @@ class JarvisSwingAnalysisResponse(TechnicalModel):
             or has_debate
         ):
             raise ValueError(
-                "failed Jarvis response requires only an LLM failure"
+                "failed Jarvis response requires an LLM failure, may retain "
+                "a completed Research Division result, and cannot contain "
+                "debate or trade conclusions"
             )
         if (
             self.failure is not None
@@ -178,9 +188,13 @@ class JarvisSwingAnalysisResponse(TechnicalModel):
         *,
         operation_id: str,
         failure: JarvisLLMFailureResponse,
+        research_division_result: (
+            MultiTimeframeResearchDivisionResult | None
+        ) = None,
     ) -> "JarvisSwingAnalysisResponse":
         return cls(
             operation_id=operation_id,
             status=JarvisCommandStatus.LLM_FAILURE,
             failure=failure,
+            research_division_result=research_division_result,
         )

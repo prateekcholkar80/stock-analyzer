@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from app.audit.prompt_audit import NullPromptAuditSink, PromptAuditSink
 from app.agents.bear_agent import BearDebateAgent
@@ -12,6 +13,7 @@ from app.llm.factory import GatewayBuilder, LLMGatewayFactory
 from app.llm.gateway import StructuredLLMGateway
 from app.llm.preflight import LLMPreflightValidator
 from app.models.llm import LLMPreflightResult
+from app.models.runtime_skill import RuntimeAgentRole
 from app.orchestration.agent_orchestrator import AgentOrchestrator
 from app.orchestration.debate_orchestrator import (
     DebateArchive,
@@ -25,9 +27,15 @@ from app.use_cases.run_end_to_end_swing_analysis import (
 from app.use_cases.run_end_to_end_multi_timeframe_swing_analysis import (
     RunEndToEndMultiTimeframeSwingAnalysis,
 )
+from app.runtime_skill_loader import RuntimeSkillLoader
 
 
 PreflightBuilder = Callable[[LLMGatewayFactory], LLMPreflightValidator]
+_RUNTIME_SKILL_MANIFEST = (
+    Path(__file__).resolve().parents[2]
+    / "runtime-skills"
+    / "manifest.yaml"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +56,7 @@ def compose_full_debate(
     gateway_builder: GatewayBuilder | None = None,
     preflight_builder: PreflightBuilder = LLMPreflightValidator,
     prompt_audit_sink: PromptAuditSink | None = None,
+    runtime_skill_loader: RuntimeSkillLoader | None = None,
 ) -> FullDebateComposition:
     """Build the complete provider-neutral panel after local preflight."""
     resolved_settings = settings or get_llm_settings()
@@ -55,6 +64,16 @@ def compose_full_debate(
         raise ValueError("full debate requires validated LLM settings")
     if not callable(preflight_builder):
         raise ValueError("full debate preflight builder must be callable")
+    resolved_runtime_skill_loader = (
+        RuntimeSkillLoader(_RUNTIME_SKILL_MANIFEST)
+        if runtime_skill_loader is None
+        else runtime_skill_loader
+    )
+    if not isinstance(resolved_runtime_skill_loader, RuntimeSkillLoader):
+        raise ValueError(
+            "full debate runtime-skill loader must be validated"
+        )
+    runtime_skills = resolved_runtime_skill_loader.load()
 
     gateway_factory = (
         LLMGatewayFactory(resolved_settings)
@@ -100,21 +119,24 @@ def compose_full_debate(
             gateway_factory,
             LLMRole.BULL,
             prompt_audit_sink,
-        )
+        ),
+        runtime_skill=runtime_skills.skill_for(RuntimeAgentRole.BULL),
     )
     bear_agent = BearDebateAgent(
         _gateway_for_agent(
             gateway_factory,
             LLMRole.BEAR,
             prompt_audit_sink,
-        )
+        ),
+        runtime_skill=runtime_skills.skill_for(RuntimeAgentRole.BEAR),
     )
     judge_agent = DebateJudgeAgent(
         _gateway_for_agent(
             gateway_factory,
             LLMRole.JUDGE,
             prompt_audit_sink,
-        )
+        ),
+        runtime_skill=runtime_skills.skill_for(RuntimeAgentRole.JUDGE),
     )
     orchestrator = DebateOrchestrator(
         bull_agent=bull_agent,

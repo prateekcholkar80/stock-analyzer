@@ -12,6 +12,7 @@ from app.llm.config import DEBATE_LLM_ROLES, LLMRole, LLMSettings
 from app.llm.audited_gateway import PromptAuditedLLMGateway
 from app.llm.preflight import LLMPreflightValidator
 from app.models.llm import LLMPreflightResult, LLMRolePreflight
+from app.models.runtime_skill import RuntimeAgentRole
 from app.use_cases.run_end_to_end_swing_analysis import (
     RunEndToEndSwingAnalysis,
 )
@@ -117,14 +118,35 @@ class FullDebateCompositionTests(unittest.TestCase):
             composition.orchestrator.bull_agent._gateway,
             builder.gateways[LLMRole.BULL],
         )
+        bull_skill = composition.orchestrator.bull_agent.runtime_skill
+        self.assertIsNotNone(bull_skill)
+        self.assertIs(
+            bull_skill.contract.agent_role,
+            RuntimeAgentRole.BULL,
+        )
+        self.assertEqual(len(bull_skill.prompt_content_sha256), 64)
         self.assertIs(
             composition.orchestrator.bear_agent._gateway,
             builder.gateways[LLMRole.BEAR],
         )
+        bear_skill = composition.orchestrator.bear_agent.runtime_skill
+        self.assertIsNotNone(bear_skill)
+        self.assertIs(
+            bear_skill.contract.agent_role,
+            RuntimeAgentRole.BEAR,
+        )
+        self.assertEqual(len(bear_skill.prompt_content_sha256), 64)
         self.assertIs(
             composition.orchestrator.judge_agent._gateway,
             builder.gateways[LLMRole.JUDGE],
         )
+        judge_skill = composition.orchestrator.judge_agent.runtime_skill
+        self.assertIsNotNone(judge_skill)
+        self.assertIs(
+            judge_skill.contract.agent_role,
+            RuntimeAgentRole.JUDGE,
+        )
+        self.assertEqual(len(judge_skill.prompt_content_sha256), 64)
         self.assertEqual(
             composition.orchestrator.judge_agent._gateway.settings.model,
             "provider/judge-model",
@@ -231,6 +253,13 @@ class FullDebateCompositionTests(unittest.TestCase):
                     {"JARVIS_LLM_MODEL": "provider/model"}
                 ),
                 preflight_builder=None,
+            )
+        with self.assertRaisesRegex(ValueError, "runtime-skill loader"):
+            compose_full_debate(
+                settings=LLMSettings.from_environment(
+                    {"JARVIS_LLM_MODEL": "provider/model"}
+                ),
+                runtime_skill_loader=object(),
             )
 
     def test_rejects_invalid_preflight_result_provider(self):

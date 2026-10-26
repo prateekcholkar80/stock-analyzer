@@ -10,7 +10,9 @@ from app.agents.trade_planning_agent import (
     TradePlanningAgent,
     TradePlanningAgentConfig,
 )
-from app.analytics.cpr_policy import evaluate_cpr_trade_policy
+from app.analytics.evidence_hierarchy import (
+    build_multi_timeframe_technical_findings,
+)
 from app.commands.swing_analysis import JarvisSwingAnalysisCommandHandler
 from app.models.interaction import SwingAnalysisCommand
 from app.models.market import Candle, HistoricalCandleSeries, MarketQuote
@@ -19,6 +21,11 @@ from app.models.multi_timeframe_trade import (
     MultiTimeframeTradeReason,
 )
 from app.models.trade_setup import TradeDirection
+from app.models.evidence_hierarchy import (
+    EvidenceCorrelationGroup,
+    EvidenceFamily,
+    EvidenceFamilyState,
+)
 from app.models.trade_decision import (
     MarketCondition,
     NoTradeReason,
@@ -27,6 +34,7 @@ from app.models.trade_decision import (
 from app.models.workflow import WorkflowEventState
 from app.models.storage import (
     MultiTimeframeEndToEndSwingAnalysisResult,
+    MultiTimeframeResearchDivisionResult,
     RollingFetchReceipt,
     StoredMarketSeries,
     payload_fingerprint,
@@ -166,6 +174,16 @@ def _use_case(*, timeframes=None, winner="bullish"):
     )
 
 
+def _build_trade_plan_directly(*, timeframes=None, winner="bullish"):
+    workflow = _use_case(timeframes=timeframes, winner=winner)
+    resolved_timeframes = timeframes or _cyclical_timeframes()
+    review = workflow.agent_orchestrator.run_multi_timeframe_analysis(
+        resolved_timeframes
+    )
+    debate = workflow.debate_orchestrator.run_multi_timeframe_debate(review)
+    return workflow.trade_plan_builder.execute(review, debate)
+
+
 def _trending_timeframes():
     ist = ZoneInfo("Asia/Kolkata")
     day = datetime(2024, 1, 1, tzinfo=ist)
@@ -212,6 +230,108 @@ def _trending_timeframes():
 
 
 class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
+    def test_trade_plan_carries_hierarchy_on_early_no_trade_path(self):
+        outcome = _build_trade_plan_directly(winner="bearish")
+
+        assessment = outcome.hierarchy_assessment
+        self.assertIsNotNone(assessment)
+        self.assertIs(
+            assessment.primary_condition,
+            outcome.trade_decision.market_condition,
+        )
+        self.assertFalse(assessment.release_eligible)
+        self.assertIn(
+            EvidenceFamily.ENTRY_TRIGGER,
+            assessment.blocking_families,
+        )
+        self.assertIn(
+            EvidenceFamily.RISK_TARGET_FEASIBILITY,
+            assessment.blocking_families,
+        )
+
+    def test_trade_plan_marks_fundamentals_out_of_technical_scope(self):
+        outcome = _build_trade_plan_directly(winner="bearish")
+        assessment = outcome.hierarchy_assessment
+        fundamental = next(
+            finding
+            for finding in assessment.gate_states
+            if finding.family is EvidenceFamily.FUNDAMENTAL_HEALTH
+        )
+
+        self.assertIs(
+            fundamental.state,
+            EvidenceFamilyState.NOT_APPLICABLE,
+        )
+        self.assertEqual(
+            assessment.not_applicable_families,
+            (EvidenceFamily.FUNDAMENTAL_HEALTH,),
+        )
+
+    def test_cpr_is_retained_as_non_blocking_correlated_support(self):
+        outcome = _build_trade_plan_directly(winner="bearish")
+        assessment = outcome.hierarchy_assessment
+        ohlc_group = next(
+            group
+            for group in assessment.supporting_groups
+            if group.correlation_group
+            is EvidenceCorrelationGroup.OHLC_DERIVED_CONFIRMATION
+        )
+
+        self.assertIn(EvidenceFamily.CPR_CONTEXT, ohlc_group.families)
+        self.assertNotIn(
+            EvidenceFamily.CPR_CONTEXT,
+            assessment.blocking_families,
+        )
+
+    def test_completed_entry_and_two_r_gates_attach_eligible_assessment(self):
+        timeframes = _trending_timeframes()
+        workflow = _use_case(timeframes=timeframes)
+        review = workflow.agent_orchestrator.run_multi_timeframe_analysis(
+            timeframes
+        )
+        debate = workflow.debate_orchestrator.run_multi_timeframe_debate(
+            review
+        )
+        findings = build_multi_timeframe_technical_findings(
+            review.evidence_package
+        )
+        forced_bullish_primary = tuple(
+            finding.model_copy(update={"state": EvidenceFamilyState.BULLISH})
+            if finding.family is EvidenceFamily.MARKET_STRUCTURE
+            else finding
+            for finding in findings
+        )
+
+        with patch(
+            "app.use_cases.build_multi_timeframe_long_trade_plan."
+            "build_multi_timeframe_technical_findings",
+            return_value=forced_bullish_primary,
+        ):
+            outcome = workflow.trade_plan_builder.execute(review, debate)
+
+        assessment = outcome.hierarchy_assessment
+        gate_states = {
+            finding.family: finding.state
+            for finding in assessment.gate_states
+        }
+        self.assertIs(
+            outcome.disposition,
+            MultiTimeframeTradeDisposition.ACTIONABLE,
+        )
+        self.assertTrue(assessment.release_eligible)
+        self.assertIs(
+            gate_states[EvidenceFamily.ENTRY_TRIGGER],
+            EvidenceFamilyState.PASS,
+        )
+        self.assertIs(
+            gate_states[EvidenceFamily.RISK_TARGET_FEASIBILITY],
+            EvidenceFamilyState.PASS,
+        )
+        self.assertIs(
+            assessment.primary_condition,
+            outcome.trade_decision.market_condition,
+        )
+
     def test_runs_real_multi_timeframe_pipeline_and_returns_context(self):
         use_case = _use_case()
 
@@ -237,6 +357,69 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
         self.assertEqual(
             result.technical_review.evidence_package.weekly.interval,
             "ONE_WEEK",
+        )
+
+    def test_research_division_result_is_immutable_and_debate_independent(self):
+        completed = _use_case().execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+        )
+
+        research = MultiTimeframeResearchDivisionResult(
+            use_case_id="jarvis.research_division.v1",
+            market_dataset_id=completed.market_dataset_id,
+            fetch=completed.fetch,
+            latest_quote=completed.latest_quote,
+            technical_review=completed.technical_review,
+        )
+
+        self.assertTrue(research.technical_review.decision.accepted)
+        self.assertFalse(hasattr(research, "debate_result"))
+        self.assertFalse(hasattr(research, "trade_plan_result"))
+        with self.assertRaisesRegex(ValueError, "frozen"):
+            research.market_dataset_id = "market:rewritten"
+        with self.assertRaisesRegex(ValueError, "fetched dataset"):
+            MultiTimeframeResearchDivisionResult(
+                use_case_id="jarvis.research_division.v1",
+                market_dataset_id="market:wrong",
+                fetch=completed.fetch,
+                latest_quote=completed.latest_quote,
+                technical_review=completed.technical_review,
+            )
+
+    def test_prepares_research_before_starting_the_debate(self):
+        use_case = _use_case()
+        sink = InMemoryWorkflowEventSink()
+        emitter = WorkflowEventEmitter("research-operation", sink)
+
+        research = use_case.prepare_research_division(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
+            event_emitter=emitter,
+        )
+
+        self.assertIsInstance(research, MultiTimeframeResearchDivisionResult)
+        self.assertTrue(research.technical_review.decision.accepted)
+        self.assertNotIn(
+            "debate.bull.argue",
+            [event.activity.activity_id for event in sink.events],
+        )
+
+        completed = use_case.complete_research_division(
+            research,
+            event_emitter=emitter,
+        )
+        self.assertIsInstance(
+            completed,
+            MultiTimeframeEndToEndSwingAnalysisResult,
+        )
+        self.assertIn(
+            "debate.bull.argue",
+            [event.activity.activity_id for event in sink.events],
         )
 
     def test_emits_truthful_ui_activities_for_the_complete_pipeline(self):
@@ -304,12 +487,29 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
         )
 
     def test_builds_actionable_long_plan_with_exact_two_r_target(self):
-        result = _use_case(timeframes=_trending_timeframes()).execute(
-            "NSE",
-            "2885",
-            "RELIANCE-EQ",
-            "ONE_HOUR",
+        timeframes = _trending_timeframes()
+        review = AgentOrchestrator().run_multi_timeframe_analysis(timeframes)
+        findings = build_multi_timeframe_technical_findings(
+            review.evidence_package
         )
+        forced_bullish_primary = tuple(
+            finding.model_copy(update={"state": EvidenceFamilyState.BULLISH})
+            if finding.family is EvidenceFamily.MARKET_STRUCTURE
+            else finding
+            for finding in findings
+        )
+
+        with patch(
+            "app.use_cases.build_multi_timeframe_long_trade_plan."
+            "build_multi_timeframe_technical_findings",
+            return_value=forced_bullish_primary,
+        ):
+            result = _use_case(timeframes=timeframes).execute(
+                "NSE",
+                "2885",
+                "RELIANCE-EQ",
+                "ONE_HOUR",
+            )
 
         outcome = result.trade_plan_result
         plan = outcome.daily_planning_result.approved_trade_intent
@@ -330,9 +530,18 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
             MarketCondition.BULLISH,
         )
         self.assertIs(outcome.trade_decision.decision, TradeDecision.BUY)
-        self.assertIn("CPR policy", outcome.rationale)
-        self.assertIn("daily acceptance=True", outcome.rationale)
-        self.assertIn("daily narrow expansion=bullish", outcome.rationale)
+        self.assertEqual(
+            result.interpretation.hierarchy_assessment,
+            outcome.hierarchy_assessment,
+        )
+        self.assertIn(
+            "hierarchical primary context is bullish",
+            outcome.rationale,
+        )
+        self.assertIn(
+            "risk_target_feasibility=pass",
+            outcome.rationale,
+        )
         self.assertIs(plan.evaluation.direction, TradeDirection.LONG)
         self.assertEqual(plan.evaluation.minimum_reward_to_risk, 2.0)
         self.assertAlmostEqual(
@@ -371,44 +580,24 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
         )
         self.assertIsNone(outcome.daily_planning_result)
 
-    def test_cpr_policy_blocker_stops_trade_before_daily_planning(self):
+    def test_cpr_context_remains_non_blocking_in_end_to_end_result(self):
         timeframes = _trending_timeframes()
-        review = AgentOrchestrator().run_multi_timeframe_analysis(timeframes)
-        assessment = evaluate_cpr_trade_policy(
-            review.evidence_package.daily.cpr,
-            review.evidence_package.weekly.cpr,
-        ).model_copy(
-            update={
-                "buy_eligible": False,
-                "blocking_reasons": (
-                    NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE,
-                ),
-                "rationale": "CPR policy test blocker.",
-            }
+        result = _use_case(timeframes=timeframes).execute(
+            "NSE",
+            "2885",
+            "RELIANCE-EQ",
+            "ONE_HOUR",
         )
 
-        with patch(
-            "app.use_cases.build_multi_timeframe_long_trade_plan."
-            "evaluate_cpr_trade_policy",
-            return_value=assessment,
-        ):
-            result = _use_case(timeframes=timeframes).execute(
-                "NSE",
-                "2885",
-                "RELIANCE-EQ",
-                "ONE_HOUR",
-            )
-
-        outcome = result.trade_plan_result
-        self.assertIs(
-            outcome.disposition,
-            MultiTimeframeTradeDisposition.NO_TRADE,
+        assessment = result.trade_plan_result.hierarchy_assessment
+        self.assertNotIn(
+            EvidenceFamily.CPR_CONTEXT,
+            assessment.blocking_families,
         )
         self.assertEqual(
-            outcome.trade_decision.no_trade_reasons,
-            (NoTradeReason.CPR_ACCEPTANCE_INCOMPLETE,),
+            result.interpretation.hierarchy_assessment,
+            assessment,
         )
-        self.assertIsNone(outcome.daily_planning_result)
 
     def test_neutral_judge_produces_explicit_no_trade_decision(self):
         result = _use_case(winner="neutral").execute(
@@ -453,7 +642,7 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             ValueError,
-            "market condition must match the deterministic daily/weekly profiles",
+            "hierarchy primary condition must match the trade decision",
         ):
             MultiTimeframeEndToEndSwingAnalysisResult(
                 use_case_id=result.use_case_id,
@@ -464,6 +653,29 @@ class RunEndToEndMultiTimeframeSwingAnalysisTests(unittest.TestCase):
                 debate_result=result.debate_result,
                 trade_plan_result=tampered_trade,
                 interpretation=result.interpretation,
+            )
+
+        altered_assessment = (
+            result.interpretation.hierarchy_assessment.model_copy(
+                update={"rationale": "Altered hierarchy rationale."}
+            )
+        )
+        altered_interpretation = result.interpretation.model_copy(
+            update={"hierarchy_assessment": altered_assessment}
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "must preserve the trade-plan hierarchy assessment",
+        ):
+            MultiTimeframeEndToEndSwingAnalysisResult(
+                use_case_id=result.use_case_id,
+                market_dataset_id=result.market_dataset_id,
+                fetch=result.fetch,
+                latest_quote=result.latest_quote,
+                technical_review=result.technical_review,
+                debate_result=result.debate_result,
+                trade_plan_result=result.trade_plan_result,
+                interpretation=altered_interpretation,
             )
 
         non_two_r_agent = TradePlanningAgent(

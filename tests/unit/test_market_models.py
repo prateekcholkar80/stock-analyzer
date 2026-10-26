@@ -195,11 +195,17 @@ class HistoricalCandleSeriesModelTests(unittest.TestCase):
             interval="ONE_DAY",
             candles=[candle],
             retrieved_at="2026-08-17T15:31:00+05:30",
+            history_requested_from="2016-08-14T09:15:00+05:30",
+            history_requested_to="2026-08-17T15:30:00+05:30",
         )
 
         self.assertEqual(len(series.candles), 1)
         self.assertEqual(series.candles[0], candle)
         self.assertEqual(series.source, "angel_one")
+        self.assertEqual(
+            series.history_requested_from.utcoffset(),
+            timedelta(hours=5, minutes=30),
+        )
 
     def test_rejects_series_without_retrieval_timezone(self):
         with self.assertRaises(ValidationError):
@@ -222,6 +228,33 @@ class HistoricalCandleSeriesModelTests(unittest.TestCase):
                 candles=[],
                 retrieved_at="2026-08-17T15:31:00+05:30",
             )
+
+    def test_rejects_partial_or_reversed_history_coverage(self):
+        invalid_ranges = (
+            {
+                "history_requested_from": "2016-08-17T09:15:00+05:30",
+            },
+            {
+                "history_requested_from": "2026-08-18T09:15:00+05:30",
+                "history_requested_to": "2026-08-17T15:30:00+05:30",
+            },
+            {
+                "history_requested_from": "2016-08-17T09:15:00",
+                "history_requested_to": "2026-08-17T15:30:00+05:30",
+            },
+        )
+        for requested_range in invalid_ranges:
+            with self.subTest(requested_range=requested_range):
+                with self.assertRaises(ValidationError):
+                    HistoricalCandleSeries(
+                        exchange="NSE",
+                        symbol_token="2885",
+                        symbol="RELIANCE-EQ",
+                        interval="ONE_HOUR",
+                        candles=[],
+                        retrieved_at="2026-08-17T15:31:00+05:30",
+                        **requested_range,
+                    )
 
 
 if __name__ == "__main__":

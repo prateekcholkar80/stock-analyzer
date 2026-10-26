@@ -25,6 +25,8 @@ class FundamentalRefreshIntentInterpreterTests(unittest.TestCase):
             "I need refresh on fundamentals",
             "I need a refresh of the fundamentals",
             "Please refresh the fundamentals",
+            "Refresh all fundamentals",
+            "Refresh all the fundamentals",
             "Refresh fundamentals data",
             "Update fundamental data",
             "Please update the fundamentals",
@@ -51,6 +53,10 @@ class FundamentalRefreshIntentInterpreterTests(unittest.TestCase):
             ),
             (
                 "Analyze Torrent Pharma for me and update fundamental data",
+                "Analyze Torrent Pharma for me",
+            ),
+            (
+                "Analyze Torrent Pharma for me and refresh all fundamentals",
                 "Analyze Torrent Pharma for me",
             ),
         )

@@ -19,8 +19,10 @@ from app.models.debate import (
     JudgeFollowUpAnswer,
 )
 from app.models.multi_timeframe_evidence import MultiTimeframeEvidenceReview
+from app.models.runtime_skill import DEFAULT_RUNTIME_SKILLS, RuntimeAgentRole
 from app.models.signals import SignalDirection, SwingTradingSignalProfile
 from app.models.technical import TechnicalModel
+from app.runtime_skill_loader import LoadedRuntimeSkill
 
 
 _ROLE = (
@@ -126,6 +128,7 @@ class DebateJudgeAgent:
         self,
         gateway: StructuredLLMGateway,
         config: DebateJudgeAgentConfig | None = None,
+        runtime_skill: LoadedRuntimeSkill | None = None,
     ) -> None:
         if not isinstance(gateway, StructuredLLMGateway):
             raise ValueError(
@@ -139,14 +142,46 @@ class DebateJudgeAgent:
                 "debate judge agent config must be a validated "
                 "configuration"
             )
+        if runtime_skill is not None and not isinstance(
+            runtime_skill,
+            LoadedRuntimeSkill,
+        ):
+            raise ValueError(
+                "debate judge agent runtime skill must be verified"
+            )
+        expected_skill = DEFAULT_RUNTIME_SKILLS.skill_for(
+            RuntimeAgentRole.JUDGE
+        )
+        if (
+            runtime_skill is not None
+            and runtime_skill.contract != expected_skill
+        ):
+            raise ValueError(
+                "debate judge agent requires the Judge runtime skill"
+            )
         self.config = config or DebateJudgeAgentConfig()
         self._gateway = gateway
+        self.runtime_skill = runtime_skill
 
     @property
     def configuration_fingerprint(self) -> str:
+        skill_identity = (
+            "embedded-legacy-judge-prompt"
+            if self.runtime_skill is None
+            else ":".join(
+                (
+                    self.runtime_skill.contract.skill_id,
+                    self.runtime_skill.contract.version,
+                    self.runtime_skill.skill_content_sha256,
+                    self.runtime_skill.shared_policy_content_sha256,
+                    self.runtime_skill.prompt_content_sha256,
+                )
+            )
+        )
         serialized = (
             f"{self.config.model_dump_json()}:"
-            f"{self._gateway.configuration_fingerprint}"
+            f"{self._gateway.configuration_fingerprint}:"
+            f"{skill_identity}"
         )
         return sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -222,7 +257,11 @@ class DebateJudgeAgent:
         )
         generation = generate_grounded(
             gateway=self._gateway,
-            system=_MULTI_TIMEFRAME_SYSTEM_PROMPT,
+            system=(
+                _MULTI_TIMEFRAME_SYSTEM_PROMPT
+                if self.runtime_skill is None
+                else self.runtime_skill.system_instructions
+            ),
             context=context,
             draft_model=_VerdictDraft,
             valid_ids=valid_multi_timeframe_evidence_ids(package),

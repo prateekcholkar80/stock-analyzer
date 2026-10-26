@@ -2,12 +2,27 @@ import unittest
 
 from pydantic import ValidationError
 
+from app.models.evidence_hierarchy import HierarchicalEvidenceAssessment
 from app.models.trade_decision import (
     MarketCondition,
     NoTradeReason,
     TradeDecision,
     TradeDecisionOutcome,
 )
+
+
+def _hierarchy_assessment(
+    condition: MarketCondition,
+    *,
+    release_eligible: bool,
+) -> HierarchicalEvidenceAssessment:
+    return HierarchicalEvidenceAssessment(
+        primary_condition=condition,
+        gate_states=(),
+        blocking_families=(),
+        release_eligible=release_eligible,
+        rationale="Deterministic hierarchy assessment for contract testing.",
+    )
 from app.models.multi_timeframe_trade import (
     MultiTimeframeLongTradePlanResult,
     MultiTimeframeTradeDisposition,
@@ -181,6 +196,102 @@ class TradeDecisionOutcomeTests(unittest.TestCase):
         )
 
         self.assertIsNone(plan.trade_decision)
+        self.assertIsNone(plan.hierarchy_assessment)
+
+    def test_version_two_trade_plan_requires_hierarchy_assessment(self):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "version-2 trade plan requires a hierarchy assessment",
+        ):
+            MultiTimeframeLongTradePlanResult(
+                schema_version="jarvis.multi_timeframe_trade_plan.v2",
+                policy_id="jarvis.buy_eligibility_2r_swing_policy.v2",
+                technical_package_fingerprint="a" * 64,
+                technical_decision_id="technical-decision",
+                debate_verdict_id="debate-verdict",
+                disposition=MultiTimeframeTradeDisposition.NO_TRADE,
+                reason=MultiTimeframeTradeReason.JUDGE_NOT_BULLISH,
+                trade_decision=TradeDecisionOutcome(
+                    market_condition=MarketCondition.BULLISH,
+                    decision=TradeDecision.NO_TRADE,
+                    no_trade_reasons=(
+                        NoTradeReason.JUDGE_REJECTED_BULLISH_CASE,
+                    ),
+                    rationale="The Judge rejected the bullish case.",
+                ),
+                rationale="The Judge rejected the bullish case.",
+            )
+
+    def test_version_two_preserves_exact_hierarchy_assessment(self):
+        assessment = _hierarchy_assessment(
+            MarketCondition.BULLISH,
+            release_eligible=True,
+        )
+        plan = MultiTimeframeLongTradePlanResult(
+            schema_version="jarvis.multi_timeframe_trade_plan.v2",
+            policy_id="jarvis.buy_eligibility_2r_swing_policy.v2",
+            technical_package_fingerprint="a" * 64,
+            technical_decision_id="technical-decision",
+            debate_verdict_id="debate-verdict",
+            disposition=MultiTimeframeTradeDisposition.NO_TRADE,
+            reason=MultiTimeframeTradeReason.JUDGE_NOT_BULLISH,
+            trade_decision=TradeDecisionOutcome(
+                market_condition=MarketCondition.BULLISH,
+                decision=TradeDecision.NO_TRADE,
+                no_trade_reasons=(
+                    NoTradeReason.JUDGE_REJECTED_BULLISH_CASE,
+                ),
+                rationale="The Judge rejected the bullish case.",
+            ),
+            hierarchy_assessment=assessment,
+            rationale="The Judge rejected the bullish case.",
+        )
+
+        self.assertIs(plan.hierarchy_assessment, assessment)
+
+    def test_version_two_rejects_hierarchy_condition_mismatch(self):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "hierarchy primary condition must match",
+        ):
+            MultiTimeframeLongTradePlanResult(
+                schema_version="jarvis.multi_timeframe_trade_plan.v2",
+                policy_id="jarvis.buy_eligibility_2r_swing_policy.v2",
+                technical_package_fingerprint="a" * 64,
+                technical_decision_id="technical-decision",
+                debate_verdict_id="debate-verdict",
+                disposition=MultiTimeframeTradeDisposition.NO_TRADE,
+                reason=MultiTimeframeTradeReason.TIMEFRAME_SETUP_NOT_ALIGNED,
+                trade_decision=TradeDecisionOutcome(
+                    market_condition=MarketCondition.BEARISH,
+                    decision=TradeDecision.NO_TRADE,
+                    no_trade_reasons=(NoTradeReason.BEARISH_CONDITION,),
+                    rationale="The primary context is bearish.",
+                ),
+                hierarchy_assessment=_hierarchy_assessment(
+                    MarketCondition.NEUTRAL,
+                    release_eligible=False,
+                ),
+                rationale="The hierarchy and decision conflict.",
+            )
+
+    def test_legacy_plan_rejects_hierarchy_assessment(self):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "legacy trade plan cannot contain a hierarchy assessment",
+        ):
+            MultiTimeframeLongTradePlanResult(
+                technical_package_fingerprint="a" * 64,
+                technical_decision_id="technical-decision",
+                debate_verdict_id="debate-verdict",
+                disposition=MultiTimeframeTradeDisposition.NO_TRADE,
+                reason=MultiTimeframeTradeReason.JUDGE_NOT_BULLISH,
+                hierarchy_assessment=_hierarchy_assessment(
+                    MarketCondition.BULLISH,
+                    release_eligible=True,
+                ),
+                rationale="Legacy stored no-trade result.",
+            )
 
     def test_no_trade_plan_rejects_buy_decision_contract(self):
         with self.assertRaisesRegex(

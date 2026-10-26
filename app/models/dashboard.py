@@ -3,6 +3,7 @@ from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
+from app.models.evidence_hierarchy import HierarchicalEvidenceAssessment
 from app.models.multi_timeframe_evidence import SwingAnalysisTimeframe
 from app.models.presentation import (
     JarvisMultiTimeframeResearchExplanation,
@@ -585,6 +586,31 @@ class DashboardActivity(TechnicalModel):
     round_number: int | None = Field(default=None, ge=1)
 
 
+class JarvisTechnicalResearchDashboardView(TechnicalModel):
+    """Completed technical evidence that has no downstream trade conclusion."""
+
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    schema_version: Literal["jarvis.technical_research_dashboard.v1"] = (
+        "jarvis.technical_research_dashboard.v1"
+    )
+    operation_id: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    completed_at: datetime
+    conclusion_available: Literal[False] = False
+    exchange: str = Field(min_length=1)
+    symbol_token: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+    source_interval: Literal["ONE_HOUR"] = "ONE_HOUR"
+    source_retrieved_at: datetime
+    latest_quote: DashboardQuote | None = None
+    refresh: DashboardRefreshProvenance
+    package_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    daily: DashboardTimeframePanel
+    weekly: DashboardTimeframePanel
+    activities: tuple[DashboardActivity, ...] = ()
+
+
 class JarvisDashboardView(TechnicalModel):
     """Stable, evidence-preserving read model for the Jarvis browser UI."""
 
@@ -606,6 +632,7 @@ class JarvisDashboardView(TechnicalModel):
     weekly: DashboardTimeframePanel
     debate: DashboardDebatePanel
     trade_plan: DashboardTradePlan
+    hierarchy_assessment: HierarchicalEvidenceAssessment | None = None
     interpretation: DashboardMultiTimeframeInterpretation | None = None
     activities: tuple[DashboardActivity, ...] = ()
     presentation: (
