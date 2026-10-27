@@ -215,6 +215,8 @@ class FundamentalFilingEvidenceCoordinator:
         evidence_repository: FundamentalFilingEvidenceRepository,
         extractor: FundamentalFilingEvidenceExtractor,
         validator: FundamentalFilingEvidenceValidator,
+        artifact_verifier: Callable[[FundamentalFilingArtifactManifest], bool] | None = None,
+        artifact_reconciler: Callable[[FundamentalFilingArtifactManifest], FundamentalFilingArtifactManifest] | None = None,
         clock: FundamentalFilingEvidenceClock | None = None,
     ) -> None:
         if not isinstance(gateway, FundamentalFilingGateway):
@@ -232,11 +234,17 @@ class FundamentalFilingEvidenceCoordinator:
             raise TypeError("filing coordinator requires an evidence validator")
         if clock is not None and not callable(clock):
             raise TypeError("filing coordinator clock must be callable")
+        if artifact_verifier is not None and not callable(artifact_verifier):
+            raise TypeError("filing artifact verifier must be callable")
+        if artifact_reconciler is not None and not callable(artifact_reconciler):
+            raise TypeError("filing artifact reconciler must be callable")
         self._gateway = gateway
         self._filing_repository = filing_repository
         self._evidence_repository = evidence_repository
         self._extractor = extractor
         self._validator = validator
+        self._artifact_verifier = artifact_verifier
+        self._artifact_reconciler = artifact_reconciler
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = RLock()
 
@@ -297,6 +305,10 @@ class FundamentalFilingEvidenceCoordinator:
             and not refresh_requested
             and not active_before.manifest.is_recheck_due(as_of=started_at)
             and self._cache_covers_request(active_before, request)
+            and (
+                self._artifact_verifier is None
+                or all(self._artifact_verifier(item) for item in active_before.artifacts)
+            )
         ):
             try:
                 records = self._released_records(
@@ -406,6 +418,7 @@ class FundamentalFilingEvidenceCoordinator:
             )
         artifacts: list[FundamentalFilingArtifactManifest] = []
         records: list[StoredFundamentalFilingEvidence] = []
+        failures: list[FundamentalFilingEvidenceCoordinationResult] = []
         for index, reference in enumerate(
             sorted(
                 discovery.references,
@@ -419,6 +432,7 @@ class FundamentalFilingEvidenceCoordinator:
                     requested_at=request.requested_at,
                     as_of=self._now(),
                 )
+                newly_acquired = artifact is None
                 result_completed_at = self._now()
                 if artifact is None:
                     acquisition_request = FundamentalFilingAcquisitionRequest(
@@ -448,7 +462,7 @@ class FundamentalFilingEvidenceCoordinator:
                     )
                     if result.status is not FundamentalRetrievalStatus.COMPLETED:
                         category, retryable = self._retrieval_failure(result.status)
-                        return self._failed(
+                        failures.append(self._failed(
                             request=request,
                             scope=scope,
                             refresh_requested=refresh_requested,
@@ -462,7 +476,8 @@ class FundamentalFilingEvidenceCoordinator:
                                 "The provider could not acquire a required filing."
                             ),
                             filing_reference_id=reference.filing_reference_id,
-                        )
+                        ))
+                        continue
                     artifact = result.artifact
                     if artifact is None:
                         raise ValueError(
@@ -470,7 +485,7 @@ class FundamentalFilingEvidenceCoordinator:
                         )
                     result_completed_at = result.completed_at
             except FundamentalGatewayError as exc:
-                return self._provider_exception_failure(
+                failures.append(self._provider_exception_failure(
                     request=request,
                     scope=scope,
                     refresh_requested=refresh_requested,
@@ -479,9 +494,10 @@ class FundamentalFilingEvidenceCoordinator:
                     stage=FundamentalFilingFailureStage.DOWNLOAD,
                     exception=exc,
                     filing_reference_id=reference.filing_reference_id,
-                )
+                ))
+                continue
             except StorageError:
-                return self._failed(
+                failures.append(self._failed(
                     request=request,
                     scope=scope,
                     refresh_requested=refresh_requested,
@@ -493,9 +509,10 @@ class FundamentalFilingEvidenceCoordinator:
                     retryable=True,
                     message="Stored filing versions could not be read safely.",
                     filing_reference_id=reference.filing_reference_id,
-                )
+                ))
+                continue
             except (TypeError, ValueError):
-                return self._failed(
+                failures.append(self._failed(
                     request=request,
                     scope=scope,
                     refresh_requested=refresh_requested,
@@ -507,8 +524,20 @@ class FundamentalFilingEvidenceCoordinator:
                     retryable=False,
                     message="The provider filing artifact response was invalid.",
                     filing_reference_id=reference.filing_reference_id,
-                )
+                ))
+                continue
             try:
+                if newly_acquired:
+                    artifact = self._preserve_original_download(artifact, scope=scope)
+                if self._artifact_reconciler is not None:
+                    reconciled = self._artifact_reconciler(artifact)
+                    original = artifact.model_dump(exclude_computed_fields=True)
+                    corrected = reconciled.model_dump(exclude_computed_fields=True)
+                    original.pop("page_count")
+                    corrected.pop("page_count")
+                    if original != corrected:
+                        raise ValueError("filing reconciliation changed download provenance")
+                    artifact = reconciled
                 stored_artifact = self._filing_repository.save_filing_artifact(
                     artifact
                 )
@@ -519,7 +548,7 @@ class FundamentalFilingEvidenceCoordinator:
                     allow_extraction=True,
                 )
             except StorageError:
-                return self._failed(
+                failures.append(self._failed(
                     request=request,
                     scope=scope,
                     refresh_requested=refresh_requested,
@@ -531,9 +560,10 @@ class FundamentalFilingEvidenceCoordinator:
                     retryable=True,
                     message="A filing artifact could not be stored safely.",
                     filing_reference_id=reference.filing_reference_id,
-                )
+                ))
+                continue
             except (TypeError, ValueError):
-                return self._failed(
+                failures.append(self._failed(
                     request=request,
                     scope=scope,
                     refresh_requested=refresh_requested,
@@ -548,9 +578,15 @@ class FundamentalFilingEvidenceCoordinator:
                         "and validation."
                     ),
                     filing_reference_id=reference.filing_reference_id,
-                )
+                ))
+                continue
             artifacts.append(stored_artifact)
             records.append(record)
+
+        if failures:
+            # All independently acquired artifacts/evidence remain durable. The
+            # analytical package stays fail-closed; report the first failure.
+            return failures[0].model_copy(update={"completed_at": self._now()})
 
         committed_at = self._now()
         if artifacts:
@@ -558,13 +594,12 @@ class FundamentalFilingEvidenceCoordinator:
                 committed_at,
                 *(artifact.last_checked_at for artifact in artifacts),
             )
-            recheck_after = min(
-                artifact.recheck_after for artifact in artifacts
-            )
+            recheck_after = committed_at + timedelta(days=10)
         else:
             recheck_after = committed_at + timedelta(days=10)
         try:
             candidate = FundamentalFilingPackage(
+                schema_version="jarvis.fundamental_filing_package.v2",
                 manifest=FundamentalFilingPackageManifest(
                     operation_id=request.operation_id,
                     connection=request.connection,
@@ -659,6 +694,31 @@ class FundamentalFilingEvidenceCoordinator:
             for artifact in package.artifacts
         )
 
+    def _preserve_original_download(
+        self,
+        artifact: FundamentalFilingArtifactManifest,
+        *,
+        scope: FundamentalFilingRepositoryScope,
+    ) -> FundamentalFilingArtifactManifest:
+        """Carry source acquisition history into a new immutable download."""
+        versions = self._filing_repository.list_filing_artifact_versions(
+            artifact.reference.filing_reference_id, scope=scope,
+        )
+        timestamps = [
+            item.first_downloaded_at for item in versions
+            if item.reference.same_source_as(artifact.reference)
+            and item.downloaded_at <= artifact.downloaded_at
+        ]
+        if not timestamps:
+            return artifact
+        original = min(artifact.first_downloaded_at, *timestamps)
+        values = artifact.model_dump(exclude_computed_fields=True)
+        values.update(
+            schema_version="jarvis.fundamental_filing_artifact.v2",
+            original_downloaded_at=original,
+        )
+        return FundamentalFilingArtifactManifest.model_validate(values)
+
     def _reusable_acquired_artifact(
         self,
         reference: FundamentalFilingReference,
@@ -667,12 +727,10 @@ class FundamentalFilingEvidenceCoordinator:
         requested_at: datetime,
         as_of: datetime,
     ) -> FundamentalFilingArtifactManifest | None:
-        """Reuse only an exact, current artifact already acquired for this run.
+        """Reuse a scoped source URL only after verifying its retained bytes.
 
-        The strict package contract forbids rebinding older PDF metadata to a
-        newly discovered reference. Exact matches acquired after the request
-        timestamp are safe to reuse after a partial retry, which avoids a
-        duplicate provider download without pretending an old artifact is new.
+        Rediscovery/refresh does not mean re-download. Preserve the original
+        discovery and download metadata, including unresolved period labels.
         """
 
         versions = self._filing_repository.list_filing_artifact_versions(
@@ -680,6 +738,14 @@ class FundamentalFilingEvidenceCoordinator:
             scope=scope,
         )
         for candidate in reversed(versions):
+            if self._artifact_verifier is not None:
+                if (
+                    candidate.reference.same_source_as(reference)
+                    and candidate.downloaded_at <= as_of
+                    and self._artifact_verifier(candidate)
+                ):
+                    return candidate
+                continue
             if (
                 candidate.reference == reference
                 and candidate.downloaded_at >= requested_at

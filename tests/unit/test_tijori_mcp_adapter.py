@@ -1,5 +1,6 @@
 import math
 import os
+import json
 import unittest
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -82,11 +83,9 @@ from tests.unit.test_tijori_benchmarking_financials_contract import (
 
 NOW = datetime(2026, 8, 28, 10, 0, tzinfo=UTC)
 FILING_NOW = datetime.fromisoformat(FILING_DISCOVERED_AT)
-FILING_PDF = (
-    b"%PDF-1.7\n"
-    b"1 0 obj\n<< /Type /Page >>\nendobj\n"
-    b"%%EOF\n"
-)
+from tests.unit.test_fundamental_filing_extractor import _pdf_bytes
+
+FILING_PDF = _pdf_bytes(("BT /F1 10 Tf 72 700 Td (Synthetic filing) Tj ET",))
 
 
 class FakeTijoriTransport:
@@ -1022,7 +1021,7 @@ class TijoriMcpAdapterTests(unittest.TestCase):
             )
             self.assertEqual(result.artifact.content_sha256, content_hash)
             self.assertEqual(result.artifact.page_count, 1)
-            self.assertEqual(result.artifact.pdf_version, "1.7")
+            self.assertEqual(result.artifact.pdf_version, "1.4")
             self.assertFalse(staged_path.exists())
             durable_path = artifacts / result.artifact.safe_relative_path
             self.assertEqual(durable_path.read_bytes(), FILING_PDF)
@@ -1061,6 +1060,26 @@ class TijoriMcpAdapterTests(unittest.TestCase):
                     staging_root=staging,
                     artifact_root=artifacts,
                 )
+
+    def test_filing_importer_ignores_extra_raw_page_markers(self):
+        content = _pdf_bytes((
+            "BT /F1 10 Tf 72 700 Td (/Type /Page) Tj ET",
+        ))
+        self.assertGreater(content.count(b"/Type /Page"), 1)
+        with TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            source = root / "source.pdf"
+            destination = root / "destination.pdf"
+            source.write_bytes(content)
+            descriptor = os.open(source, os.O_RDONLY)
+            try:
+                metadata = TijoriFilingArtifactImporter._copy_and_validate_pdf(
+                    source_descriptor=descriptor, temporary_path=destination,
+                    expected_hash=sha256(content).hexdigest(), expected_length=len(content),
+                )
+            finally:
+                os.close(descriptor)
+            self.assertEqual(metadata["page_count"], 1)
 
     def test_filing_importer_counts_compressed_page_objects_with_parser(self):
         content = (
@@ -1532,6 +1551,21 @@ class TijoriMcpAdapterTests(unittest.TestCase):
                     self.adapter.retrieve_peer_comparison(
                         request=self.overview_request()
                     )
+
+    def test_benchmarking_crore_suffix_variants_preserve_units_and_source(self):
+        from app.fundamentals.tijori_mcp_contracts import TijoriBenchmarkingRow
+        for source_value in ("1,234.50 Cr", "1,234.50 Crs", "1,234.50 Crs.",
+                             "(1,234.50 Crs)"):
+            with self.subTest(source_value=source_value):
+                row = benchmarking_payload()["document"]["rows"][2]
+                row["values"][0]["source_value"] = source_value
+                parsed = TijoriBenchmarkingRow.model_validate_json(json.dumps(row))
+                normalized = self.adapter._normalize_benchmarking_row(parsed)
+                self.assertEqual(normalized.value_kind, FundamentalValueKind.MONETARY)
+                self.assertEqual(normalized.normalized_unit, "INR crore")
+                self.assertEqual(normalized.cells[0].source_value, source_value)
+                self.assertEqual(normalized.cells[0].normalized_value,
+                                 Decimal("-1234.50" if source_value.startswith("(") else "1234.50"))
 
     def test_benchmarking_financials_returns_provider_neutral_document(self):
         payload = benchmarking_payload()

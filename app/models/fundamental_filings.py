@@ -194,6 +194,18 @@ class FundamentalFilingReference(FundamentalModel):
     available_at: datetime | None = None
     discovered_at: datetime
 
+    def same_source_as(self, other: "FundamentalFilingReference") -> bool:
+        """Compare scoped source identity, independent of discovery/period labels."""
+        return (
+            self.connection == other.connection
+            and self.issuer == other.issuer
+            and self.provider == other.provider
+            and self.category == other.category
+            and self.source_class == other.source_class
+            and self.artifact_url == other.artifact_url
+            and self.filing_reference_id == other.filing_reference_id
+        )
+
     @field_validator("source_page_url")
     @classmethod
     def validate_source_page_url(cls, value: str) -> str:
@@ -365,7 +377,10 @@ class FundamentalFilingDiscoverySnapshot(FundamentalModel):
 class FundamentalFilingArtifactManifest(FundamentalModel):
     """Validated durable metadata for one content-addressed PDF."""
 
-    schema_version: Literal["jarvis.fundamental_filing_artifact.v1"] = (
+    schema_version: Literal[
+        "jarvis.fundamental_filing_artifact.v1",
+        "jarvis.fundamental_filing_artifact.v2",
+    ] = (
         "jarvis.fundamental_filing_artifact.v1"
     )
     reference: FundamentalFilingReference
@@ -381,6 +396,9 @@ class FundamentalFilingArtifactManifest(FundamentalModel):
         pattern=r"^[0-9]+(?:\.[0-9]+)?$",
     )
     downloaded_at: datetime
+    original_downloaded_at: datetime | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+    )
     last_checked_at: datetime
     recheck_after: datetime
     duplicate_of_artifact_id: str | None = Field(
@@ -417,6 +435,12 @@ class FundamentalFilingArtifactManifest(FundamentalModel):
 
     @model_validator(mode="after")
     def validate_artifact(self) -> Self:
+        if self.original_downloaded_at is not None:
+            _require_timezone(self.original_downloaded_at, "original download time")
+            if self.schema_version != "jarvis.fundamental_filing_artifact.v2":
+                raise ValueError("original download metadata requires artifact v2")
+            if self.original_downloaded_at > self.downloaded_at:
+                raise ValueError("original download cannot follow this download")
         if self.downloaded_at < self.reference.discovered_at:
             raise ValueError("filing download cannot predate discovery")
         if self.last_checked_at < self.downloaded_at:
@@ -453,9 +477,16 @@ class FundamentalFilingArtifactManifest(FundamentalModel):
             "duplicate_of_artifact_id": self.duplicate_of_artifact_id,
             "supersedes_artifact_id": self.supersedes_artifact_id,
         }
+        if self.original_downloaded_at is not None:
+            payload["original_downloaded_at"] = self.original_downloaded_at.isoformat()
         return sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+
+    @property
+    def first_downloaded_at(self) -> datetime:
+        """Original source download, including legacy manifests."""
+        return self.original_downloaded_at or self.downloaded_at
 
     @computed_field
     @property
@@ -572,7 +603,10 @@ class FundamentalFilingPackageManifest(FundamentalModel):
 class FundamentalFilingPackage(FundamentalModel):
     """Immutable full aggregate activated only after every PDF validates."""
 
-    schema_version: Literal["jarvis.fundamental_filing_package.v1"] = (
+    schema_version: Literal[
+        "jarvis.fundamental_filing_package.v1",
+        "jarvis.fundamental_filing_package.v2",
+    ] = (
         "jarvis.fundamental_filing_package.v1"
     )
     manifest: FundamentalFilingPackageManifest
@@ -616,9 +650,14 @@ class FundamentalFilingPackage(FundamentalModel):
             )
 
         for artifact in self.artifacts:
+            discovered = discovered_references[artifact.reference.filing_reference_id]
             if (
-                artifact.reference
-                != discovered_references[artifact.reference.filing_reference_id]
+                artifact.reference != discovered
+                and not (
+                    self.schema_version == "jarvis.fundamental_filing_package.v2"
+                    and artifact.reference.same_source_as(discovered)
+                    and artifact.reference.discovered_at <= discovered.discovered_at
+                )
             ):
                 raise ValueError(
                     "filing artifact must exactly match its discovered reference"
@@ -628,12 +667,19 @@ class FundamentalFilingPackage(FundamentalModel):
                 or artifact.reference.issuer != self.manifest.issuer
             ):
                 raise ValueError("filing package artifacts must share its scope")
-            if artifact.downloaded_at < self.manifest.requested_at:
+            if (
+                self.schema_version == "jarvis.fundamental_filing_package.v1"
+                and artifact.downloaded_at < self.manifest.requested_at
+            ):
                 raise ValueError("filing package artifact predates its request")
             if artifact.last_checked_at > self.manifest.committed_at:
                 raise ValueError("filing package commit predates artifact validation")
-        if self.artifacts and self.manifest.recheck_after != min(
-            artifact.recheck_after for artifact in self.artifacts
+        if (
+            self.schema_version == "jarvis.fundamental_filing_package.v1"
+            and self.artifacts
+            and self.manifest.recheck_after != min(
+                artifact.recheck_after for artifact in self.artifacts
+            )
         ):
             raise ValueError("filing package recheck must match its earliest artifact")
         return self

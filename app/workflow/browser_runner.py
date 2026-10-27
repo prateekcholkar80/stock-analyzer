@@ -518,6 +518,8 @@ class JarvisBrowserOperationHandler:
         ) = None
         fundamental_analysis: FundamentalAnalysis | None = None
         fundamental_failure: BrowserOperationFailure | None = None
+        filing_failure: BrowserOperationFailure | None = None
+        research_failure: BrowserOperationFailure | None = None
         fundamental_future: Future | None = None
         fundamental_pool = (
             ThreadPoolExecutor(
@@ -597,9 +599,9 @@ class JarvisBrowserOperationHandler:
                     ),
                 )
             except ApplicationError as exc:
-                raise BrowserOperationHandledFailure(
-                    _safe_research_failure(exc)
-                ) from exc
+                research_failure = _safe_research_failure(exc)
+                if fundamental_future is None:
+                    raise BrowserOperationHandledFailure(research_failure) from exc
             if fundamental_future is not None:
                 try:
                     (
@@ -609,12 +611,28 @@ class JarvisBrowserOperationHandler:
                         fundamental_package_reference,
                         fundamental_analysis,
                         fundamental_failure,
+                        filing_failure,
                     ) = fundamental_future.result()
                 except BrowserOperationHandledFailure as exc:
                     fundamental_failure = exc.failure
         finally:
             if fundamental_pool is not None:
                 fundamental_pool.shutdown(wait=True)
+        if research_failure is not None:
+            return BrowserOperationOutput(
+                operation_id=request.operation_id,
+                session_id=request.session_id,
+                kind=request.kind,
+                completed_at=self._clock(),
+                research_failure=research_failure,
+                filing_failure=filing_failure,
+                fundamental_evidence=fundamental_evidence,
+                structured_document_references=structured_document_references,
+                benchmarking_financials_reference=benchmarking_financials_reference,
+                fundamental_package_reference=fundamental_package_reference,
+                fundamental_analysis=fundamental_analysis,
+                fundamental_failure=fundamental_failure,
+            )
         if not isinstance(response, JarvisSwingAnalysisResponse):
             raise ValueError("research executor returned an invalid response")
         if response.operation_id != request.operation_id:
@@ -644,6 +662,7 @@ class JarvisBrowserOperationHandler:
                 fundamental_package_reference=fundamental_package_reference,
                 fundamental_analysis=fundamental_analysis,
                 fundamental_failure=fundamental_failure,
+                filing_failure=filing_failure,
             )
         if response.result is None:
             raise ValueError("completed research response is missing analysis")
@@ -695,6 +714,7 @@ class JarvisBrowserOperationHandler:
                 fundamental_package_reference=fundamental_package_reference,
                 fundamental_analysis=fundamental_analysis,
                 fundamental_failure=fundamental_failure,
+                filing_failure=filing_failure,
             )
         if not isinstance(
             explanation,
@@ -720,6 +740,7 @@ class JarvisBrowserOperationHandler:
             fundamental_package_reference=fundamental_package_reference,
             fundamental_analysis=fundamental_analysis,
             fundamental_failure=fundamental_failure,
+            filing_failure=filing_failure,
         )
 
     def _load_fundamental_evidence(
@@ -734,6 +755,7 @@ class JarvisBrowserOperationHandler:
         BrowserBenchmarkingFinancialsReference | None,
         BrowserFundamentalPackageReference | None,
         FundamentalAnalysis | None,
+        BrowserOperationFailure | None,
         BrowserOperationFailure | None,
     ]:
         executor = self._fundamental_evidence
@@ -812,7 +834,7 @@ class JarvisBrowserOperationHandler:
                 )
             )
         issuer = resolution.issuer
-        self._prepare_filing_evidence(
+        filing_failure = self._prepare_filing_evidence(
             operation=operation,
             connection=connection,
             issuer=issuer,
@@ -1302,6 +1324,7 @@ class JarvisBrowserOperationHandler:
             package_reference,
             fundamental_analysis,
             analyst_failure,
+            filing_failure,
         )
 
     def _analyze_fundamental_documents(
@@ -1366,7 +1389,7 @@ class JarvisBrowserOperationHandler:
         requested_at: datetime,
         emitter: WorkflowEventEmitter,
         token: BrowserCancellationToken,
-    ) -> None:
+    ) -> BrowserOperationFailure | None:
         """Prepare primary filing evidence without blocking other research."""
 
         executor = self._fundamental_filing_evidence
@@ -1437,7 +1460,11 @@ class JarvisBrowserOperationHandler:
                 ),
                 **common,
             )
-            return
+            return BrowserOperationFailure(
+                code="fundamentals.filings_unavailable",
+                message="Corporate filings could not be prepared safely. Other research continued independently.",
+                retryable=False,
+            )
 
         if result.status in {
             FundamentalFilingEvidenceCoordinationStatus.CACHE_REUSED,
@@ -1467,6 +1494,11 @@ class JarvisBrowserOperationHandler:
                 )
             ),
             **common,
+        )
+        return BrowserOperationFailure(
+            code="fundamentals.filings_unavailable",
+            message=failure.sanitized_message if failure is not None else "Corporate filings could not be prepared safely.",
+            retryable=failure.retryable if failure is not None else False,
         )
 
     def _execute_follow_up(
@@ -1650,6 +1682,9 @@ class AsyncBrowserOperationRunner:
                 raise ValueError("browser handler output identity must match request")
             token.raise_if_requested()
             self._results.save(output)
+            if output.research_failure is not None:
+                self._fail(operation_id, output.research_failure, result_available=True)
+                return
             emitter.emit(WorkflowStage.COMPLETED, WorkflowEventState.COMPLETED)
             self._registry.mark_completed(operation_id, at=self._clock())
             logger.info(
@@ -1712,6 +1747,8 @@ class AsyncBrowserOperationRunner:
         self,
         operation_id: str,
         failure: BrowserOperationFailure,
+        *,
+        result_available: bool = False,
     ) -> None:
         current = self._registry.get_operation(operation_id)
         if current is None or current.status.terminal:
@@ -1723,7 +1760,9 @@ class AsyncBrowserOperationRunner:
             initial_sequence=current.last_event_sequence,
         )
         emitter.emit(WorkflowStage.FAILED, WorkflowEventState.FAILED)
-        self._registry.mark_failed(operation_id, failure, at=self._clock())
+        self._registry.mark_failed(
+            operation_id, failure, at=self._clock(), result_available=result_available,
+        )
 
 
 def _required_text(label: str, value: str) -> str:

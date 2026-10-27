@@ -15,6 +15,7 @@ from app.fundamentals.filing_extractor import (
 )
 from app.models.fundamental_filing_evidence import (
     FundamentalFilingCitationElementType,
+    FundamentalFilingExtractionLimitation,
     FundamentalFilingGuidanceCommitment,
     FundamentalFilingGuidanceValueKind,
     FundamentalFilingObservedFact,
@@ -32,6 +33,7 @@ from app.models.fundamental_filings import (
 from tests.unit.test_fundamental_filing_extractor import (
     _manifest_for,
     _native_filing_pdf,
+    _pdf_bytes,
 )
 from tests.unit.test_fundamental_filings import COMMITTED_AT
 
@@ -148,7 +150,7 @@ class DeterministicFundamentalFilingEvidenceValidatorTests(
         repeated = self.validate()
 
         self.assertTrue(first.releaseable)
-        self.assertEqual(first.policy_version, "1.3.0")
+        self.assertEqual(first.policy_version, "1.4.0")
         self.assertEqual(len(first.findings), 7)
         self.assertTrue(
             all(
@@ -257,6 +259,20 @@ class DeterministicFundamentalFilingEvidenceValidatorTests(
             FundamentalFilingValidationStatus.PASS,
         )
 
+    def test_material_extraction_limitation_blocks_release(self):
+        evidence = self.evidence.model_copy(update={"limitations": (
+            FundamentalFilingExtractionLimitation(
+                limitation_id="page.1.table_limit", description="Table structure unavailable",
+                affected_pages=(1,), material=True,
+            ),
+        )})
+        result = self.validate(evidence)
+        self.assertFalse(result.releaseable)
+        self.assertEqual(
+            self.finding(result, FundamentalFilingValidationCode.PAGE_SPANS).status,
+            FundamentalFilingValidationStatus.FAIL,
+        )
+
     def test_accepts_unclassified_provider_month_with_reporting_period_anchor(self):
         period = FundamentalFilingPeriod(
             state=FundamentalFilingPeriodState.UNCLASSIFIED,
@@ -282,6 +298,38 @@ class DeterministicFundamentalFilingEvidenceValidatorTests(
             finding.status,
             FundamentalFilingValidationStatus.PASS,
         )
+
+    def test_period_evidence_after_cover_pages_and_future_conflict(self):
+        period = FundamentalFilingPeriod(
+            state=FundamentalFilingPeriodState.UNCLASSIFIED,
+            period_type=FundamentalFilingPeriodType.UNCLASSIFIED,
+            source_label="Apr 2026",
+        )
+        for conflicting in (False, True):
+            with self.subTest(conflicting=conflicting):
+                texts = ["Coforge Limited", "Company overview", "Highlights",
+                         "Results for the year ended March 31, 2026"]
+                if conflicting:
+                    texts.append("Results for the quarter ended December 31, 2026")
+                pdf = _pdf_bytes(tuple(
+                    f"BT /F1 10 Tf 72 700 Td ({text}) Tj ET" for text in texts
+                ))
+                manifest = _manifest_for(
+                    Path(self.temporary_directory.name).resolve(), pdf,
+                    page_count=len(texts),
+                )
+                evidence = self.extract_evidence(manifest)
+                result = self.validate(_with_period(evidence, period), expected_period=period)
+                self.assertEqual(
+                    self.finding(result, FundamentalFilingValidationCode.PERIOD_IDENTITY).status,
+                    FundamentalFilingValidationStatus.FAIL if conflicting
+                    else FundamentalFilingValidationStatus.PASS,
+                )
+
+    def extract_evidence(self, manifest):
+        return DeterministicFundamentalFilingExtractor(
+            artifact_root=Path(self.temporary_directory.name).resolve(),
+        ).extract(manifest, extracted_at=COMMITTED_AT + timedelta(minutes=2))
 
     def test_accepts_format_variants_for_unclassified_reporting_period(self):
         period = FundamentalFilingPeriod(

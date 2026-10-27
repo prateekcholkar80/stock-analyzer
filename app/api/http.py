@@ -817,7 +817,7 @@ def create_jarvis_http_app(
     ):
         authorize(session_id, x_jarvis_session_token)
         snapshot = owned_operation(session_id, operation_id)
-        if snapshot.status is BrowserOperationStatus.COMPLETED:
+        if snapshot.result_available:
             output = operations.get_result(operation_id)
             if output is None:
                 raise HTTPException(
@@ -857,7 +857,7 @@ def create_jarvis_http_app(
     ) -> BrowserStructuredFinancialDocumentResponse:
         authorize(session_id, x_jarvis_session_token)
         snapshot = owned_operation(session_id, operation_id)
-        if snapshot.status is not BrowserOperationStatus.COMPLETED:
+        if not snapshot.result_available:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="financial documents are available after completion",
@@ -944,7 +944,7 @@ def create_jarvis_http_app(
     ) -> BrowserBenchmarkingFinancialsDocumentResponse:
         authorize(session_id, x_jarvis_session_token)
         snapshot = owned_operation(session_id, operation_id)
-        if snapshot.status is not BrowserOperationStatus.COMPLETED:
+        if not snapshot.result_available:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(

@@ -44,7 +44,7 @@ from app.models.fundamentals import FundamentalIssuerIdentity
 
 
 _POLICY_ID = "filing.evidence.release_validation"
-_POLICY_VERSION = "1.3.0"
+_POLICY_VERSION = "1.4.0"
 _WHITESPACE = re.compile(r"\s+")
 _NON_IDENTIFIER = re.compile(r"[^a-z0-9]+")
 _MAX_UNCLASSIFIED_PUBLICATION_LAG_DAYS = 184
@@ -190,7 +190,7 @@ class DeterministicFundamentalFilingEvidenceValidator:
     ) -> FundamentalFilingValidationFinding:
         actual = evidence.artifact.reference.period
         affected: list[str] = []
-        content = _identity_content(evidence)
+        content = _identity_content(evidence, all_pages=True)
         if actual != expected or not _content_matches_period(content, expected):
             affected.append(evidence.artifact.reference.filing_reference_id)
         if actual.period_end is not None:
@@ -241,6 +241,10 @@ class DeterministicFundamentalFilingEvidenceValidator:
             ):
                 affected.append(turn.element_id)
 
+        affected.extend(
+            limitation.limitation_id for limitation in evidence.limitations
+            if limitation.material
+        )
         citations = {item.citation_id: item for item in evidence.citations}
         unreadable_pages = {
             page.page_number
@@ -260,7 +264,7 @@ class DeterministicFundamentalFilingEvidenceValidator:
             return _failed(
                 FundamentalFilingValidationCode.PAGE_SPANS,
                 "One or more evidence spans are absent, cross unreadable pages, "
-                "or contain a non-contiguous speaker turn.",
+                "contain a non-contiguous speaker turn, or have material extraction limitations.",
                 affected,
             )
         return _passed(
@@ -577,9 +581,11 @@ def _canonical_text(value: str) -> str:
     return _WHITESPACE.sub(" ", value).strip().casefold()
 
 
-def _identity_content(evidence: FundamentalFilingExtractedEvidence) -> str:
+def _identity_content(
+    evidence: FundamentalFilingExtractedEvidence, *, all_pages: bool = False,
+) -> str:
     values: list[str] = []
-    for page in evidence.pages[:3]:
+    for page in evidence.pages if all_pages else evidence.pages[:3]:
         values.extend(block.text for block in page.text_blocks)
         values.extend(
             cell.text for table in page.tables for cell in table.cells
@@ -692,11 +698,16 @@ def _content_has_compatible_unclassified_period(
     source_month_end = _source_label_month_end(source_label)
     if source_month_end is None:
         return False
+    reporting_dates = _reporting_period_end_dates(canonical_content)
+    # An older comparative column cannot rescue a source label that predates
+    # an explicitly stated completed reporting period in the same document.
+    if any(period_end > source_month_end for period_end in reporting_dates):
+        return False
     return any(
         0 <= (source_month_end - period_end).days
         <= _MAX_UNCLASSIFIED_PUBLICATION_LAG_DAYS
         for period_end in (
-            *_reporting_period_end_dates(canonical_content),
+            *reporting_dates,
             *_indian_fiscal_quarter_end_dates(canonical_content),
         )
     )

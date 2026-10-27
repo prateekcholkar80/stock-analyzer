@@ -2,6 +2,7 @@ import hashlib
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -441,7 +442,7 @@ class DeterministicFundamentalFilingExtractorTests(unittest.TestCase):
             first.extraction_fingerprint,
             repeated.extraction_fingerprint,
         )
-        self.assertEqual(first.policy.policy_version, "1.4.0")
+        self.assertEqual(first.policy.policy_version, "1.5.0")
         self.assertIn("pdfplumber", first.policy.text_engine)
 
     def test_distinguishes_basis_point_units_from_business_process_services(self):
@@ -664,6 +665,20 @@ class DeterministicFundamentalFilingExtractorTests(unittest.TestCase):
         self.assertFalse(result.participants)
         self.assertFalse(result.speaker_turns)
 
+    def test_reconciles_page_count_without_changing_download_provenance(self):
+        manifest = _manifest_for(self.root, _native_filing_pdf(), page_count=3)
+        corrected = self.extractor().reconcile_page_count(manifest)
+        self.assertEqual(corrected.page_count, 2)
+        self.assertEqual(manifest.page_count, 3)
+        self.assertNotEqual(corrected.artifact_id, manifest.artifact_id)
+        for field in ("reference", "content_sha256", "byte_length", "downloaded_at",
+                      "original_downloaded_at", "last_checked_at", "recheck_after"):
+            self.assertEqual(getattr(corrected, field), getattr(manifest, field))
+        self.assertEqual(self.extractor().reconcile_page_count(corrected), corrected)
+        corrupt = manifest.model_copy(update={"byte_length": manifest.byte_length + 1})
+        with self.assertRaises(FundamentalFilingExtractionError):
+            self.extractor().reconcile_page_count(corrupt)
+
     def test_rejects_byte_length_hash_and_page_count_mismatches(self):
         pdf = _native_filing_pdf()
         manifest = _manifest_for(
@@ -674,9 +689,12 @@ class DeterministicFundamentalFilingExtractorTests(unittest.TestCase):
         )
         path = self.root.joinpath(*manifest.safe_relative_path.split("/"))
 
+        self.assertTrue(self.extractor().artifact_is_intact(manifest))
+
         wrong_length = manifest.model_copy(
             update={"byte_length": manifest.byte_length + 1}
         )
+        self.assertFalse(self.extractor().artifact_is_intact(wrong_length))
         with self.assertRaisesRegex(
             FundamentalFilingExtractionError,
             "byte length",
@@ -802,6 +820,20 @@ class DeterministicFundamentalFilingExtractorTests(unittest.TestCase):
             FundamentalFilingWarningCode.TABLE_STRUCTURE_UNCERTAIN,
         )
         self.assertFalse(limitations[0].material)
+
+    def test_oversized_table_cell_retains_text_and_records_material_limitation(self):
+        table = _SyntheticMixedUnitTable()
+        with patch.object(table, "extract", return_value=[["x" * 10_001]]), patch.object(
+            _TableFailurePage, "find_tables", return_value=[table],
+        ):
+            page, warnings, limitations = self.extractor()._extract_page(
+                _TableFailurePage(), page_number=1,
+            )
+        self.assertEqual(page.status, FundamentalFilingPageStatus.PARTIAL)
+        self.assertEqual(page.text_blocks[0].text, "Revenue increased.")
+        self.assertEqual(page.tables, ())
+        self.assertEqual(warnings[0].code, FundamentalFilingWarningCode.TABLE_STRUCTURE_UNCERTAIN)
+        self.assertTrue(limitations[0].material)
 
     def test_ocr_policy_is_rejected_until_a_versioned_adapter_exists(self):
         ocr_policy = FundamentalFilingExtractionPolicy(

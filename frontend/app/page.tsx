@@ -137,6 +137,7 @@ type AgentTone = "cyan" | "amber" | "rose" | "violet";
 type CreatedSession = { session: Session; access_token: string };
 type RetainedOperationOutput = {
   decision_failure?: OperationDecisionFailure | null;
+  research_failure?: OperationDecisionFailure | null;
   fundamental_failure?: OperationDecisionFailure | null;
   structured_document_references?: StructuredDocumentReference[];
   benchmarking_financials_reference?: BenchmarkingFinancialsReference | null;
@@ -797,11 +798,12 @@ export default function Home() {
     return { audit, operationBase };
   }, [authHeaders, session, token]);
 
-  const fetchCompletedOperation = useCallback(async (operationId: string) => {
+  const fetchCompletedOperation = useCallback(async (operationId: string, allowMissingResult = false) => {
     const audited = await fetchOperationAudit(operationId);
     if (!audited) return;
     const { audit, operationBase } = audited;
     if (!audit.result) {
+      if (allowMissingResult) return;
       throw new Error("Jarvis completed without a retained operation result.");
     }
     const operationResult = audit.result;
@@ -822,6 +824,15 @@ export default function Home() {
     );
     setFundamentalFailure(operationResult.fundamental_failure ?? null);
     setFundamentalPackageReference(packageReference);
+    if (operationResult.research_failure) {
+      setDashboard(null);
+      setNotice(packageReference
+        ? "Fundamental package saved. Market analysis failed; no trade conclusion was produced."
+        : "Market analysis failed; retained activity results remain available.");
+      setError(operationResult.research_failure.message);
+      setActiveOperation(null);
+      return;
+    }
     const dashboardResponse = await fetch(`${operationBase}/dashboard`, {
       headers: authHeaders,
     });
@@ -935,7 +946,7 @@ export default function Home() {
           } else {
             neuralAudioRef.current?.play("fault");
             setActiveOperation(null);
-            void fetchOperationAudit(operationId).catch(() => undefined);
+            void fetchCompletedOperation(operationId, true).catch((reason) => setError(reason.message));
             if (
               terminal.failure
               && RECOVERABLE_INSTRUMENT_FAILURES.has(terminal.failure.code)
@@ -961,7 +972,7 @@ export default function Home() {
           setOperationStatus("failed");
         }
       });
-  }, [authHeaders, fetchCompletedOperation, fetchOperationAudit, session, token]);
+  }, [authHeaders, fetchCompletedOperation, session, token]);
 
   const playSpokenMessage = useCallback(async (message: string | null | undefined) => {
     if (!shouldPlaySpokenMessage(voiceEnabled, message) || !session || !token) return;
@@ -1574,6 +1585,32 @@ export default function Home() {
             <p className="eyebrow">Jarvis communication</p><h2>{notice}</h2>
             {error && <p className="error-message">{error}</p>}
           </div>
+          {state === "dormant" && (
+            <section className="wake-launcher" aria-label="Quick start Jarvis">
+              <div className="wake-launcher-heading">
+                <span className="eyebrow">Start a conversation</span>
+                <span className="wake-launcher-hint">Click a phrase to send it</span>
+              </div>
+              <button
+                type="button"
+                className="wake-phrase-primary"
+                disabled={!session || !token}
+                onClick={() => void sendText("Hey Jarvis")}
+              >
+                <span><strong>Hey Jarvis</strong><small>Wake up and start listening</small></span>
+                <span aria-hidden="true">↗</span>
+              </button>
+              <div className="wake-phrase-examples">
+                {["Hey Jarvis, analyse Reliance", "Hey Jarvis, analyse TCS"].map((phrase) => (
+                  <button key={phrase} type="button" disabled={!session || !token}
+                    onClick={() => void sendText(phrase)}>
+                    <span>{phrase}</span><span aria-hidden="true">→</span>
+                  </button>
+                ))}
+              </div>
+              <p>Start with a greeting, or choose an example to request research. For speech, enable Voice input below.</p>
+            </section>
+          )}
           <form id="command-form" className="command-bar" onSubmit={submit}>
             <span className="prompt-symbol">›</span>
             <input

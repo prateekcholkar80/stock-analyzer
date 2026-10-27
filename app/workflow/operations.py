@@ -85,6 +85,7 @@ class BrowserOperationRegistry(Protocol):
         failure: BrowserOperationFailure,
         *,
         at: datetime,
+        result_available: bool = False,
     ) -> BrowserOperationSnapshot:
         ...
 
@@ -303,6 +304,7 @@ class InMemoryBrowserOperationRegistry:
         failure: BrowserOperationFailure,
         *,
         at: datetime,
+        result_available: bool = False,
     ) -> BrowserOperationSnapshot:
         if not isinstance(failure, BrowserOperationFailure):
             raise ValueError("failed operation requires a safe failure")
@@ -315,6 +317,7 @@ class InMemoryBrowserOperationRegistry:
                 BrowserOperationStatus.CANCELLATION_REQUESTED,
             },
             failure=failure,
+            result_available=result_available,
         )
 
     def publish(self, event: JarvisWorkflowEvent) -> None:

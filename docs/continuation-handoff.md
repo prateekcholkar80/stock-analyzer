@@ -1,11 +1,328 @@
 # Jarvis Implementation Continuation Handoff
 
-Last updated: **2026-10-26 (Asia/Kolkata)**
+Last updated: **2026-10-27 (Asia/Kolkata)**
 
 Use this file to resume implementation without relying on chat history. The
 authoritative architectural detail remains in `docs/current-baseline.md`; this
 document captures the current decisions, exact executable path, validation
 evidence, local artifacts, known gaps, and recommended next work.
+
+## Check-in preparation and approved next boundary — 2026-10-27
+
+The user requested check-in preparation with the agreed collection/offline-analysis
+boundary. The authoritative next-step contract is the opening section of
+`docs/controlled-learning-and-fundamental-intelligence-plan.md`: Tijori refresh
+owns discovery, scoped URL-based deduplication, download, integrity checks and
+durable storage. Offline/background work owns extraction, table segmentation,
+chunking, indexing, citations and analytical validation. Collection success and
+analysis readiness must be independent. Tijori labels are accepted source
+metadata for collection; discrepancies remain traceable downstream and must not
+invalidate a stored file. The cell-size limit must not define document validity.
+
+This is an approved design decision, not a completed refactor. The current
+coordinator still extracts and validates inline, and the January/March filing
+analytical holds remain in place. The checkpoint includes the implemented reuse,
+timestamp provenance, recovery, benchmarking and independent-result fixes, plus
+the existing wake-command UI and company-first planning changes. Do not claim
+offline processing or changed source-date release policy in the commit/PR.
+
+Pre-check-in validation completed after the implementation milestones:
+**2,884 Python tests passed** (`unittest discover -s tests -q`, 106.969 seconds).
+Frontend build/75 tests, TypeScript, scoped page lint and synthetic failure-UI
+verification passed as recorded below. Full frontend lint retains five deferred
+errors in unchanged AnimatedAgent3D.tsx. No code changed after this validation;
+this preparation updates documentation only, so successful suites were not
+repeated. Whitespace checks passed. Nothing has been staged, committed or pushed.
+
+Additional authorized broker diagnostic: one TCS ONE_HOUR request covering
+20–26 October 2026 returned HTTP 200 and 28 validated candles on its first attempt
+at approximately 10:26 IST. It made no database writes. This did not reproduce
+the earlier rate-limit failure and does not prove a full historical backfill
+will succeed.
+
+Local inspection of the retained March PDF confirmed oversized detected cells
+on physical pages 11 (11,900 characters), 17 (10,290), and 19 (12,068): each is
+table 1, row 3, column 1 using one-based detector coordinates. They cover large
+description-column regions in consolidated cash flow, standalone balance sheet
+and standalone cash flow respectively. These are segmentation limitations, not
+evidence of invalid financial data. No new download was made.
+
+Single next implementation step: define the separate collection receipt and
+offline analytical job/status contract before moving work out of the refresh
+path. The latest independent-result runtime fix still requires a backend restart.
+
+## Preserve independent results after market failure — 2026-10-27
+
+Implemented the diagnosed market-exception path. The browser handler now joins
+and collects the independent fundamental worker after a handled research error.
+It returns a retained partial output with `research_failure`, committed package
+and document references, and the Fundamental Analyst's own failure. The runner
+saves that output before marking the operation FAILED with `result_available`.
+No research response, explanation, completed event or trade conclusion is
+fabricated. Operations that fail before independent work starts retain their
+previous no-result behavior. Cancellation behavior is unchanged.
+
+Filing preparation now returns a safe `filing_failure` with its own message and
+retryability. The agent ledger prioritizes that failure and the Fundamental
+Analyst's failure over the operation-wide market error. Older records without
+these fields use the activity's own safe terminal message for fundamental/filing
+failures instead of falsely assigning the market error. Existing failure-only
+audits are not retroactively reconstructed from the fundamental database.
+
+Authenticated audit/result and referenced financial-document endpoints can read
+retained results on failed operations. The result endpoint returns HTTP 200
+with an explicitly failed operation and partial output when available; failed
+operations without results retain HTTP 409. The analysis dashboard remains
+unavailable on failed operations. The frontend loads retained audit results on
+failure and displays package success independently of market/analyst failures,
+without requesting a dashboard or displaying a research conclusion.
+
+Validation: 951 affected Python subsystem tests passed. The exact regression
+combines a market-history exception, real in-memory 16-item package commit,
+analyst failure and filing failure; it verifies retained package identity,
+FAILED status, missing research conclusion and distinct activity failures with
+filing retryability. HTTP regression verifies package-success audit/result
+responses and dashboard rejection. Frontend production build, 75 tests,
+TypeScript and scoped `page.tsx` lint passed. Full frontend lint remains blocked
+by five existing react/no-unknown-property errors in unchanged
+`AnimatedAgent3D.tsx`. Whitespace checks passed; no complete Python regression
+was run. A synthetic loopback browser check confirmed visible package success,
+analyst and market errors, FAILED operation status, zero dashboard requests and
+zero page errors; its initial teardown issue was fixed and the check passed.
+No broker, Tijori or LLM calls were made, and the live backend was not restarted.
+All changes remain unstaged/uncommitted; earlier edits are preserved.
+
+Single next step: obtain authorization to restart the live backend so future
+operations use the retained-result behavior. The earlier failed operation audit
+is unchanged; the underlying Angel One rate-limit issue is not fixed here.
+
+## Live verification of filing and benchmarking fixes — 2026-10-27
+
+The user authorized a backend restart and exactly one TCS refresh. The backend
+was restarted on port 18765 against `data/jarvis_live_preview_20261026.duckdb`
+with the current fixes. Its existing Tijori session was ready; no new login was
+needed. Operation `operation-b9d1d703a8734d4ca8b905008ab46614` ran from roughly
+10:03:57 to 10:05:35 IST. No second refresh was submitted.
+
+Stable database/WAL snapshot verification confirmed:
+- All 34 original artifact records and their hashes/download timestamps remain
+  unchanged. There are 35 manifests for 34 distinct source references: the only
+  new manifest corrects September 2022 from 34 to 33 pages with the same bytes
+  and download timestamp. No new PDF acquisition is reflected in the records.
+- All 34 sources now have extraction records under extraction v1.5.0 and
+  validation v1.4.0; 32 are releaseable. April 2026 and September 2022 pass.
+  March 2025 has a saved 21-page extraction but three material table limitations;
+  January 2022 remains withheld for its reporting-date/source-label conflict.
+- Benchmarking successfully completed and was stored: 3 companies, 39 rows.
+  A complete 16-item fundamental package for this operation was committed at
+  **10:05:34 IST**. This verifies the `Crs` normalization fix end-to-end.
+- No separate corporate-filing package was published because of the two
+  withheld documents. The overall analysis operation failed with
+  `market.unavailable` after Angel One history rate-limit failures. Its audit
+  reports no package publication, although the database independently confirms
+  the committed fundamental package; do not equate the analysis failure with
+  loss of the successfully stored fundamentals.
+
+This turn ran the authorized live refresh and read-only database verification;
+no code changed and no deterministic/full regression was repeated. The previous
+855-test affected-suite result remains applicable. Documentation whitespace
+checks passed. Changes remain unstaged and uncommitted. The live backend now
+includes the original-download timestamp enhancement and all three defect fixes.
+Single next step: diagnose the Angel One history failure and why the failed
+operation audit hides the successfully committed fundamental package, using
+retained local evidence before considering another live request.
+
+## Filing defects and benchmarking normalization — 2026-10-27
+
+Implemented and locally verified the three failure categories from the last TCS
+refresh. Release validation v1.4.0 reads reporting-period evidence across all
+pages, while issuer identity retains its opening-page boundary. An older
+comparative period cannot override explicit reporting dates later than the
+provider's source-month label. Material extraction limitations now fail release.
+Extraction policy v1.5.0 retains native text and explicit material table
+limitations when a detected table cell exceeds the existing 10,000-character
+bound, rather than losing the entire extraction to a schema exception.
+
+PDF import always counts the parsed page tree instead of raw page markers.
+Production composition also injects a verified-local-byte page-count reconciler
+into the filing coordinator. A corrected manifest is saved separately before
+extraction; the old record, source identity, bytes and original/current download
+timestamps are preserved. The coordinator rejects reconciliation that changes
+anything except page count. This requires no provider download.
+
+Three individually authorized read-only benchmarking diagnostics were run.
+The browser extractor returned 3 companies, 39 rows and 117 cells; the full
+adapter reproduced an InvalidOperation on the provider's `Crs` currency suffix.
+The second diagnostic's follow-up inspection used the wrong Pydantic mode;
+the third corrected that diagnostic and established the cause. The adapter now
+normalizes `Cr`, `Crs` and their dotted forms as INR crore, preserving source
+text. The fix is covered by synthetic tests, not a subsequent live provider call.
+No provider payload was retained in logs or fixtures.
+
+Final local replay of four retained TCS PDFs, with no live database writes:
+- April 2026: 16 pages, release validation passes (anchors occur after page 3).
+- September 2022: parsed count 33 versus old manifest 34; corrected extraction
+  passes release validation without a download.
+- March 2025: all 21 pages now produce extraction; three oversized-table
+  limitations remain material, so analytical release is withheld.
+- January 2022: all 28 pages extract; later reporting dates conflict with the
+  provider label, so release remains withheld. No date was guessed or rewritten.
+
+Validation: targeted modules passed (22 validator, 19 extractor, 15 coordinator,
+27 composition, 51 adapter); final affected fundamentals/Tijori/storage/browser
+operation/HTTP suite **855/855 passed**. `git diff --check` passed. Full Python
+and frontend suites were not run. All changes remain unstaged and uncommitted;
+the running backend has not loaded these fixes, and the live DB still has the
+previous records. No complete analytical package has been published.
+
+Single next step: obtain authorization to restart the backend and run one TCS
+refresh to persist the repaired metadata/extraction records and verify the
+benchmarking fix end-to-end. March table limitations and January's source-date
+conflict still prevent a fully releaseable filing package.
+
+## Preserve original download time across re-downloads — 2026-10-27
+
+Implemented artifact v2 `original_downloaded_at` metadata for a newly acquired
+PDF whose exact scoped source URL/reference has retained download history.
+The coordinator carries the earliest known original time into every subsequent
+download; `downloaded_at` remains the timestamp of that specific download.
+Older manifests and their fingerprints are unchanged. First-download and legacy
+records expose the existing download time through `first_downloaded_at` without
+rewriting history. URL, issuer and connection boundaries prevent timestamp
+inheritance from unrelated documents. Content hashes still identify each
+version independently. The JSON-backed repositories need no table migration.
+
+Validation: 16 domain tests and 13 coordinator tests passed; final affected
+filing/composition/DuckDB/browser/HTTP suite **327/327 passed**. The re-download
+regression checks original/current times, immutable old records, repeated
+downloads, changed-URL isolation and DuckDB reopen. The synthetic extractor now
+correctly rebinds citation identifiers to each test artifact. Whitespace checks
+passed. No full Python regression or live provider call was run for this step.
+Existing unrelated edits are preserved; everything remains unstaged and
+uncommitted. The running backend still has the earlier URL-reuse code and has
+not loaded this timestamp enhancement. Single next step: restart the backend
+when authorized so future re-downloads use the new provenance behavior.
+
+## URL-based filing reuse and independent collection — 2026-10-27
+
+Live verification completed after the explicitly authorized backend restart.
+The expired Tijori session was renewed through its headed login flow. Exactly
+one TCS refresh was submitted: `operation-9322bf16e7a04c3281ce9f4276c3b575`,
+completed at approximately 09:05 IST. Stable database/WAL snapshot inspection
+found **34 retained PDFs: 17 earnings releases and 17 conference calls**, up
+from one. All 34 passed owner/path/length/SHA-256 local integrity checks. The
+original April 2026 earnings release retained its exact artifact ID and original
+download timestamp, with only one record for that URL; 33 new PDFs were saved.
+The October 2026 conference call and July 2026 earnings release are included.
+
+Thirty extraction records are releaseable and two are withheld for
+`period_identity` (April 2026 and January 2022 earnings releases). Two other
+downloaded earnings releases, March 2025 and September 2022, have no saved
+extraction record; their exact extraction failure still needs diagnosis. No
+filing package was published. Benchmarking retrieval also still failed, so no
+full fundamental package was published. The independent collection/reuse
+behavior is verified; these remaining analytical failures are not resolved.
+No second refresh was run. The live backend remains on port 18765 using the
+existing preview database; frontend is at `http://127.0.0.1:15173/`. Refreshing
+the browser creates a new session after the backend restart.
+
+Implemented the user's source-identity acquisition rule for the currently
+supported earnings-release and conference-call categories. Live composition
+injects a local artifact integrity verifier; a scoped stable reference ID plus
+exact URL/category/issuer match and intact retained bytes skips acquisition,
+including across later discovery runs and explicit company refreshes. Missing
+or corrupt local bytes are not considered a reusable download. Original
+artifact timestamps, content hashes and discovery provenance are preserved.
+
+The filing coordinator no longer stops the collection loop at the first
+download, storage or extraction/validation failure. It attempts remaining
+bounded references, retains successful files and evidence records, and returns
+the first safe failure after collection. Period validation still governs
+analytical release, not whether another document may be downloaded. Failed
+downloads remain retryable on rediscovery because no successful artifact entry
+exists. A standalone durable discovery-attempt registry was not introduced.
+
+Filing package v2 supports reused source-identical older artifacts; v1 readers
+retain their original validation. No database table migration was required.
+Package recheck is a discovery interval, not remote-content revalidation.
+Same-URL remote replacements require a future explicit re-download policy;
+local hashes alone do not detect them. Annual reports/investor presentations,
+company-core fourteen-slot runtime changes and a richer per-file UI are not
+part of this milestone. The strict analytical package may still report failure
+when a stored PDF has an unresolved reporting period.
+
+Validation: 15 domain tests, 17 extractor tests, 27 composition tests; final
+combined affected suite **325/325 passed** (filings, composition, DuckDB,
+browser runner/operations and HTTP), including URL reuse across rediscovery
+and DuckDB reopen, continued acquisition after failures, retained metadata and
+legacy v1 compatibility. `git diff --check` passed. No complete Python suite,
+frontend suite or live provider calls were run for this backend-only milestone.
+The subsequent authorized restart and live evidence are recorded above.
+Existing UI/planning edits remain preserved. All changes are
+unstaged and uncommitted.
+
+Single recommended next step: diagnose the two saved PDFs without extraction
+records, using the retained files without another provider download.
+
+## Company-first fundamental contract and execution plan — 2026-10-26
+
+User priority: Phase 1 analyzes the individual company; Phase 2 compares peers.
+The authoritative new specification is the opening `Current priority` section
+of `docs/controlled-learning-and-fundamental-intelligence-plan.md`. It supersedes
+the older sixteen-slot planning requirement for future company-only analysis.
+Runtime still uses the sixteen-slot v1 contract; no implementation was changed
+in this documentation step.
+
+The proposed versioned company-core package requires fourteen company-specific
+artifacts, excludes peer/benchmarking prerequisites, preserves atomic activation
+and source-level partial/missing states, and gates each analytical conclusion
+on its own validated inputs. Existing full packages retain their schema and
+fingerprints. Persistence must distinguish active package profiles. Filings,
+analyst explanation and comparison results have independent outcomes; technical
+trade gates and shadow fundamental policy remain unchanged.
+
+The plan covers domain contracts, persistence/migration, orchestration,
+normalization/analyst integration, API/UI and validation. First implementation
+substep: add the separate core contract in `app/models/fundamental_package.py`
+and `tests/unit/test_fundamental_package.py`, retaining v1 behavior and leaving
+callers unchanged until subsequent steps pass.
+
+Live operational context: the preview at `http://127.0.0.1:15173/` was switched
+from the demo to the live API on port 18765. It uses
+`data/jarvis_live_preview_20261026.duckdb` because the original database failed
+startup expired-snapshot cleanup with an index error. Tijori connected. Direct
+stable database/WAL snapshot inspection found TCS's eleven financial documents,
+three partial snapshots and one peer document; September 2026 appears in both
+quarterly documents. Benchmarking and committed full packages were absent.
+The UI also reported filing validation and LLM credential failures. None of
+these failures was repaired by this planning step.
+
+Validation: documentation consistency review and `git diff --check` only;
+runtime tests and live calls were not needed for these document edits. Existing
+wake-UI edits are preserved. All changes remain unstaged and uncommitted.
+Single next step: implement and test the new company-core domain contract.
+
+## Clickable wake-phrase quick start — 2026-10-26
+
+The dormant browser console now shows a distinct quick-start panel: a prominent
+`Hey Jarvis` activation button and two clickable research examples for Reliance
+and TCS. All buttons use the existing authenticated text-conversation flow and
+remain disabled until session credentials are available. The panel disappears
+when the conversation leaves standby. Speech still requires opt-in Voice input;
+this change adds no acoustic wake-word engine or backend behavior.
+
+Changed implementation: `frontend/app/page.tsx` and
+`frontend/app/globals.css`. Validation: 75/75 frontend tests, production build,
+TypeScript, page ESLint and whitespace checks passed. Six normal browser clicks
+at 1600px and 390px verified activation and exact example submission against a
+synthetic local API, with no page errors or horizontal overflow. Desktop and
+mobile screenshots were inspected. Python tests were not repeated because no
+Python implementation changed. No live provider calls were made.
+
+Local verification preview: `http://127.0.0.1:15173/`, backed by a temporary demo
+API on port 18765; it does not provide live investment research. Preview scripts
+and screenshots reside in `/private/tmp`, outside the repository. Changes remain
+unstaged and uncommitted. Next step: user review of the quick-start UI.
 
 ## PR #3 merge preparation — 2026-10-26
 

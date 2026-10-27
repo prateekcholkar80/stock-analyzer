@@ -7,6 +7,200 @@ Created: 2026-09-12
 Scope: Jarvis procedural learning, deterministic fundamental analysis, and
 bounded fundamental evidence for Bull, Bear, and Senior Judge
 
+## Approved filing boundary — collection first, offline analysis (2026-10-27)
+
+The user has approved separating filing collection from analytical preparation.
+This is the next implementation contract, not implemented behavior in the
+current checkpoint. It supersedes any earlier proposal that requires successful
+PDF text/table extraction or reporting-period validation before declaring
+document collection complete.
+
+The Tijori refresh path must discover supported filing links, retain scoped
+source identifiers/URLs, skip intact previously downloaded documents, and
+download and durably store unseen or locally damaged files. Preserve source
+metadata, content hashes, original download time and individual acquisition
+timestamps. File-type/structure, size, path, tenant isolation and integrity
+checks remain acquisition safeguards. Do not perform semantic text/table
+extraction, chunking, indexing or analytical validation in this request path.
+
+Treat Tijori's supplied label as accepted source metadata for collection. Keep
+it unchanged; any discrepancy with PDF content is downstream metadata, not
+grounds to reject the stored document or repeat its download. Source acceptance
+does not establish independently verified reporting periods or decision-grade
+financial claims.
+
+A separate offline/background worker reads retained PDFs and performs native
+text/table extraction, meaningful chunking, indexing and citation preparation.
+Large detected cells or merged description columns must be segmented without
+silently truncating content. The current 10,000-character cell bound must not
+determine document validity or collection success. Worker resource bounds may
+produce an explicit partial/failed analytical status, independently retryable
+without provider access or redownloading the PDF.
+
+Track collection status and analysis readiness separately. A stored, intact
+document remains successfully collected while analytical preparation is pending,
+partial or failed. Expose only prepared, traceable evidence to downstream
+analysis; do not represent omitted tables as complete. Version worker policies
+and bind outputs to the scoped artifact/content hash, physical page, source
+region and chunk identity. Reprocessing preserves immutable source history.
+
+Implementation sequence:
+1. Introduce versioned collection receipts and separate analytical job/status
+   records; preserve existing filing-package readers and historical audits.
+2. Make refresh publish the collection result and enqueue durable, idempotent
+   offline work without waiting for analytical preparation.
+3. Move extraction/validation to the worker and improve table segmentation,
+   including the retained March 2025 TCS pages 11, 17 and 19.
+4. Present collection success separately from analytical readiness and validate
+   job retries, source isolation, unchanged download timestamps and citations.
+
+Checkpoint limitation: the current coordinator still performs extraction and
+release validation inline. This check-in records that transitional state; it
+does not claim the separation above has already been implemented.
+
+## Current priority — company-first research contract (2026-10-26)
+
+The user has set the sequence: **Phase 1 analyzes the individual company;
+Phase 2 compares it with peers.** This section supersedes older planning text
+that makes peer comparison and benchmarking mandatory for every analysis.
+It is the implementation specification, not a claim that runtime behavior has
+changed. The deployed package remains the strict 16-dataset v1 contract until
+the steps below are implemented and validated.
+
+### Phase 1 package contract
+
+Introduce a separate versioned company-analysis package/manifest contract with
+profile `company_core` and completeness policy `company_core.v1`. Preserve the
+existing v1 full-package reader and its sixteen-slot semantics. The new wire
+schema, profile, policy version and exact source bindings must participate in
+the manifest fingerprint and package identity.
+
+| Required company dataset | Reporting basis | Slots |
+|---|---|---:|
+| Company overview | Not applicable | 1 |
+| Financial statements summary | Not applicable | 1 |
+| Shareholding history | Not applicable | 1 |
+| Growth table | Not applicable | 1 |
+| Balance sheet | Consolidated and standalone | 2 |
+| Profit and loss | Consolidated and standalone | 2 |
+| Cash flow | Consolidated and standalone | 2 |
+| Ratios | Consolidated and standalone | 2 |
+| Quarterly results | Consolidated and standalone | 2 |
+| **Company-core total** | | **14** |
+
+Peer comparison and benchmarking financials are not required slots and must
+not be fetched as prerequisites for Phase 1. Their absence, expiry or retrieval
+failure cannot prevent company-core publication. Existing comparison records
+remain stored; do not delete, relabel or silently substitute them.
+
+This is the narrow first change: keep the existing company-data requirements,
+remove the two cross-company dependencies, and version the boundary. It does
+not establish that every supported issuer will supply both reporting bases.
+Absent company slots must remain explicit failures under this initial policy;
+sector/basis-specific applicability policies require a later explicit design,
+not fabricated standalone/consolidated records.
+
+Publication remains atomic. Required artifacts must satisfy existing identity,
+tenant/connection, request, freshness, validation and lineage constraints.
+Failed refreshes cannot replace a valid active core package. Select active
+packages by scope AND profile so core and full/comparison products cannot
+overwrite or masquerade as each other. Preserve old fingerprints and payloads;
+do not silently convert a v1 package by dropping two manifest items.
+
+`Core package complete` describes the artifact boundary, not complete knowledge
+of the company. Preserve source-level partial states and missing cells. Release
+each metric/check only if its exact inputs pass reporting-basis, unit, period,
+availability and conflict validation. Missing data returns `NA`/withheld, never
+a pass or an improved score. A stored `Sep 2026` label alone is not enough to
+infer quarter versus TTM, fiscal dates or historical publication availability.
+
+### Phase 1 analytical scope and failure boundaries
+
+- Analyze supported company growth, profitability, capital efficiency,
+  liquidity, leverage, cash conversion, working capital, ownership and
+  earnings-quality/forensic review flags.
+- Normalize and assess only an immutable committed eligible core package.
+  Version normalization/source-binding policies for the new profile; do not
+  bypass package validation by directly reading arbitrary cached documents.
+- Use company-specific valuation evidence only where an existing approved
+  policy supports it. Peer percentiles, relative valuation, sector leadership
+  and claims of superiority remain withheld during Phase 1.
+- Keep mandatory checks independent of framework scores. Frameworks may be
+  partially applicable; no rescaling that rewards unavailable comparison data.
+- Filings are separately versioned, cited evidence. Filing extraction or LLM
+  failure must not roll back a committed core package. Withhold affected filing
+  conclusions and report that stage separately. Management quality, moat and
+  other qualitative claims require sufficient approved documentary evidence.
+- Preserve fundamental shadow-mode restrictions, secondary-source posture,
+  technical trade-release gates and explicit no-conclusion outcomes. This
+  change does not authorize fundamental scores to influence trades.
+
+Phase 2 will define comparison coverage, comparable peer selection, aligned
+periods/bases/units and any unique contribution of detailed benchmarking. Do
+not assume both comparison feeds are indispensable, interchangeable or
+independent evidence. Attach a separately fingerprinted comparison result to
+an exact core package without mutating it.
+
+### Implementation sequence
+
+Each numbered item is a logical milestone. Before editing, split that milestone
+into explicit substeps of at most two files and validate each substep. The first
+substep is fixed below; later file pairs must follow the discovered dependency
+map rather than hiding a broad change inside one step.
+
+1. **Add the core domain contract, without switching callers.** Active file
+   pair: `app/models/fundamental_package.py` and
+   `tests/unit/test_fundamental_package.py`. Add a separately versioned core
+   manifest/package, fourteen exact slots and profile-aware fingerprints.
+   Retain v1 parsing and validation. Prove rejection of missing/duplicate slots,
+   mixed issuers/bases/tenants and inconsistent source bindings.
+2. **Add persistence compatibility.** Update repository ports, in-memory and
+   DuckDB adapters in separate implementation/test pairs. Support profile-aware
+   active pointers and new payload readers. Test migration/reopen against v1
+   records, rollback compatibility and atomic replacement on failed refresh.
+3. **Change company refresh orchestration.** Update the evidence coordinator
+   and browser runner in separate substeps. Publish core artifacts without
+   invoking peer/benchmarking retrieval. Preserve explicit refresh and cache
+   semantics, individual failure outcomes and old full-package compatibility.
+4. **Wire deterministic assessment and explanation.** Update normalization,
+   source binding, framework applicability and analyst contracts as required.
+   Compare unchanged company metrics against equivalent full-package fixtures;
+   assert that no peer claim or score is invented when comparisons are absent.
+5. **Expose truthful API/UI state.** Version package references/projections and
+   update frontend parsers/rendering in bounded substeps. Show `Company data
+   committed · 14 datasets`, independent analyst/filing status and `Peer
+   comparison deferred`. Never show `Complete 16-dataset package` for a core
+   result. Preserve rendering/reading of historical v1 results.
+6. **Validate the complete flow and update baseline.** Test fresh cache reuse,
+   missing/expired core slots, partial content, auth failure, failed refresh,
+   unsupported basis/sector, comparison outage and analyst/filing failure.
+   Verify source isolation, unchanged trade gates and no comparison calls in
+   Phase 1. Update `docs/current-baseline.md` only after implementation.
+
+Run directly affected tests per substep and subsystem checks plus whitespace
+checks per completed milestone. Before staging, run the full Python suite and
+frontend suite/build/type checks for changed UI/API contracts. Live retrieval
+is separate and requires explicit authorization; do not repeatedly run it as
+part of deterministic validation. No staging, commit, push or deployment is
+included in this plan.
+
+### Acceptance and current evidence
+
+Phase 1 succeeds when a valid fourteen-slot company-core package commits and
+becomes active even with no competitor/benchmarking data, supported company
+assessment runs from it, and unsupported conclusions remain withheld. Missing
+required core artifacts must still prevent activation. Existing v1 records
+remain readable with their original identities. UI and audit distinguish data
+publication, calculation coverage, filings and analyst explanation.
+
+The TCS live database inspection on 2026-10-26 found eleven structured financial
+documents (including consolidated and standalone September 2026 quarterly
+results), three partial snapshots, one peer-comparison document, no benchmarking
+record and no committed full package. This reproduces the over-broad publication
+dependency; it does not prove that the stored partial snapshots satisfy every
+future core assessment. Benchmarking retrieval, the existing database index
+error, filing validation and rejected LLM credentials are separate issues.
+
 ## 1. Objective
 
 Deliver two connected capabilities without weakening Jarvis's existing

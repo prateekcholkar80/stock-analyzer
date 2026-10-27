@@ -73,6 +73,43 @@ def _request(
 
 
 class BrowserOperationModelTests(unittest.TestCase):
+    def test_failed_research_retains_package_without_fabricating_response(self):
+        failure = BrowserOperationFailure(code="market.unavailable", message="History unavailable", retryable=True)
+        reference = BrowserFundamentalPackageReference(
+            package_id="fundamental_package:" + "a" * 64,
+            manifest_fingerprint="a" * 64, expires_at=T0 + timedelta(days=10),
+        )
+        output = BrowserOperationOutput(
+            operation_id="operation-1", session_id="session-1",
+            kind=BrowserOperationKind.SWING_ANALYSIS, completed_at=T0,
+            research_failure=failure, fundamental_package_reference=reference,
+            filing_failure=BrowserOperationFailure(
+                code="fundamentals.filings_unavailable", message="Filing validation failed", retryable=False,
+            ),
+        )
+        request = _request().model_copy(update={"fundamentals_requested": True, "refresh_requested": True})
+        snapshot = BrowserOperationSnapshot(
+            request=request, status=BrowserOperationStatus.FAILED,
+            updated_at=T0, failure=failure, result_available=True,
+        )
+        audit = BrowserOperationAuditLog(
+            operation=snapshot, result=output,
+            fundamental_package_publication=BrowserFundamentalPackagePublicationOutcome(reference=reference),
+        )
+        self.assertEqual(audit.result.fundamental_package_reference, reference)
+        self.assertIsNone(audit.result.research_response)
+        self.assertEqual(audit.result.filing_failure.message, "Filing validation failed")
+        with self.assertRaises(ValidationError):
+            BrowserOperationOutput.model_validate({
+                **output.model_dump(exclude_computed_fields=True),
+                "presentation_failure": failure,
+            })
+        with self.assertRaises(ValidationError):
+            BrowserOperationAuditLog(
+                operation=snapshot.model_copy(update={"failure": failure.model_copy(update={"code": "other.failure"})}),
+                result=output, fundamental_package_publication=audit.fundamental_package_publication,
+            )
+
     def test_agent_execution_outcome_is_immutable_and_terminal(self):
         completed = BrowserAgentExecutionOutcome(
             invocation_id="technical.daily_analyst",
@@ -686,6 +723,18 @@ class InMemoryBrowserOperationRegistryTests(unittest.TestCase):
                 failure.model_copy(update={"code": "different.failure"}),
                 at=T0 + timedelta(seconds=3),
             )
+
+    def test_failed_operation_can_retain_independent_results(self):
+        self.registry.submit(_request())
+        self.registry.mark_running("operation-1", at=T0 + timedelta(seconds=1))
+        failure = BrowserOperationFailure(code="market.unavailable", message="History unavailable")
+        snapshot = self.registry.mark_failed(
+            "operation-1", failure, at=T0 + timedelta(seconds=2), result_available=True,
+        )
+        self.assertEqual(snapshot.status, BrowserOperationStatus.FAILED)
+        self.assertTrue(snapshot.result_available)
+        self.assertEqual(snapshot.failure, failure)
+        self.assertIsNone(self.registry.get_session("session-1").active_operation_id)
 
     def test_rejects_illegal_transitions_time_reversal_and_event_gaps(self):
         self.registry.submit(_request())

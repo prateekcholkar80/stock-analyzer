@@ -333,6 +333,14 @@ def _safe_failure(
     result: BrowserOperationOutput | None,
     operation_failure: BrowserOperationFailure | None,
 ) -> BrowserOperationFailure:
+    if event.activity.participant_id == "fundamentals.corporate_filings_analyst":
+        if result is not None and result.filing_failure is not None:
+            return result.filing_failure
+        return BrowserOperationFailure(
+            code="fundamentals.filings_unavailable",
+            message=event.message,
+            retryable=False,
+        )
     if result is not None:
         if (
             event.activity.participant_id
@@ -355,6 +363,10 @@ def _safe_failure(
             and result.decision_failure is not None
         ):
             return result.decision_failure
+    if event.activity.participant_id == _FUNDAMENTAL.participant_id:
+        return BrowserOperationFailure(
+            code="fundamentals.unavailable", message=event.message, retryable=False,
+        )
     if operation_failure is not None:
         return operation_failure
     return BrowserOperationFailure(
