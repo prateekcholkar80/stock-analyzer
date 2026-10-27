@@ -1813,6 +1813,97 @@ shared-permission, wrong-owner, or identical root fails closed. The local
 runtime uses distinct pre-existing mode-0700 directories. PDF bytes remain on
 the filesystem and outside DuckDB and browser responses.
 
+As of 2026-10-27, filing acquisition reuses retained documents by scoped source
+identity. The bridge's category-and-URL-derived reference ID is looked up within
+the tenant, provider connection and issuer; reuse additionally requires the
+same exact source URL/category and a verified owner-only local file with its
+original byte length and SHA-256. Rediscovery labels, reporting period and
+operation timestamps do not force another download. Original discovery,
+download and provider-check metadata are retained unchanged. Company refresh
+rediscovers links; it does not force a download of an intact known URL.
+
+Re-download provenance (2026-10-27): when a new acquisition has an earlier
+retained record for the same scoped URL/reference, the coordinator writes an
+artifact v2 manifest with `original_downloaded_at` equal to the earliest known
+download time. `downloaded_at` continues to describe this particular download.
+The original timestamp is carried forward across repeated downloads, including
+changed bytes at the same URL; it describes source history, not the age of new
+content. Different URLs/scopes cannot inherit it. Old artifacts remain immutable.
+For a first download or a legacy v1 artifact, `first_downloaded_at` falls back to
+its existing `downloaded_at`. The absent optional field is omitted from legacy
+serialization and fingerprints, preserving existing stored identities. New
+original timestamps require v2, must be timezone-aware, cannot follow the current
+download, and are included in the new artifact fingerprint. No table migration
+or historical data rewrite is required. The guarantee depends on retaining the
+source's download metadata; deleted history cannot be reconstructed.
+
+Filing recovery (2026-10-27): imports count the parsed PDF page tree, not raw
+page-object markers. Production composition injects local page-count
+reconciliation before artifact/evidence storage. It verifies retained bytes,
+returns a new manifest identity only when the count differs, and preserves the
+original record and download provenance. The coordinator rejects changes to any
+other manifest field. Extraction policy v1.5.0 retains native text when a detected
+table cell exceeds its 10,000-character limit and records a material table
+limitation instead of aborting the whole extraction. Validation v1.4.0 checks
+reporting-period anchors across all physical pages, rejects explicit reporting
+dates later than an unclassified provider month, and blocks release for material
+extraction limitations. Issuer identification still uses the opening three
+pages. These checks do not alter URL-based download eligibility.
+
+Benchmarking currency normalization accepts `Cr`, `Crs` and dotted variants as
+INR crore without changing the retained source text. The failure was reproduced
+through an authorized full-adapter TCS diagnostic and fixed with synthetic
+regressions. The final affected subsystem suite passed 855 tests; this is not a
+new complete-regression baseline. The authorized 2026-10-27 backend restart and
+single TCS refresh loaded these changes and persisted the recovery: all 34
+sources have extraction records (32 releaseable), September's corrected manifest
+retains its original bytes/time, and benchmarking stored 3 companies/39 rows.
+A complete 16-dataset fundamental package committed at 10:05:34 IST. The separate
+filing package remains withheld for January's period conflict and March's
+material table limitations. The overall analysis failed on Angel One market
+history; its audit omitted the package-publication result despite the database
+commit. This was an orchestration/observability issue, not a missing
+benchmarking dataset; the subsequent retained-result implementation below
+addresses future operations without rewriting that historical audit.
+
+Independent-result retention (2026-10-27): a handled market/research exception
+after fundamental work starts no longer discards the worker's committed package
+reference. The handler collects its result and saves a partial browser output
+with `research_failure` before marking the operation FAILED. Failed snapshots
+may expose `result_available`; audit validation binds their retained research
+failure to the operation failure. Partial outputs cannot include a research
+response or conclusion. Fundamental Analyst and filing failures remain separate;
+`filing_failure` retains the safe message and retryability. The outcome ledger
+does not substitute a global market error for these independent activities.
+
+Authenticated audit/result and reference-bound document endpoints can expose
+these retained outputs. Dashboard generation still requires completed analysis.
+The frontend reads partial results on failure and shows package publication
+alongside the market/analyst errors without requesting a dashboard. Historical
+failed operations without retained outputs are not reconstructed automatically.
+Validation: 951 affected Python tests, frontend build/75 tests, TypeScript,
+scoped page lint and synthetic browser verification passed. Global frontend
+lint has five existing errors in unchanged AnimatedAgent3D.tsx. This change has
+not been loaded into the live backend; it makes no change to broker rate limits.
+
+The coordinator processes remaining discovered documents after independent
+download, storage or extraction/validation failures. Successfully saved artifact
+metadata retains the URL and stable reference ID even when analysis validation
+fails. Failed downloads have no successful artifact entry and remain eligible
+for acquisition on rediscovery. No separate durable discovery-attempt journal
+has been added. Existing discovery category and document-count bounds remain.
+
+Filing package v2 permits references to these older, source-identical artifacts
+without rebinding their provenance. V1 payloads retain their stricter original
+validation and remain readable. The v2 package recheck window schedules another
+discovery; it is not a claim that remote PDF bytes were checked again. A remote
+replacement at an unchanged URL is not detected by local integrity verification.
+The existing analytical package still publishes only when every required
+document passes release validation. An unknown period cannot stop downloading
+other PDFs, but remains an analytical limitation. The legacy outcome reports
+the first failure after all bounded candidates have been attempted; per-file
+artifact/evidence records remain durable. No new UI status contract is included.
+
 `InMemoryFundamentalFilingRepository` is the reference implementation of the
 database-neutral filing persistence port. It keeps artifact metadata and full
 filing packages as defensive immutable copies, scopes every read by tenant,

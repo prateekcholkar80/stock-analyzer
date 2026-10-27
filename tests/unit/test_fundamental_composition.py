@@ -513,6 +513,14 @@ class TijoriFundamentalCompositionTests(unittest.TestCase):
             )
             self.assertIs(coordinator._filing_repository, storage)
             self.assertIs(coordinator._evidence_repository, storage)
+            self.assertEqual(
+                coordinator._artifact_verifier,
+                coordinator._extractor.artifact_is_intact,
+            )
+            self.assertEqual(
+                coordinator._artifact_reconciler,
+                coordinator._extractor.reconcile_page_count,
+            )
             self.assertIsInstance(
                 coordinator._extractor,
                 DeterministicFundamentalFilingExtractor,

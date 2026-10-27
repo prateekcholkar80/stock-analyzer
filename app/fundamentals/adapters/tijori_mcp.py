@@ -196,8 +196,6 @@ _STATUS_LIMITATIONS = {
     ),
 }
 _PDF_HEADER_PATTERN = re.compile(rb"^%PDF-([0-9]+(?:\.[0-9]+)?)")
-_PDF_PAGE_PATTERN = re.compile(rb"/Type\s*/Page(?!s)\b")
-_PDF_SCAN_OVERLAP = 64
 _PDF_EOF_TAIL_BYTES = 1_024
 _MAXIMUM_FILING_BYTES = 100_000_000
 _MAXIMUM_FILING_PAGES = 5_000
@@ -414,9 +412,7 @@ class TijoriFilingArtifactImporter:
         digest = sha256()
         byte_length = 0
         header = b""
-        overlap = b""
         eof_tail = b""
-        page_count = 0
         destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         destination_descriptor = os.open(
             temporary_path,
@@ -436,16 +432,6 @@ class TijoriFilingArtifactImporter:
                     target.write(chunk)
                     if len(header) < 32:
                         header = (header + chunk)[:32]
-                    scanned = overlap + chunk
-                    overlap_length = len(overlap)
-                    page_count += sum(
-                        1
-                        for match in _PDF_PAGE_PATTERN.finditer(scanned)
-                        if match.end() > overlap_length
-                    )
-                    if page_count > _MAXIMUM_FILING_PAGES:
-                        raise ValueError("staged filing exceeds the page limit")
-                    overlap = scanned[-_PDF_SCAN_OVERLAP:]
                     eof_tail = (eof_tail + chunk)[-_PDF_EOF_TAIL_BYTES:]
                 target.flush()
                 os.fsync(destination_descriptor)
@@ -457,10 +443,9 @@ class TijoriFilingArtifactImporter:
             raise ValueError("staged filing failed PDF structure validation")
         if byte_length != expected_length or digest.hexdigest() != expected_hash:
             raise ValueError("staged filing content metadata does not match")
-        if page_count < 1:
-            page_count = TijoriFilingArtifactImporter._parsed_pdf_page_count(
-                temporary_path
-            )
+        page_count = TijoriFilingArtifactImporter._parsed_pdf_page_count(
+            temporary_path
+        )
         return {
             "page_count": page_count,
             "pdf_version": header_match.group(1).decode("ascii"),
@@ -468,7 +453,7 @@ class TijoriFilingArtifactImporter:
 
     @staticmethod
     def _parsed_pdf_page_count(path: Path) -> int:
-        """Count pages when compressed object streams hide raw page markers."""
+        """Count the page tree, excluding obsolete objects and embedded markers."""
 
         try:
             with pdfplumber.open(path) as document:
@@ -1692,7 +1677,7 @@ class TijoriMcpAdapter(
         if any("%" in value for value in values):
             return FundamentalValueKind.PERCENTAGE, "percent", "percent"
         if any(
-            "₹" in value or value.casefold().endswith(" cr")
+            "₹" in value or re.search(r"\s+crs?\.?\s*\)?$", value, re.I)
             for value in values
         ):
             return FundamentalValueKind.MONETARY, "INR crore", "INR crore"
@@ -1720,7 +1705,8 @@ class TijoriMcpAdapter(
             accounting_negative = numeric.startswith("(") and numeric.endswith(")")
             if accounting_negative:
                 numeric = numeric[1:-1].strip()
-            for suffix in ("cr", "days", "day", "x"):
+            numeric = re.sub(r"\s+crs?\.?$", "", numeric, flags=re.I).strip()
+            for suffix in ("days", "day", "x"):
                 if numeric.casefold().endswith(suffix):
                     numeric = numeric[: -len(suffix)].strip()
                     break

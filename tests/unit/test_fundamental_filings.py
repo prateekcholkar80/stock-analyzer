@@ -244,6 +244,31 @@ class FundamentalFilingDiscoveryTests(unittest.TestCase):
 
 
 class FundamentalFilingArtifactTests(unittest.TestCase):
+    def test_original_download_metadata_is_versioned_and_legacy_safe(self):
+        old = artifact()
+        self.assertEqual(old.first_downloaded_at, DOWNLOADED_AT)
+        self.assertNotIn("original_downloaded_at", old.model_dump(mode="json"))
+        later = DOWNLOADED_AT + timedelta(days=2)
+        new = artifact(
+            schema_version="jarvis.fundamental_filing_artifact.v2",
+            original_downloaded_at=DOWNLOADED_AT,
+            downloaded_at=later, last_checked_at=later,
+            recheck_after=later + timedelta(days=10),
+        )
+        self.assertEqual(new.first_downloaded_at, DOWNLOADED_AT)
+        self.assertEqual(new.downloaded_at, later)
+        self.assertNotEqual(new.artifact_id, old.artifact_id)
+        self.assertEqual(FundamentalFilingArtifactManifest.model_validate_json(
+            new.model_dump_json(exclude_computed_fields=True),
+        ), new)
+        with self.assertRaisesRegex(ValidationError, "requires artifact v2"):
+            artifact(original_downloaded_at=DOWNLOADED_AT)
+        with self.assertRaisesRegex(ValidationError, "cannot follow"):
+            artifact(
+                schema_version="jarvis.fundamental_filing_artifact.v2",
+                original_downloaded_at=later,
+            )
+
     def test_is_content_addressed_and_uses_ten_day_recheck(self):
         result = artifact()
 
@@ -275,6 +300,47 @@ class FundamentalFilingArtifactTests(unittest.TestCase):
 
 
 class FundamentalFilingPackageTests(unittest.TestCase):
+    def test_v2_reuses_original_download_across_rediscovery(self):
+        old = package()
+        later = COMMITTED_AT + timedelta(days=12)
+        new_reference = reference(
+            discovered_at=later,
+            source_discovery_fingerprint="c" * 64,
+            title="Rediscovered filing",
+        )
+        found = discovery(references=(new_reference,), discovered_at=later)
+        manifest = FundamentalFilingPackageManifest(
+            operation_id="operation-rediscovery",
+            connection=old.manifest.connection,
+            issuer=old.manifest.issuer,
+            requested_at=later,
+            committed_at=later,
+            discovery_fingerprint=found.discovery_fingerprint,
+            artifact_ids=old.manifest.artifact_ids,
+            recheck_after=later + timedelta(days=10),
+        )
+        current = FundamentalFilingPackage(
+            schema_version="jarvis.fundamental_filing_package.v2",
+            manifest=manifest, discovery=found, artifacts=old.artifacts,
+        )
+        self.assertEqual(current.artifacts, old.artifacts)
+        with self.assertRaises(ValidationError):
+            FundamentalFilingPackage(
+                manifest=manifest, discovery=found, artifacts=old.artifacts,
+            )
+        changed = discovery(references=(reference(
+            discovered_at=later, artifact_url="https://example.com/other.pdf",
+        ),), discovered_at=later)
+        changed_manifest = manifest.model_copy(update={
+            "discovery_fingerprint": changed.discovery_fingerprint,
+        })
+        with self.assertRaisesRegex(ValidationError, "discovered reference"):
+            FundamentalFilingPackage(
+                schema_version="jarvis.fundamental_filing_package.v2",
+                manifest=changed_manifest, discovery=changed,
+                artifacts=old.artifacts,
+            )
+
     def test_releases_complete_atomic_package_and_defensive_dump(self):
         result = package()
         dumped = result.model_dump(mode="json")

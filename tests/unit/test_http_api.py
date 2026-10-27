@@ -1124,7 +1124,7 @@ class JarvisHttpApiTests(unittest.TestCase):
         )
         self.assertEqual(body["result"]["operation_id"], "operation-1")
 
-    def test_audit_shows_committed_package_and_failed_analyst_separately(self):
+    def test_audit_shows_committed_package_and_failed_analyst_separately(self, market_failed=False):
         session_id, token = self._session()
         at = datetime.now(IST)
         operation_id = "operation-package-analyst-failed"
@@ -1179,8 +1179,7 @@ class JarvisHttpApiTests(unittest.TestCase):
             retryable=False,
             operation_id=operation_id,
         )
-        self.results.save(
-            BrowserOperationOutput(
+        output = BrowserOperationOutput(
                 operation_id=operation_id,
                 session_id=session_id,
                 kind=BrowserOperationKind.SWING_ANALYSIS,
@@ -1201,8 +1200,18 @@ class JarvisHttpApiTests(unittest.TestCase):
                     retryable=False,
                 ),
             )
-        )
-        self.registry.mark_completed(operation_id, at=at + timedelta(seconds=5))
+        if market_failed:
+            failure = BrowserOperationFailure(code="market.unavailable", message="Market history unavailable", retryable=True)
+            output = BrowserOperationOutput.model_validate({
+                **output.model_dump(exclude_computed_fields=True),
+                "research_response": None, "decision_failure": None,
+                "research_failure": failure,
+            })
+        self.results.save(output)
+        if market_failed:
+            self.registry.mark_failed(operation_id, failure, at=at + timedelta(seconds=5), result_available=True)
+        else:
+            self.registry.mark_completed(operation_id, at=at + timedelta(seconds=5))
 
         response = self.client.get(
             f"/api/v1/sessions/{session_id}/operations/{operation_id}/audit",
@@ -1225,6 +1234,24 @@ class JarvisHttpApiTests(unittest.TestCase):
             outcomes["fundamentals.fundamental_analyst"]["failure"]["code"],
             "fundamentals.analyst_unavailable",
         )
+        if market_failed:
+            self.assertEqual(body["operation"]["status"], "failed")
+            self.assertEqual(body["result"]["research_failure"]["code"], "market.unavailable")
+            self.assertIsNone(body["result"]["research_response"])
+            result_response = self.client.get(
+                f"/api/v1/sessions/{session_id}/operations/{operation_id}/result",
+                headers=self._headers(token),
+            )
+            self.assertEqual(result_response.status_code, 200)
+            self.assertEqual(result_response.json()["output"]["fundamental_package_reference"]["package_id"], reference.package_id)
+            dashboard = self.client.get(
+                f"/api/v1/sessions/{session_id}/operations/{operation_id}/dashboard",
+                headers=self._headers(token),
+            )
+            self.assertEqual(dashboard.status_code, 409)
+
+    def test_market_failure_audit_preserves_committed_package(self):
+        self.test_audit_shows_committed_package_and_failed_analyst_separately(market_failed=True)
 
     def test_failed_operation_audit_identifies_exact_agent(self):
         session_id, token = self._session()

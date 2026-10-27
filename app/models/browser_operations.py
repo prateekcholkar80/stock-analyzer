@@ -377,8 +377,8 @@ class BrowserOperationSnapshot(TechnicalModel):
                 raise ValueError(
                     "completed operation requires only an available result"
                 )
-        elif self.result_available:
-            raise ValueError("only completed operations may expose a result")
+        elif self.result_available and self.status is not BrowserOperationStatus.FAILED:
+            raise ValueError("only completed or failed operations may expose a result")
         if self.status is BrowserOperationStatus.FAILED:
             if self.failure is None:
                 raise ValueError("failed operation requires a safe failure")
@@ -577,7 +577,9 @@ class BrowserOperationOutput(TechnicalModel):
     judge_follow_up: JudgeFollowUpAnswer | None = None
     presentation_failure: BrowserOperationFailure | None = None
     decision_failure: BrowserOperationFailure | None = None
+    research_failure: BrowserOperationFailure | None = None
     fundamental_failure: BrowserOperationFailure | None = None
+    filing_failure: BrowserOperationFailure | None = None
     fundamental_evidence: tuple[FundamentalEvidenceLoadResult, ...] = Field(
         default=(),
         max_length=3,
@@ -604,11 +606,17 @@ class BrowserOperationOutput(TechnicalModel):
     @model_validator(mode="after")
     def validate_kind_payload(self) -> Self:
         if self.kind is BrowserOperationKind.SWING_ANALYSIS:
-            if self.research_response is None:
+            if self.research_failure is not None:
+                if any(value is not None for value in (
+                    self.research_response, self.research_explanation,
+                    self.presentation_failure, self.decision_failure,
+                )):
+                    raise ValueError("research failure cannot contain a research conclusion")
+            elif self.research_response is None:
                 raise ValueError("swing analysis output requires its response")
-            if self.research_response.operation_id != self.operation_id:
+            if self.research_response is not None and self.research_response.operation_id != self.operation_id:
                 raise ValueError("research response operation ID must match")
-            has_analysis = self.research_response.result is not None
+            has_analysis = self.research_response is not None and self.research_response.result is not None
             has_explanation = self.research_explanation is not None
             has_presentation_failure = self.presentation_failure is not None
             if has_analysis:
@@ -622,7 +630,7 @@ class BrowserOperationOutput(TechnicalModel):
                         "swing output requires either an explanation or a "
                         "presentation failure"
                     )
-            else:
+            elif self.research_failure is None:
                 llm_failure = self.research_response.failure
                 if llm_failure is None or self.decision_failure is None:
                     raise ValueError(
@@ -733,7 +741,9 @@ class BrowserOperationOutput(TechnicalModel):
                     self.research_explanation,
                     self.presentation_failure,
                     self.decision_failure,
+                    self.research_failure,
                     self.fundamental_failure,
+                    self.filing_failure,
                 )
             ):
                 raise ValueError(
@@ -925,6 +935,12 @@ class BrowserOperationAuditLog(TechnicalModel):
             raise ValueError(
                 "operation audit result identity must match its operation"
             )
+        if self.result is not None:
+            if self.operation.status is BrowserOperationStatus.FAILED:
+                if self.result.research_failure != self.operation.failure:
+                    raise ValueError("failed audit result must retain its research failure")
+            elif self.result.research_failure is not None:
+                raise ValueError("research failure requires a failed operation")
         expected_package = (
             self.result.fundamental_package_reference
             if self.result is not None

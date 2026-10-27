@@ -139,7 +139,7 @@ _ROSTER_ROLES = {
 
 DEFAULT_FILING_EXTRACTION_POLICY = FundamentalFilingExtractionPolicy(
     policy_id="filing.extraction.native_pdf",
-    policy_version="1.4.0",
+    policy_version="1.5.0",
     text_engine=_ENGINE_ID,
     table_engine=_ENGINE_ID,
     ocr_enabled=False,
@@ -148,6 +148,10 @@ DEFAULT_FILING_EXTRACTION_POLICY = FundamentalFilingExtractionPolicy(
 
 class FundamentalFilingExtractionError(ValueError):
     """Safe, non-provider-specific failure while extracting a retained PDF."""
+
+
+class _TableCellLimitError(ValueError):
+    """Native text is retained, but the detected table cannot be represented."""
 
 
 class DeterministicFundamentalFilingExtractor:
@@ -168,6 +172,36 @@ class DeterministicFundamentalFilingExtractor:
     @property
     def policy(self) -> FundamentalFilingExtractionPolicy:
         return self._policy.model_copy(deep=True)
+
+    def artifact_is_intact(self, artifact: FundamentalFilingArtifactManifest) -> bool:
+        """Check retained bytes without parsing pages or validating a period."""
+        try:
+            manifest = FundamentalFilingArtifactManifest.model_validate(artifact)
+            path = self._resolve_artifact_path(manifest)
+            self._validate_artifact_file(path, manifest)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def reconcile_page_count(
+        self, artifact: FundamentalFilingArtifactManifest,
+    ) -> FundamentalFilingArtifactManifest:
+        """Return corrected metadata for identical verified bytes; retain history."""
+        manifest = FundamentalFilingArtifactManifest.model_validate(artifact)
+        path = self._resolve_artifact_path(manifest)
+        self._validate_artifact_file(path, manifest)
+        try:
+            with pdfplumber.open(path) as document:
+                page_count = len(document.pages)
+        except (OSError, PDFPasswordIncorrect, PDFSyntaxError, ValueError) as exc:
+            raise FundamentalFilingExtractionError(
+                "Retained PDF page metadata could not be reconciled"
+            ) from exc
+        if page_count == manifest.page_count:
+            return manifest
+        values = manifest.model_dump(exclude_computed_fields=True)
+        values["page_count"] = page_count
+        return FundamentalFilingArtifactManifest.model_validate(values)
 
     def extract(
         self,
@@ -423,7 +457,7 @@ class DeterministicFundamentalFilingExtractor:
                 page_number=page_number,
                 blocks=blocks,
             )
-        except (PdfminerException, PDFSyntaxError, UnicodeError):
+        except (PdfminerException, PDFSyntaxError, UnicodeError, _TableCellLimitError) as exc:
             table_failed = True
             warnings.append(
                 self._warning(
@@ -438,7 +472,7 @@ class DeterministicFundamentalFilingExtractor:
                     page_number,
                     "table_structure_uncertain",
                     "Native table structure is unavailable on this page.",
-                    material=False,
+                    material=isinstance(exc, _TableCellLimitError),
                 )
             )
 
@@ -710,6 +744,10 @@ class DeterministicFundamentalFilingExtractor:
                         raw_text = str(matrix[row_index][column_index] or "").strip()
                     if not raw_text:
                         continue
+                    if len(raw_text) > 10_000:
+                        raise _TableCellLimitError(
+                            "Native table cell exceeds the evidence size bound"
+                        )
                     observed = self._observed_value(
                         raw_text,
                         row_unit or default_unit,

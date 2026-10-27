@@ -1954,6 +1954,62 @@ class JarvisBrowserOperationHandlerTests(unittest.TestCase):
 
 
 class AsyncBrowserOperationRunnerTests(unittest.TestCase):
+    def test_market_failure_retains_committed_package_and_independent_failures(self):
+        clock = _AdvancingClock()
+        packages = InMemoryFundamentalPackageRepository(clock=clock)
+        coordinator = FundamentalEvidenceCoordinator(
+            gateway=_BrowserFundamentalGateway(),
+            repository=InMemoryFundamentalSnapshotRepository(clock=clock),
+            structured_document_repository=InMemoryStructuredFinancialDocumentRepository(clock=clock),
+            benchmarking_financials_repository=InMemoryBenchmarkingFinancialsRepository(clock=clock),
+            peer_comparison_repository=InMemoryPeerComparisonRepository(clock=clock),
+            package_repository=packages, clock=clock,
+        )
+        handler = JarvisBrowserOperationHandler(
+            _ResearchExecutor(failure=MarketDataError("synthetic rate limit")),
+            RecordingPresenter(), RecordingJudgeFollowUpExecutor(), user_name="Test",
+            fundamental_evidence_executor=coordinator,
+            fundamental_filing_evidence_executor=_RecordingFilingEvidenceCoordinator(fail=True),
+            provider_scope_resolver=lambda session_id: build_connection(),
+            fundamental_analyst=_FailingFundamentalAnalyst(), clock=clock,
+        )
+        runner = AsyncBrowserOperationRunner(self.registry, handler, self.results, max_workers=1, clock=clock)
+        request = _request().model_copy(update={"fundamentals_requested": True, "refresh_requested": True})
+        try:
+            runner.submit(request)
+            terminal = _wait_for_terminal(runner, request.operation_id)
+        finally:
+            runner.shutdown()
+        self.assertEqual(terminal.status, BrowserOperationStatus.FAILED)
+        self.assertEqual(terminal.failure.code, "market.unavailable")
+        self.assertTrue(terminal.result_available)
+        output = self.results.get(request.operation_id)
+        self.assertIsNotNone(output.fundamental_package_reference)
+        self.assertEqual(output.research_failure, terminal.failure)
+        self.assertIsNone(output.research_response)
+        self.assertIsNone(output.research_explanation)
+        self.assertEqual(output.fundamental_failure.code, "fundamentals.analyst_unavailable")
+        events = self.registry.replay(WorkflowEventReplayCursor(operation_id=request.operation_id)).events
+        filing_failure = next(e for e in events if e.activity.participant_id == "fundamentals.corporate_filings_analyst" and e.state is WorkflowEventState.FAILED)
+        self.assertEqual(filing_failure.message, "Corporate filing discovery is temporarily unavailable.")
+        self.assertEqual(output.filing_failure.message, filing_failure.message)
+        self.assertTrue(output.filing_failure.retryable)
+        active_package = packages.get_active_fundamental_package(
+            scope=FundamentalPackageRepositoryScope(
+                connection=build_connection(), issuer=output.fundamental_evidence[0].retrieval.issuer,
+            ), as_of=clock(),
+        )
+        self.assertEqual(active_package.package_id, output.fundamental_package_reference.package_id)
+        self.assertEqual(len(active_package.manifest.items), 16)
+        self.assertFalse(any(e.stage is WorkflowStage.COMPLETED for e in events))
+        outcomes = {o.participant_id: o for o in build_agent_execution_outcomes(terminal, events, output)}
+        self.assertEqual(outcomes["fundamentals.fundamental_analyst"].failure, output.fundamental_failure)
+        filing = outcomes["fundamentals.corporate_filings_analyst"].failure
+        self.assertEqual(filing.code, "fundamentals.filings_unavailable")
+        self.assertEqual(filing, output.filing_failure)
+        self.assertEqual(filing.message, filing_failure.message)
+        self.assertNotEqual(filing.code, terminal.failure.code)
+
     def setUp(self):
         self.registry = InMemoryBrowserOperationRegistry()
         at = _now()

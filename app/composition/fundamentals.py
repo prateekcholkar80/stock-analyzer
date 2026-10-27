@@ -581,6 +581,8 @@ def compose_tijori_filing_evidence_coordinator(
         evidence_repository=storage,
         extractor=extractor,
         validator=DeterministicFundamentalFilingEvidenceValidator(),
+        artifact_verifier=extractor.artifact_is_intact,
+        artifact_reconciler=extractor.reconcile_page_count,
         clock=clock,
     )
 

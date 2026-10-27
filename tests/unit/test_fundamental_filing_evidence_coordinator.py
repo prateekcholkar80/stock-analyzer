@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from datetime import timedelta
 
 from app.exceptions import StorageConflictError
@@ -36,6 +38,7 @@ from tests.unit.test_fundamental_filings import (
     artifact,
     discovery,
     package,
+    reference,
 )
 
 
@@ -85,11 +88,34 @@ class StubExtractor:
 
     def extract(self, filing_artifact, *, extracted_at):
         self.calls.append(filing_artifact.artifact_id)
-        return extraction(
-            artifact=filing_artifact,
-            policy=self._policy,
+        template = extraction()
+        bound = tuple(item.model_copy(update={
+            "artifact_id": filing_artifact.artifact_id,
+            "content_sha256": filing_artifact.content_sha256,
+        }) for item in template.citations)
+        identifiers = {
+            old.citation_id: new.citation_id
+            for old, new in zip(template.citations, bound, strict=True)
+        }
+
+        def rebind(value):
+            if isinstance(value, dict):
+                return {
+                    key: tuple(sorted(rebind(item))) if key == "citation_ids"
+                    else rebind(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, (list, tuple)):
+                return type(value)(rebind(item) for item in value)
+            return identifiers.get(value, value) if isinstance(value, str) else value
+
+        values = rebind(template.model_dump(exclude_computed_fields=True))
+        values.update(
+            artifact=filing_artifact, policy=self._policy,
             extracted_at=extracted_at,
+            citations=tuple(sorted(bound, key=lambda item: item.citation_id)),
         )
+        return type(template).model_validate(values)
 
 
 class StubValidator:
@@ -191,6 +217,103 @@ def _stored_record(*, filing_artifact=None):
 
 
 class FundamentalFilingEvidenceCoordinatorTests(unittest.TestCase):
+    def test_redownload_preserves_first_timestamp_after_duckdb_reopen(self):
+        from app.storage.adapters.duckdb import DuckDBJarvisStorage
+
+        old = artifact()
+        class RedownloadGateway(StubGateway):
+            def acquire_filing(self, *, request):
+                self.acquisition_calls.append(request)
+                return FundamentalFilingAcquisitionResult(
+                    **self._response_values(request), issuer=request.issuer,
+                    status=FundamentalRetrievalStatus.COMPLETED,
+                    artifact=artifact(
+                        reference=request.reference,
+                        downloaded_at=NOW, last_checked_at=NOW,
+                        recheck_after=NOW + timedelta(days=10),
+                    ),
+                )
+
+        gateway = RedownloadGateway()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "redownload.duckdb"
+            with DuckDBJarvisStorage(path, clock=lambda: NOW) as storage:
+                storage.save_filing_artifact(old)
+                result = self._coordinator(
+                    gateway=gateway, filing_repository=storage,
+                    evidence_repository=storage,
+                    artifact_verifier=lambda value: False,
+                ).coordinate(_discovery_request(), refresh_requested=True)
+                self.assertEqual(len(gateway.acquisition_calls), 1)
+                self.assertEqual(result.status,
+                    FundamentalFilingEvidenceCoordinationStatus.PACKAGE_PUBLISHED,
+                    result.failure)
+            with DuckDBJarvisStorage(path, clock=lambda: NOW) as storage:
+                versions = storage.list_filing_artifact_versions(
+                    old.reference.filing_reference_id, scope=result.scope,
+                )
+                self.assertEqual(len(versions), 2)
+                self.assertIn(old, versions)
+                latest = next(item for item in versions if item.artifact_id != old.artifact_id)
+                self.assertEqual(latest.original_downloaded_at, old.downloaded_at)
+                self.assertEqual(latest.downloaded_at, NOW)
+                third = artifact(
+                    downloaded_at=NOW + timedelta(minutes=1),
+                    last_checked_at=NOW + timedelta(minutes=1),
+                    recheck_after=NOW + timedelta(days=10),
+                )
+                coordinator = self._coordinator(
+                    filing_repository=storage, evidence_repository=storage,
+                )
+                preserved = coordinator._preserve_original_download(third, scope=result.scope)
+                self.assertEqual(preserved.first_downloaded_at, old.downloaded_at)
+                changed_url = artifact(reference=reference(
+                    artifact_url="https://files.tijorifinance.com/other.pdf",
+                ))
+                self.assertEqual(coordinator._preserve_original_download(
+                    changed_url, scope=result.scope,
+                ), changed_url)
+
+    def test_rediscovered_url_reuse_survives_duckdb_reopen(self):
+        from app.storage.adapters.duckdb import DuckDBJarvisStorage
+
+        old = artifact()
+        found = discovery(references=(reference(
+            discovered_at=NOW, source_discovery_fingerprint="e" * 64,
+        ),), discovered_at=NOW)
+
+        class RediscoveryGateway(StubGateway):
+            def discover_filings(self, *, request):
+                result = super().discover_filings(request=request)
+                return result.model_copy(update={"discovery": found})
+
+        gateway = RediscoveryGateway()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "filings.duckdb"
+            with DuckDBJarvisStorage(path, clock=lambda: NOW) as storage:
+                storage.save_filing_artifact(old)
+                result = self._coordinator(
+                    gateway=gateway, filing_repository=storage,
+                    evidence_repository=storage,
+                    artifact_verifier=lambda value: value == old,
+                ).coordinate(_discovery_request(), refresh_requested=True)
+                self.assertEqual(result.status,
+                    FundamentalFilingEvidenceCoordinationStatus.PACKAGE_PUBLISHED)
+                self.assertEqual(gateway.acquisition_calls, [])
+                self.assertEqual(result.selected_package.artifacts, (old,))
+            with DuckDBJarvisStorage(path, clock=lambda: NOW) as storage:
+                self.assertEqual(storage.get_active_filing_package(
+                    scope=result.scope,
+                ), result.selected_package)
+                again = self._coordinator(
+                    gateway=gateway, filing_repository=storage,
+                    evidence_repository=storage,
+                    artifact_verifier=lambda value: value == old,
+                ).coordinate(_discovery_request(), refresh_requested=True)
+                self.assertEqual(again.status,
+                    FundamentalFilingEvidenceCoordinationStatus.PACKAGE_PUBLISHED)
+                self.assertEqual(gateway.acquisition_calls, [])
+
     def _coordinator(
         self,
         *,
@@ -199,6 +322,8 @@ class FundamentalFilingEvidenceCoordinatorTests(unittest.TestCase):
         evidence_repository=None,
         extractor=None,
         validator=None,
+        artifact_verifier=None,
+        artifact_reconciler=None,
     ):
         return FundamentalFilingEvidenceCoordinator(
             gateway=gateway or StubGateway(),
@@ -212,8 +337,135 @@ class FundamentalFilingEvidenceCoordinatorTests(unittest.TestCase):
             ),
             extractor=extractor or StubExtractor(),
             validator=validator or StubValidator(),
+            artifact_verifier=artifact_verifier,
+            artifact_reconciler=artifact_reconciler,
             clock=lambda: NOW,
         )
+
+    def test_reconciles_retained_metadata_without_download_or_history_rewrite(self):
+        correct = artifact()
+        original = correct.model_copy(update={"page_count": correct.page_count + 1})
+        gateway = StubGateway()
+        repo = InMemoryFundamentalFilingRepository(clock=lambda: NOW)
+        repo.save_filing_artifact(original)
+        coordinator = self._coordinator(
+            gateway=gateway, filing_repository=repo,
+            artifact_verifier=lambda value: True,
+            artifact_reconciler=lambda value: correct,
+        )
+        result = coordinator.coordinate(_discovery_request(), refresh_requested=True)
+        self.assertEqual(gateway.acquisition_calls, [])
+        self.assertIsNotNone(result.selected_package)
+        for manifest in (original, correct):
+            self.assertEqual(repo.get_filing_artifact(
+                manifest.artifact_id, scope=result.scope,
+            ), manifest)
+
+    def test_reconciliation_cannot_change_download_provenance(self):
+        original = artifact()
+        changed = original.model_copy(update={"downloaded_at": NOW})
+        repo = InMemoryFundamentalFilingRepository(clock=lambda: NOW)
+        repo.save_filing_artifact(original)
+        coordinator = self._coordinator(
+            filing_repository=repo, artifact_verifier=lambda value: True,
+            artifact_reconciler=lambda value: changed,
+        )
+        result = coordinator.coordinate(_discovery_request(), refresh_requested=True)
+        self.assertIsNone(result.selected_package)
+        self.assertIsNotNone(result.failure)
+
+    def test_rediscovered_url_reuses_original_pdf_without_rebinding(self):
+        original = artifact()
+        rediscovered = reference(
+            discovered_at=NOW,
+            source_discovery_fingerprint="d" * 64,
+            title="Same PDF discovered again",
+        )
+        class RediscoveryGateway(StubGateway):
+            def discover_filings(self, *, request):
+                result = super().discover_filings(request=request)
+                return result.model_copy(update={"discovery": discovery(
+                    references=(rediscovered,), discovered_at=NOW,
+                )})
+        for intact in (True, False):
+            with self.subTest(intact=intact):
+                gateway = RediscoveryGateway()
+                repo = InMemoryFundamentalFilingRepository(clock=lambda: NOW)
+                repo.save_filing_artifact(original)
+                coordinator = self._coordinator(
+                    gateway=gateway, filing_repository=repo,
+                    artifact_verifier=lambda value: intact,
+                    validator=StubValidator(releaseable=False),
+                )
+                result = coordinator.coordinate(_discovery_request(), refresh_requested=True)
+                self.assertEqual(len(gateway.acquisition_calls), 0 if intact else 1)
+                self.assertEqual(repo.get_filing_artifact(
+                    original.artifact_id,
+                    scope=result.scope,
+                ), original)
+
+    def test_validation_failure_does_not_stop_later_downloads(self):
+        first = reference()
+        second = reference(
+            filing_reference_id="filing.zz.second",
+            artifact_url="https://files.tijorifinance.com/second.pdf",
+        )
+        class MultipleGateway(StubGateway):
+            def discover_filings(self, *, request):
+                result = super().discover_filings(request=request)
+                return result.model_copy(update={"discovery": discovery(
+                    references=(first, second),
+                )})
+        gateway = MultipleGateway()
+        repo = InMemoryFundamentalFilingRepository(clock=lambda: NOW)
+        coordinator = self._coordinator(
+            gateway=gateway, filing_repository=repo,
+            validator=StubValidator(releaseable=False),
+            artifact_verifier=lambda value: True,
+        )
+        result = coordinator.coordinate(_discovery_request())
+        self.assertEqual(len(gateway.acquisition_calls), 2)
+        for item in (first, second):
+            self.assertEqual(len(repo.list_filing_artifact_versions(
+                item.filing_reference_id, scope=result.scope,
+            )), 1)
+        self.assertIsNone(result.selected_package)
+        coordinator.coordinate(_discovery_request(), refresh_requested=True)
+        self.assertEqual(len(gateway.acquisition_calls), 2)
+
+    def test_download_failure_does_not_stop_other_sources(self):
+        first = reference()
+        second = reference(
+            filing_reference_id="filing.zz.second",
+            artifact_url="https://files.tijorifinance.com/second.pdf",
+        )
+        class FailingGateway(StubGateway):
+            def discover_filings(self, *, request):
+                result = super().discover_filings(request=request)
+                return result.model_copy(update={"discovery": discovery(
+                    references=(first, second),
+                )})
+
+            def acquire_filing(self, *, request):
+                if request.reference == first:
+                    self.acquisition_calls.append(request)
+                    return FundamentalFilingAcquisitionResult(
+                        **self._response_values(request), issuer=request.issuer,
+                        status=FundamentalRetrievalStatus.PROVIDER_UNAVAILABLE,
+                        limitations=("Synthetic download unavailable.",),
+                    )
+                return super().acquire_filing(request=request)
+
+        gateway = FailingGateway()
+        repo = InMemoryFundamentalFilingRepository(clock=lambda: NOW)
+        result = self._coordinator(
+            gateway=gateway, filing_repository=repo,
+        ).coordinate(_discovery_request())
+        self.assertEqual(len(gateway.acquisition_calls), 2)
+        self.assertEqual(len(repo.list_filing_artifact_versions(
+            second.filing_reference_id, scope=result.scope,
+        )), 1)
+        self.assertIsNone(result.selected_package)
 
     def test_reuses_fresh_complete_package_without_provider_or_extraction(self):
         gateway = StubGateway()
